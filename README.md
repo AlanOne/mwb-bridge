@@ -101,6 +101,21 @@ as a file, so pasting in Finder copies them out. One file per copy, 100MB
 max, no folders — real MWB's own limits. A later file with the same name
 overwrites the earlier one.
 
+**Dragging a file between machines** (not yet live-tested): drag a file
+in Explorer or Finder across the screen edge and let go on the other
+machine, as with real MWB (PowerToys' "Transfer file" setting must be on).
+One file at a time, 100MB max, no folders, same as real MWB.
+- **Windows -> Mac**: the file is saved to `~/Desktop/MouseWithoutBorders/`
+  and shown in Finder (the counterpart of real MWB's
+  `Desktop\MouseWithoutBorders\` on Windows). macOS may ask once for
+  permission to use the Desktop folder.
+- **Mac -> Windows**: when the cursor leaves the Mac mid-drag, the drag
+  here is cancelled (so nothing is dropped at the screen edge) and the
+  file is offered to Windows, which fetches it when you let go there and
+  saves it to `Desktop\MouseWithoutBorders\`. This relies on answering
+  Windows' `ClipboardAsk` (see `daemon/PROTOCOL.md`'s drag-and-drop
+  section), which may also be what the big-path wall below was missing.
+
 **HTML-only copies**: some Windows copies (seen from a browser) arrive as
 HTML with no plain-text version. These are applied as HTML plus a
 tag-stripped plain-text alternative, so rich and plain paste targets both

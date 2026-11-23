@@ -41,6 +41,16 @@ pub enum ClipboardEvent {
     BigImage(PathBuf),  // PNG bytes already written to a temp file, big-path
 }
 
+/// Big-path content waiting for Windows to fetch it, either by connecting
+/// to our port 15100 or, in practice, by asking us to push it (ClipboardAsk).
+#[derive(Clone, Debug)]
+pub enum Outbound {
+    /// A clipboard image too big for the small path, as a PNG file.
+    Image(PathBuf),
+    /// A file dragged from this Mac to Windows.
+    File(PathBuf),
+}
+
 /// Shared state between the client connection's receive loop, the file-
 /// server listener (port 15100), and the local clipboard-watcher thread —
 /// mirrors the Linux build's `ClipboardShared`, minus the file-transfer
@@ -53,7 +63,7 @@ pub struct ClipboardShared {
     // `apply_incoming_clipboard_image`'s doc comment for why the comparison
     // has to happen on pixels rather than the outer PNG encoding.
     last_applied_image_rgba: Arc<Mutex<Option<(usize, usize, Vec<u8>)>>>,
-    pending_outbound_image: Arc<Mutex<Option<PathBuf>>>,
+    pending_outbound: Arc<Mutex<Option<Outbound>>>,
     // Windows' own machine ID, learned from the Src field of anything it's
     // sent us — needed to address a MachineSwitched package directly to it
     // (see `announce_big_image`).
@@ -65,7 +75,7 @@ impl ClipboardShared {
         Self {
             last_applied_text: Arc::new(Mutex::new(None)),
             last_applied_image_rgba: Arc::new(Mutex::new(None)),
-            pending_outbound_image: Arc::new(Mutex::new(None)),
+            pending_outbound: Arc::new(Mutex::new(None)),
             peer_machine_id: Arc::new(Mutex::new(None)),
         }
     }
@@ -407,10 +417,13 @@ fn read_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 
     Ok(decrypted)
 }
 
+/// Sends a file's bytes plus the zero tail real MWB always adds (see
+/// `push_padding_len`): the receiver stops reading once it has the file's
+/// size, and a body ending exactly there would leave it waiting instead.
 fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     const CHUNK: usize = 1 << 20;
-    let padded_len = data.len().div_ceil(32) * 32;
+    let padded_len = data.len() + push_padding_len(data.len());
     let mut padded = vec![0u8; padded_len];
     padded[..data.len()].copy_from_slice(data);
     for chunk in padded.chunks(CHUNK) {
@@ -419,14 +432,11 @@ fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8;
     Ok(())
 }
 
-/// Connects to Windows' separate clipboard-server socket (port 15100) to
-/// pull whatever it just announced via a beat on the message server — a
-/// big-path image (header name `"image"`) or a copied file (header name =
-/// its full Windows path) — and applies it to the local clipboard once
-/// fully received. Mirrors the Linux build's `pull_file_from_windows`.
-pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut stream = match peer_addr {
+/// Opens a connection to Windows' clipboard-server socket (port 15100), at
+/// the address the live message connection already uses (see PROTOCOL.md
+/// on why not to resolve the hostname again).
+fn connect_to_windows_clipboard_port(cfg: &Config, peer_addr: Option<SocketAddr>) -> std::io::Result<TcpStream> {
+    let stream = match peer_addr {
         Some(addr) => TcpStream::connect(with_port(addr, FILE_LISTEN_PORT))?,
         None => {
             let host = cfg.windows_ip.rsplit_once(':').map(|(h, _)| h).unwrap_or(&cfg.windows_ip);
@@ -435,6 +445,19 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(300)));
+    Ok(stream)
+}
+
+/// Connects to Windows' separate clipboard-server socket (port 15100) to
+/// pull whatever it has for us — a big-path image (header name `"image"`)
+/// or a copied or dragged file (header name = its full Windows path) —
+/// once fully received. `post_action` says what to do with a file:
+/// `POST_ACTION_OTHER` puts it on the clipboard (copy and paste),
+/// `POST_ACTION_DESKTOP` saves it where it can be seen (a drop). Mirrors the
+/// Linux build's `pull_file_from_windows`.
+pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared, post_action: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stream = connect_to_windows_clipboard_port(cfg, peer_addr)?;
 
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
@@ -442,7 +465,7 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
     // ClipboardPush — that's Windows' side, since it's about to push the
     // actual bytes). No finalize_send_buf here — this handshake has no
     // checksum/magic-number scheme, unlike the message server's.
-    let hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD, cfg.machine_id, &cfg.machine_name);
+    let hs = build_clipboard_handshake_with_action(PACKAGE_TYPE_CLIPBOARD, post_action, cfg.machine_id, &cfg.machine_name);
     stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;
 
     let mut peer_hs_ct = [0u8; PACKAGE_SIZE_EX];
@@ -470,6 +493,19 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
         return Ok(());
     }
 
+    if post_action == POST_ACTION_DESKTOP {
+        let dir = dropped_files_dir();
+        std::fs::create_dir_all(&dir)?;
+        let dest = dir.join(safe_file_name(&name));
+        std::fs::write(&dest, &body)?;
+        println!("[drop] Received {:?} ({size} bytes) dragged from Windows -> {}", dest.file_name().unwrap_or_default(), dest.display());
+        // Show it, as real MWB opens its Desktop\MouseWithoutBorders folder.
+        if let Err(e) = std::process::Command::new("open").arg("-R").arg(&dest).status() {
+            eprintln!("[drop] Couldn't reveal it in Finder: {e}");
+        }
+        return Ok(());
+    }
+
     let dir = received_files_dir();
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(safe_file_name(&name));
@@ -490,6 +526,14 @@ fn received_files_dir() -> PathBuf {
     cache_dir().join("received-files")
 }
 
+/// Where files dragged over from Windows land: the Mac counterpart of where
+/// real MWB saves a drop on Windows (`Desktop\MouseWithoutBorders\`). A
+/// later file with the same name replaces the earlier one, as there.
+fn dropped_files_dir() -> PathBuf {
+    let home = std::env::var("HOME").expect("HOME not set");
+    PathBuf::from(home).join("Desktop/MouseWithoutBorders")
+}
+
 /// The header's `name` is a full Windows path (`C:\Users\...\file.txt`) —
 /// `Path::file_name` only splits on `/` here, so split on both manually
 /// (the Linux build hit this live: a file landed named with the literal
@@ -503,10 +547,27 @@ fn safe_file_name(windows_path: &str) -> String {
     }
 }
 
-/// Serves the pending big-path image to a peer that just connected to our
-/// clipboard-server listener (port 15100) to pull it — mirrors the Linux
-/// build's `serve_file_to_peer`, image-only.
-fn serve_pending_image(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option<PathBuf>>>) -> std::io::Result<()> {
+/// Sends `outbound` as the 1024-byte header plus body, over a clipboard-
+/// server connection whose handshake is done. A file goes by its base name,
+/// the only part of the header's name Windows keeps anyway.
+fn send_outbound(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], outbound: &Outbound) -> std::io::Result<()> {
+    use std::io::Write;
+    let (path, name) = match outbound {
+        Outbound::Image(path) => (path, BIG_PATH_IMAGE_NAME.to_string()),
+        Outbound::File(path) => (path, path.file_name().map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned())),
+    };
+    let data = std::fs::read(path)?;
+    let header = build_file_header(data.len(), &name);
+    stream.write_all(&cipher.encrypt(chain, &header))?;
+    write_padded_body(stream, cipher, chain, &data)?;
+    println!("[big-send] Sent {name:?} ({} bytes) to Windows.", data.len());
+    Ok(())
+}
+
+/// Serves the pending big-path content to a peer that just connected to
+/// our clipboard-server listener (port 15100) to pull it — mirrors the
+/// Linux build's `serve_file_to_peer`.
+fn serve_pending(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option<Outbound>>>) -> std::io::Result<()> {
     use std::io::Write;
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
@@ -518,24 +579,48 @@ fn serve_pending_image(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<
     let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
 
     let current = pending.lock().unwrap().clone();
-    let Some(path) = current else {
+    let Some(outbound) = current else {
         let header = build_file_header(0, "Nothing currently available");
         stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
         return Ok(());
     };
+    send_outbound(&mut stream, &cipher, &mut write_chain, &outbound)
+}
 
-    let data = std::fs::read(&path)?;
-    let header = build_file_header(data.len(), BIG_PATH_IMAGE_NAME);
-    stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
-    write_padded_body(&mut stream, &cipher, &mut write_chain, &data)?;
-    println!("[image-serve] Sent a {}-byte image to peer.", data.len());
-    Ok(())
+/// Answers Windows' ClipboardAsk: connects to *its* clipboard-server port
+/// and pushes the pending big-path content (a dragged file, or a big
+/// image). This is how Windows fetches anything big from this bridge: it
+/// only pulls over a message connection it opened itself
+/// (`IsConnectedByAClientSocketTo` in real MWB), never opens one to us, and
+/// so asks us to push instead. `post_action` is echoed from the ask and
+/// tells Windows what to do with the data (save a drop to its desktop, or
+/// put it on the clipboard).
+pub fn push_to_windows(cfg: &Config, peer_addr: Option<SocketAddr>, post_action: u32, shared: &ClipboardShared) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(outbound) = shared.pending_outbound.lock().unwrap().clone() else {
+        // Connecting with nothing to send would leave Windows saving an
+        // empty file, so just don't answer.
+        println!("[big-send] Windows asked for big-path data, but nothing is pending.");
+        return Ok(());
+    };
+    let mut stream = connect_to_windows_clipboard_port(cfg, peer_addr)?;
+    let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
+
+    let hs = build_clipboard_handshake_with_action(PACKAGE_TYPE_CLIPBOARD_PUSH, post_action, cfg.machine_id, &cfg.machine_name);
+    stream.write_all(&cipher.encrypt(&mut write_chain, &hs))?;
+
+    let mut peer_hs_ct = [0u8; PACKAGE_SIZE_EX];
+    stream.read_exact(&mut peer_hs_ct)?;
+    let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
+
+    // Returning drops the stream, closing it.
+    send_outbound(&mut stream, &cipher, &mut write_chain, &outbound)
 }
 
 /// Listens on the clipboard-server port for Windows connecting in to pull
-/// a pending big-path image. Mirrors the Linux build's
+/// pending big-path content. Mirrors the Linux build's
 /// `run_file_server_listener`.
-pub fn run_file_server_listener(active: Arc<Mutex<Config>>, pending: Arc<Mutex<Option<PathBuf>>>) {
+pub fn run_file_server_listener(active: Arc<Mutex<Config>>, pending: Arc<Mutex<Option<Outbound>>>) {
     let listener = match TcpListener::bind(("0.0.0.0", FILE_LISTEN_PORT)) {
         Ok(l) => l,
         Err(e) => {
@@ -554,7 +639,7 @@ pub fn run_file_server_listener(active: Arc<Mutex<Config>>, pending: Arc<Mutex<O
                 let cfg = active.lock().unwrap().clone();
                 let pending = pending.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = serve_pending_image(stream, &cfg, &pending) {
+                    if let Err(e) = serve_pending(stream, &cfg, &pending) {
                         eprintln!("[image-serve] Session ended: {e}");
                     }
                 });
@@ -564,11 +649,11 @@ pub fn run_file_server_listener(active: Arc<Mutex<Config>>, pending: Arc<Mutex<O
     }
 }
 
-/// Exposes the shared pending-outbound-image slot to `main.rs`'s send loop
-/// (set when a `BigImage` event arrives) and the file-server listener
-/// (read when Windows connects to pull it).
-pub fn pending_outbound_image(shared: &ClipboardShared) -> Arc<Mutex<Option<PathBuf>>> {
-    shared.pending_outbound_image.clone()
+/// Exposes the shared pending-outbound slot to `main.rs`'s receive loop
+/// (set when a `BigImage` event arrives or a file is dragged out) and the
+/// file-server listener (read when Windows connects to pull it).
+pub fn pending_outbound(shared: &ClipboardShared) -> Arc<Mutex<Option<Outbound>>> {
+    shared.pending_outbound.clone()
 }
 
 pub fn peer_machine_id(shared: &ClipboardShared) -> Option<u32> {

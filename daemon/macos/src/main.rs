@@ -10,6 +10,7 @@
 
 mod cg_input;
 mod clipboard;
+mod drag_out;
 mod keycode_macos;
 mod route;
 mod windows_keys;
@@ -21,12 +22,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::{self, Config};
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP};
+use mwb_protocol::drag_drop::{DragAction, DragDropState};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN};
 use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
 use cg_input::CgInput;
-use clipboard::{ClipboardEvent, ClipboardShared};
+use clipboard::{ClipboardEvent, ClipboardShared, Outbound};
+use drag_out::DragOut;
 
 // Same 5-minute idle-tolerant timeout the Linux build settled on after
 // finding both failure modes live (a no-timeout 3+ hour hang, then an
@@ -163,6 +166,12 @@ fn run_session(
     let mut next_clip_id: u32 = initial_package_id();
     let mut lag = LagMonitor::new();
     let mut invalid_count = 0u32;
+    let mut drag = DragDropState::new(cfg.machine_id);
+    let mut drag_out = DragOut::new();
+    // Package types this loop ignores, logged once each so new traffic
+    // from Windows (like a ClipboardAsk this bridge didn't handle for a
+    // long time) shows up in the log instead of vanishing.
+    let mut unhandled_seen = std::collections::HashSet::new();
 
     loop {
         if let Some((clip_rx, shared)) = clipboard.as_ref() {
@@ -189,7 +198,7 @@ fn run_session(
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
                 }
                 Some(ClipboardEvent::BigImage(path)) => {
-                    *clipboard::pending_outbound_image(shared).lock().unwrap() = Some(path);
+                    *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Image(path));
                     clipboard::announce_big_image(
                         stream,
                         &cipher,
@@ -267,8 +276,24 @@ fn run_session(
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(cg) = cg.as_deref_mut() {
                     lag.arrived(stream);
+                    if flags == WM_LBUTTONDOWN {
+                        drag_out.mouse_down();
+                    }
                     let started = std::time::Instant::now();
                     let switch = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed);
+                    if drag.on_mouse(flags) == DragAction::PullDrop
+                        && let Some((_, shared)) = clipboard.as_ref()
+                    {
+                        println!("{} [drop] A file dragged on Windows was dropped here, fetching it.", timestamp());
+                        let cfg = cfg.clone();
+                        let shared = (*shared).clone();
+                        let peer_addr = stream.peer_addr().ok();
+                        std::thread::spawn(move || {
+                            if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared, POST_ACTION_DESKTOP) {
+                                eprintln!("[drop] Fetching the dropped file failed: {e}");
+                            }
+                        });
+                    }
                     lag.injected(if flags == 0x200 { "a mouse move" } else { "a click/scroll" }, started);
                     // Relative mode: the cursor was pushed off the edge facing
                     // Windows or a configured neighbour, so ask Windows to switch.
@@ -332,7 +357,7 @@ fn run_session(
                     let shared = (*shared).clone();
                     let peer_addr = stream.peer_addr().ok();
                     std::thread::spawn(move || {
-                        if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared) {
+                        if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared, POST_ACTION_OTHER) {
                             eprintln!("(clipboard: big-path pull failed: {e})");
                         }
                     });
@@ -344,10 +369,92 @@ fn run_session(
                     println!("[client] (Hi liveness pings received so far: {hi_count})");
                 }
             }
+            PACKAGE_TYPE_CLIPBOARD_DRAG_DROP
+            | PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END
+            | PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION
+            | PACKAGE_TYPE_EXPLORER_DRAG_DROP => {
+                let des_id = unpack_u32_le(&full, 12);
+                let was_dropping = drag.is_dropping();
+                let action = drag.on_package(package_type, src_id, des_id);
+                if drag.is_dropping() != was_dropping {
+                    let what = if was_dropping { "left without a drop" } else { "is over this Mac" };
+                    println!("{} [drop] A file dragged on Windows {what}.", timestamp());
+                }
+                if let DragAction::CheckOutgoingDrag { to } = action
+                    && let (Some(cg), Some((_, shared))) = (cg.as_deref_mut(), clipboard.as_ref())
+                {
+                    offer_outgoing_drag(stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, to, &mut next_clip_id, cg, &drag_out, shared)?;
+                }
+            }
+            PACKAGE_TYPE_CLIPBOARD_ASK => {
+                let des_id = unpack_u32_le(&full, 12);
+                if des_id == cfg.machine_id
+                    && let Some((_, shared)) = clipboard.as_ref()
+                {
+                    let post_action = unpack_u32_le(&full, 16);
+                    println!("{} [big-send] Windows asked us to push big-path data (post action {post_action}).", timestamp());
+                    let cfg = cfg.clone();
+                    let shared = (*shared).clone();
+                    let peer_addr = stream.peer_addr().ok();
+                    std::thread::spawn(move || {
+                        if let Err(e) = clipboard::push_to_windows(&cfg, peer_addr, post_action, &shared) {
+                            eprintln!("[big-send] Pushing to Windows failed: {e}");
+                        }
+                    });
+                }
+            }
             PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT => {}
-            _ => {}
+            _ => {
+                if unhandled_seen.insert(package_type) {
+                    let des_id = unpack_u32_le(&full, 12);
+                    println!("{} [client] (first package of unhandled type {package_type}, src {src_id}, des {des_id})", timestamp());
+                }
+            }
         }
     }
+}
+
+/// Windows saw the cursor leave this Mac with the left button held and asks
+/// whether a file is being dragged (ExplorerDragDrop). If one is, offer it
+/// to machine `to` the way real MWB does (DragDropStep06: a ClipboardDragDrop
+/// broadcast, then ClipboardDragDropOperation to the drop target), keep it
+/// ready for Windows to fetch on drop, and cancel the drag here so it
+/// doesn't drop anything on this Mac.
+#[allow(clippy::too_many_arguments)]
+fn offer_outgoing_drag(
+    stream: &mut TcpStream,
+    cipher: &CbcState,
+    write_chain: &mut [u8; 16],
+    magic_number: u32,
+    my_id: u32,
+    to: u32,
+    next_id: &mut u32,
+    cg: &mut CgInput,
+    drag_out: &DragOut,
+    shared: &ClipboardShared,
+) -> std::io::Result<()> {
+    if !cg.left_button_held() {
+        return Ok(());
+    }
+    let Some(path) = drag_out.dragged_file() else {
+        println!("{} [drag-out] Left with the button held, but no file is being dragged.", timestamp());
+        return Ok(());
+    };
+    if let Some(reason) = drag_out::unsendable_reason(&path) {
+        println!("{} [drag-out] Not sending {} to Windows: {reason}.", timestamp(), path.display());
+        cg.cancel_drag();
+        return Ok(());
+    }
+    *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::File(path.clone()));
+    for (package_type, des) in [(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP, ID_ALL), (PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, to)] {
+        let mut pkg = build_drag_drop_package(package_type, *next_id, my_id, des);
+        *next_id = next_id.wrapping_add(1);
+        finalize_send_buf(&mut pkg, magic_number);
+        stream.write_all(&cipher.encrypt(write_chain, &pkg))?;
+    }
+    cg.cancel_drag();
+    println!("{} [drag-out] Dragging {} to Windows; it's fetched when dropped there.", timestamp(), path.display());
+    Ok(())
 }
 
 fn run_client(
@@ -505,7 +612,7 @@ fn network_thread(cfg: Config) {
     }
     {
         let active = active.clone();
-        let pending = clipboard::pending_outbound_image(&clip_shared);
+        let pending = clipboard::pending_outbound(&clip_shared);
         std::thread::spawn(move || clipboard::run_file_server_listener(active, pending));
     }
 

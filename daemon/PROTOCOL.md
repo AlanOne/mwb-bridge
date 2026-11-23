@@ -454,16 +454,14 @@ not anything Linux-specific. The macOS build works around it for images by
 downscaling until the PNG fits the small path; files have no such
 workaround (real MWB always sends them big-path).
 
-**Only "copy a file, paste it elsewhere" is implemented — not visual
-drag-and-drop.** Real MWB has two genuinely separate trigger paths that
-both end up at the same big-path transfer mechanism: a normal file copy
+**On Linux, only "copy a file, paste it elsewhere" is implemented — not
+drag-and-drop** (the macOS build has both directions, see "File
+drag-and-drop" below). Real MWB has two separate trigger paths that both
+end up at the same big-path transfer mechanism: a normal file copy
 (`Clipboard.cs`'s `CheckClipboardEx`, `isFilePath` branch) and actual
-Win32 drag-and-drop (`DragDrop.cs` — a ~200-line state machine involving a
-hidden helper window physically repositioned under the cursor every 20ms
-to intercept a native `DragEnter` event, IPC to a helper process, and
-native window messages). The drag-and-drop path is fundamentally tied to
-Win32 APIs and a helper GUI process with no meaningful equivalent for a
-headless Linux daemon — deliberately out of scope. Folders aren't
+drag-and-drop (`DragDrop.cs`). The Win32 helper window in `DragDrop.cs`
+only matters on the machine where the drag *starts*; the packages it
+exchanges are plain and replicable, as the macOS build shows. Folders aren't
 supported either (real MWB itself refuses them, telling the user to zip
 first), and only one file at a time (real MWB's own transfer code only
 ever handles a single `LastDragDropFile`, never a multi-file selection —
@@ -562,6 +560,58 @@ limitation. The sending code (beat + `HideMouse` + `MachineSwitched`) is
 left in place since it's verified correct and harmless, in case a future
 PowerToys version, a different network topology, or something not yet
 understood makes it work.
+
+### ClipboardAsk: the likely missing piece in the reverse direction
+
+Found 2026-11-23 by reading the PowerToys source again (`main`, after
+v0.102): real MWB's pull, `Clipboard.ConnectAndGetData`, first checks
+`Common.IsConnectedByAClientSocketTo(remoteMachine)`, i.e. whether
+*Windows itself* opened a message connection to us. It never does with
+this bridge (the reverse listener has never logged an accepted
+connection), so instead of connecting to our port 15100 it sends us a
+**`ClipboardAsk` (Type=78)**, a 64-byte package with `Des` = us,
+`PostAction` (`uint`, offset 16: 0 Other, 1 Desktop, 2 Mspaint) and its
+own name at 32..64. The asked machine is expected to connect to the
+asker's port 15100 itself and **push**: clipboard handshake with
+Type=`ClipboardPush` and the ask's `PostAction` echoed, then the usual
+1024-byte header and body (`Receiver.cs`'s `ClipboardAsk` case). Both
+builds used to drop Type=78 silently in the receive loop's catch-all, which
+fits every observation above: correct beats and `MachineSwitched`, and
+never a connection. **Not yet confirmed live.** The macOS build now answers
+it (`push_to_windows`) and logs the first package of every type it ignores,
+so the next test shows whether it arrives. The Windows receiver stops at
+the header's size, needing the 1..=32 bytes of zero padding real MWB
+always sends after the body (`push_padding_len`) or the socket closing.
+
+### File drag-and-drop (macOS build)
+
+Ported from `DragDrop.cs`. All drag packages are plain 32-byte ones:
+`ClipboardDragDrop` (70, "a machine has a dragged file", `Des=ALL`),
+`ClipboardDragDropEnd` (71, "the drag went back"), `ExplorerDragDrop` (72,
+"is a file being dragged on your screen?") and
+`ClipboardDragDropOperation` (75, "you're the drop target").
+
+**Windows -> Mac.** Windows' own hook sees the left button go down on a
+file, and when the cursor crosses to us it finds the file via its helper
+window, then sends 70 (broadcast) and 75 (`Des` = us). The Mac pulls the
+file when the forwarded `WM_LBUTTONUP` arrives while that 75 is live
+(real MWB's `DragDropStep10`, `GetRemoteClipboard("desktop")`): the usual
+pull over Windows' port 15100, which serves `LastDragDropFile`. 71, or a
+right click, cancels. The pure state machine is `protocol/src/drag_drop.rs`.
+
+**Mac -> Windows.** Windows tracks the left button for every machine, so
+when the cursor crosses back with it held (`Event.PrepareToSwitchToMachine`
+-> `DragDropStep02`) it sends us 72 with `Src` = where the cursor went. A
+Mac app writes what it drags to the shared drag pasteboard
+(`NSPasteboardNameDrag`) when the drag starts, so "a file drag is in
+progress" is: the left button is still held, and that pasteboard's
+`changeCount` moved since the button went down (its contents outlive the
+drag). If so, the Mac sends 70 and 75 (`Des` = 72's `Src`), keeps the file
+as pending big-path content, and cancels the local drag with Escape before
+releasing the button, so nothing gets dropped at the screen edge (real MWB
+does that job by releasing over its helper window). On the drop Windows
+runs `GetRemoteClipboard("desktop")`, which comes to us as the
+`ClipboardAsk` above with `PostAction` Desktop.
 
 ## The real blocker was never the wire protocol — it was Windows-side state
 

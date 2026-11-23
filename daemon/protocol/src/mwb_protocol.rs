@@ -52,6 +52,29 @@ pub const PACKAGE_TYPE_CLIPBOARD: u8 = 69;
 // The handshake package type used by whichever side of the port-15100
 // connection is about to push/send the actual file bytes.
 pub const PACKAGE_TYPE_CLIPBOARD_PUSH: u8 = 79;
+// Sent by a machine that wants big-path data from us but has no outbound
+// ("client") message socket to us, which is always the case for this
+// bridge: Windows never connects back to it. Instead of connecting to our
+// port 15100 to pull, it asks us to connect to *its* port 15100 and push
+// (Clipboard.cs's ConnectAndGetData, Receiver.cs's ClipboardAsk case).
+// A 64-byte package: PostAction at offset 16, the asker's name at 32..64.
+pub const PACKAGE_TYPE_CLIPBOARD_ASK: u8 = 78;
+// File drag-and-drop (DragDrop.cs), all plain 32-byte packages:
+// "a machine has a file being dragged", broadcast to every machine.
+pub const PACKAGE_TYPE_CLIPBOARD_DRAG_DROP: u8 = 70;
+// "The drag went back without a drop", to the machine it was over.
+pub const PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END: u8 = 71;
+// "Is a file being dragged on your screen?", sent by Windows to the machine
+// the cursor just left with the left button held. Src is the machine the
+// cursor went to, i.e. where a drop would land.
+pub const PACKAGE_TYPE_EXPLORER_DRAG_DROP: u8 = 72;
+// "You're the drop target": pull the file when the button is released.
+pub const PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION: u8 = 75;
+// ClipboardPostAction: what the receiver of big-path data does with it.
+// Other = put it on the clipboard; Desktop = a drag-and-drop, save it and
+// show it (Windows: Desktop\MouseWithoutBorders\, opened in Explorer).
+pub const POST_ACTION_OTHER: u32 = 0;
+pub const POST_ACTION_DESKTOP: u32 = 1;
 pub const ID_ALL: u32 = 255;
 
 // Real MWB's own cap (MAX_CLIPBOARD_FILE_SIZE_CAN_BE_SENT), enforced by the
@@ -392,12 +415,39 @@ pub fn build_hide_mouse(id: u32, src_id: u32, des_id: u32) -> [u8; PACKAGE_SIZE]
 /// send the file). Real MWB leaves Des/Machine1-4 at zero here and only
 /// populates Src + MachineName — matched exactly.
 pub fn build_clipboard_handshake(package_type: u8, src_id: u32, machine_name: &str) -> [u8; PACKAGE_SIZE_EX] {
+    build_clipboard_handshake_with_action(package_type, POST_ACTION_OTHER, src_id, machine_name)
+}
+
+/// `build_clipboard_handshake` with a `PostAction` (offset 16), which tells
+/// the receiving side what to do with the data — see `POST_ACTION_*`.
+pub fn build_clipboard_handshake_with_action(package_type: u8, post_action: u32, src_id: u32, machine_name: &str) -> [u8; PACKAGE_SIZE_EX] {
     let mut buf = [0u8; PACKAGE_SIZE_EX];
     buf[0] = package_type;
     pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 16, post_action);
     let name_padded = format!("{:<32}", machine_name);
     buf[32..64].copy_from_slice(&name_padded.as_bytes()[..32]);
     buf
+}
+
+/// Builds one of the plain 32-byte drag-and-drop packages
+/// (`PACKAGE_TYPE_CLIPBOARD_DRAG_DROP*`), which carry nothing but
+/// Type/Id/Src/Des — Common.SendPackage on real MWB.
+pub fn build_drag_drop_package(package_type: u8, id: u32, src_id: u32, des_id: u32) -> [u8; PACKAGE_SIZE] {
+    let mut buf = [0u8; PACKAGE_SIZE];
+    buf[0] = package_type;
+    pack_u32_le(&mut buf, 4, id);
+    pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 12, des_id);
+    buf
+}
+
+/// Zero padding real MWB appends after a pushed file's bytes
+/// (SocketStuff.SendFileEx): always 1..=32 bytes, a full 32 when the size
+/// is already a multiple. The receiver reads until it has `size` bytes, so
+/// this tail is what lets it stop without waiting for the socket to close.
+pub fn push_padding_len(size: usize) -> usize {
+    PACKAGE_SIZE - size % PACKAGE_SIZE
 }
 
 pub const CLIPBOARD_FILE_HEADER_SIZE: usize = 1024;
@@ -455,6 +505,45 @@ pub fn validate_and_clean_recv_buf(buf: &mut [u8], magic_number: u32) -> bool {
     buf[2] = 0;
     buf[3] = 0;
     ok
+}
+
+#[cfg(test)]
+mod package_tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_handshake_carries_the_post_action_at_offset_16() {
+        let hs = build_clipboard_handshake_with_action(PACKAGE_TYPE_CLIPBOARD_PUSH, POST_ACTION_DESKTOP, 2, "mac");
+        assert_eq!(hs[0], PACKAGE_TYPE_CLIPBOARD_PUSH);
+        assert_eq!(unpack_u32_le(&hs, 8), 2);
+        assert_eq!(unpack_u32_le(&hs, 16), POST_ACTION_DESKTOP);
+        assert_eq!(&hs[32..35], b"mac");
+        // The old builder is unchanged: PostAction Other (0).
+        let plain = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD, 2, "mac");
+        assert_eq!(unpack_u32_le(&plain, 16), POST_ACTION_OTHER);
+    }
+
+    #[test]
+    fn drag_drop_packages_are_small_and_addressed() {
+        let p = build_drag_drop_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, 42, 2, 7);
+        assert_eq!(p.len(), PACKAGE_SIZE);
+        assert_eq!(p[0], 75);
+        assert_eq!(unpack_u32_le(&p, 4), 42);
+        assert_eq!(unpack_u32_le(&p, 8), 2);
+        assert_eq!(unpack_u32_le(&p, 12), 7);
+        for t in [70, 71, 72, 75] {
+            assert!(!is_big_package(t), "type {t} is a 32-byte package on real MWB");
+        }
+        assert!(is_big_package(PACKAGE_TYPE_CLIPBOARD_ASK));
+    }
+
+    #[test]
+    fn push_padding_matches_real_mwb() {
+        assert_eq!(push_padding_len(1), 31);
+        assert_eq!(push_padding_len(31), 1);
+        assert_eq!(push_padding_len(32), 32);
+        assert_eq!(push_padding_len(0), 32);
+    }
 }
 
 #[cfg(test)]

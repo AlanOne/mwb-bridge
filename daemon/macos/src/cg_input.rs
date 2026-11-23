@@ -368,6 +368,27 @@ impl CgInput {
         self.win_as_control = true;
     }
 
+    pub fn left_button_held(&self) -> bool {
+        self.held_buttons.iter().any(|b| b.0 == mwb_protocol::input_handling::BTN_LEFT)
+    }
+
+    /// Ends a drag that has left for Windows without dropping anything
+    /// here: Escape cancels it (the dragged icon slides back), then the left
+    /// button is released. Releasing alone would drop the file wherever the
+    /// cursor was parked at the screen edge, e.g. moving it to the Desktop.
+    /// Real MWB does the same job by releasing over its own helper window.
+    pub fn cancel_drag(&mut self) {
+        const KVK_ESCAPE: u16 = 53;
+        self.post_key(KVK_ESCAPE, true, self.flags, CGEventTapLocation::HID, false);
+        self.post_key(KVK_ESCAPE, false, self.flags, CGEventTapLocation::HID, false);
+        // Let the drag session see the cancel before the release arrives.
+        std::thread::sleep(Duration::from_millis(50));
+        if self.left_button_held() {
+            use mwb_protocol::input_handling::InputSink;
+            self.button(mwb_protocol::input_handling::BTN_LEFT, false);
+        }
+    }
+
     fn desktop_bounds(&mut self) -> CGRect {
         if self.bounds_read.elapsed() >= DISPLAY_BOUNDS_REFRESH {
             self.bounds = virtual_desktop_bounds();
