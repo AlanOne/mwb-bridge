@@ -446,16 +446,21 @@ fn offer_outgoing_drag(
     if !cg.left_button_held() {
         return Ok(());
     }
-    let Some(path) = drag_out.dragged_file() else {
+    let dragged = drag_out.dragged_files();
+    if dragged.is_empty() {
         println!("{} [drag-out] Left with the button held, but no file is being dragged.", timestamp());
         return Ok(());
-    };
-    if let Some(reason) = drag_out::unsendable_reason(&path) {
+    }
+    let (files, skipped) = drag_out::split_sendable(dragged);
+    for (path, reason) in &skipped {
         println!("{} [drag-out] Not sending {} to Windows: {reason}.", timestamp(), path.display());
+    }
+    if files.is_empty() {
         cg.cancel_drag();
         return Ok(());
     }
-    *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::File(path.clone()));
+    let names: Vec<String> = files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+    *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Files(files));
     for (package_type, des) in [(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP, ID_ALL), (PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, to)] {
         let mut pkg = build_drag_drop_package(package_type, *next_id, my_id, des);
         *next_id = next_id.wrapping_add(1);
@@ -463,7 +468,7 @@ fn offer_outgoing_drag(
         stream.write_all(&cipher.encrypt(write_chain, &pkg))?;
     }
     cg.cancel_drag();
-    println!("{} [drag-out] Dragging {} to Windows; it's fetched when dropped there.", timestamp(), path.display());
+    println!("{} [drag-out] Dragging {} to Windows ({}); sent when dropped there.", timestamp(), if names.len() == 1 { "1 file".to_string() } else { format!("{} files", names.len()) }, names.join(", "));
     Ok(())
 }
 

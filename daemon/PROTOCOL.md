@@ -633,6 +633,15 @@ does that job by releasing over its helper window). On the drop Windows
 runs `GetRemoteClipboard("desktop")`, which comes to us as the
 `ClipboardAsk` above with `PostAction` Desktop.
 
+Several files dragged from the Mac are pushed one per connection, all in
+answer to that one ask: Windows' receiver accepts any `ClipboardPush`
+connection, not just one it asked for. They must go strictly one after
+another, since Windows handles one transfer at a time and refuses one that
+waits more than 3s for the last (`ExecuteClipboardReceive`). Windows also
+keeps reading past a file's size until the sender closes its side, then
+saves the file and closes its own: so each push half-closes (`shutdown`
+write) after the body and waits for that close before the next.
+
 ## The real blocker was never the wire protocol — it was Windows-side state
 
 Everything above (crypto/framing/handshake) was correct from early in the

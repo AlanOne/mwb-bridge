@@ -104,7 +104,9 @@ overwrites the earlier one.
 **Dragging a file between machines** (live-tested both ways 2026-11-23): drag a file
 in Explorer or Finder across the screen edge and let go on the other
 machine, as with real MWB (PowerToys' "Transfer file" setting must be on).
-One file at a time, 100MB max, no folders, same as real MWB.
+100MB max per file and no folders, same as real MWB. From the Mac you can
+drag several files at once (not yet live-tested); from Windows only one,
+since PowerToys only reports single-file drags.
 - **Windows -> Mac**: drops into whatever app you let go over (a Finder
   window, the Desktop, a chat app's attachment area...), live-tested
   2026-11-23, including going back to Windows mid-drag, which cancels it

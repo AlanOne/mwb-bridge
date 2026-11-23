@@ -30,20 +30,14 @@ impl DragOut {
         self.baseline = Some(drag_pasteboard_change_count());
     }
 
-    /// The file being dragged right now, if a drag with files on it started
-    /// since the last `mouse_down`. Real MWB only ever transfers one file,
-    /// so a multi-file drag sends its first.
-    pub fn dragged_file(&self) -> Option<PathBuf> {
-        let baseline = self.baseline?;
+    /// The files being dragged right now, if a drag with files on it
+    /// started since the last `mouse_down`; empty otherwise.
+    pub fn dragged_files(&self) -> Vec<PathBuf> {
+        let Some(baseline) = self.baseline else { return Vec::new() };
         if drag_pasteboard_change_count() == baseline {
-            return None;
+            return Vec::new();
         }
-        let files = drag_pasteboard_files();
-        if files.len() > 1 {
-            let names: Vec<String> = files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
-            println!("[drag-out] {} files dragged ({}), only the first goes to Windows (one file at a time, as on real MWB).", files.len(), names.join(", "));
-        }
-        files.into_iter().next()
+        drag_pasteboard_files()
     }
 }
 
@@ -63,6 +57,20 @@ pub fn unsendable_reason(path: &Path) -> Option<&'static str> {
         Ok(m) if m.len() as usize > MAX_CLIPBOARD_FILE_SIZE => Some("it's over 100MB"),
         Ok(_) => None,
     }
+}
+
+/// Splits dragged files into those that can go to Windows, in their
+/// original order, and those that can't, with why.
+pub fn split_sendable(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, &'static str)>) {
+    let mut send = Vec::new();
+    let mut skip = Vec::new();
+    for path in paths {
+        match unsendable_reason(&path) {
+            None => send.push(path),
+            Some(reason) => skip.push((path, reason)),
+        }
+    }
+    (send, skip)
 }
 
 fn drag_pasteboard() -> objc2::rc::Retained<NSPasteboard> {
@@ -107,6 +115,21 @@ mod tests {
         assert_eq!(unsendable_reason(&file), None);
         assert_eq!(unsendable_reason(&dir), Some("folders aren't supported, zip it first"));
         assert_eq!(unsendable_reason(&dir.join("missing")), Some("it can't be read"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_mixed_drag_keeps_the_sendable_files_in_order() {
+        let dir = std::env::temp_dir().join(format!("mwb-drag-out-split-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let (send, skip) = split_sendable(vec![a.clone(), dir.join("folder"), b.clone()]);
+        assert_eq!(send, vec![a, b]);
+        assert_eq!(skip, vec![(dir.join("folder"), "folders aren't supported, zip it first")]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

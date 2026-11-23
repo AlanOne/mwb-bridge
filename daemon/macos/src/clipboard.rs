@@ -47,8 +47,23 @@ pub enum ClipboardEvent {
 pub enum Outbound {
     /// A clipboard image too big for the small path, as a PNG file.
     Image(PathBuf),
-    /// A file dragged from this Mac to Windows.
-    File(PathBuf),
+    /// Files dragged from this Mac to Windows, sent one after another.
+    Files(Vec<PathBuf>),
+}
+
+/// One file of pending content, and the name its header carries.
+type Item = (PathBuf, String);
+
+/// What `outbound` sends, one item per transfer. A file goes by its base
+/// name, the only part of the header's name Windows keeps anyway.
+fn outbound_items(outbound: &Outbound) -> Vec<Item> {
+    match outbound {
+        Outbound::Image(path) => vec![(path.clone(), BIG_PATH_IMAGE_NAME.to_string())],
+        Outbound::Files(paths) => paths
+            .iter()
+            .map(|p| (p.clone(), p.file_name().map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned())))
+            .collect(),
+    }
 }
 
 /// Shared state between the client connection's receive loop, the file-
@@ -439,13 +454,22 @@ fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8;
 /// the address the live message connection already uses (see PROTOCOL.md
 /// on why not to resolve the hostname again).
 fn connect_to_windows_clipboard_port(cfg: &Config, peer_addr: Option<SocketAddr>) -> std::io::Result<TcpStream> {
-    let stream = match peer_addr {
-        Some(addr) => TcpStream::connect(with_port(addr, FILE_LISTEN_PORT))?,
+    connect_clipboard(windows_clipboard_addr(cfg, peer_addr)?)
+}
+
+fn windows_clipboard_addr(cfg: &Config, peer_addr: Option<SocketAddr>) -> std::io::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    match peer_addr {
+        Some(addr) => Ok(with_port(addr, FILE_LISTEN_PORT)),
         None => {
             let host = cfg.windows_ip.rsplit_once(':').map(|(h, _)| h).unwrap_or(&cfg.windows_ip);
-            TcpStream::connect((host, FILE_LISTEN_PORT))?
+            (host, FILE_LISTEN_PORT).to_socket_addrs()?.next().ok_or_else(|| std::io::Error::other("Windows' address didn't resolve"))
         }
-    };
+    }
+}
+
+fn connect_clipboard(addr: SocketAddr) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(addr)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(300)));
     Ok(stream)
@@ -584,17 +608,12 @@ fn safe_file_name(windows_path: &str) -> String {
     }
 }
 
-/// Sends `outbound` as the 1024-byte header plus body, over a clipboard-
-/// server connection whose handshake is done. A file goes by its base name,
-/// the only part of the header's name Windows keeps anyway.
-fn send_outbound(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], outbound: &Outbound) -> std::io::Result<()> {
+/// Sends one item as the 1024-byte header plus body, over a clipboard-
+/// server connection whose handshake is done.
+fn send_item(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], (path, name): &Item) -> std::io::Result<()> {
     use std::io::Write;
-    let (path, name) = match outbound {
-        Outbound::Image(path) => (path, BIG_PATH_IMAGE_NAME.to_string()),
-        Outbound::File(path) => (path, path.file_name().map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned())),
-    };
     let data = std::fs::read(path)?;
-    let header = build_file_header(data.len(), &name);
+    let header = build_file_header(data.len(), name);
     stream.write_all(&cipher.encrypt(chain, &header))?;
     write_padded_body(stream, cipher, chain, &data)?;
     println!("[big-send] Sent {name:?} ({} bytes) to Windows.", data.len());
@@ -615,13 +634,15 @@ fn serve_pending(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option
     stream.read_exact(&mut peer_hs_ct)?;
     let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
 
-    let current = pending.lock().unwrap().clone();
-    let Some(outbound) = current else {
+    // A pull carries one file, so only the first of several. In practice
+    // Windows never pulls (see push_to_windows), this is for completeness.
+    let first = pending.lock().unwrap().as_ref().and_then(|o| outbound_items(o).into_iter().next());
+    let Some(item) = first else {
         let header = build_file_header(0, "Nothing currently available");
         stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
         return Ok(());
     };
-    send_outbound(&mut stream, &cipher, &mut write_chain, &outbound)
+    send_item(&mut stream, &cipher, &mut write_chain, &item)
 }
 
 /// Answers Windows' ClipboardAsk: connects to *its* clipboard-server port
@@ -631,16 +652,34 @@ fn serve_pending(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option
 /// (`IsConnectedByAClientSocketTo` in real MWB), never opens one to us, and
 /// so asks us to push instead. `post_action` is echoed from the ask and
 /// tells Windows what to do with the data (save a drop to its desktop, or
-/// put it on the clipboard).
+/// put it on the clipboard). Several dragged files go one per connection:
+/// Windows takes one file per transfer, but accepts further pushes.
 pub fn push_to_windows(cfg: &Config, peer_addr: Option<SocketAddr>, post_action: u32, shared: &ClipboardShared) -> std::io::Result<()> {
-    use std::io::Write;
     let Some(outbound) = shared.pending_outbound.lock().unwrap().clone() else {
         // Connecting with nothing to send would leave Windows saving an
         // empty file, so just don't answer.
         println!("[big-send] Windows asked for big-path data, but nothing is pending.");
         return Ok(());
     };
-    let mut stream = connect_to_windows_clipboard_port(cfg, peer_addr)?;
+    push_items(cfg, windows_clipboard_addr(cfg, peer_addr)?, post_action, &outbound_items(&outbound));
+    Ok(())
+}
+
+/// Pushes each item over its own connection to `addr`, strictly one after
+/// another: Windows handles one transfer at a time and refuses a new one
+/// that waits more than 3s for the last (Clipboard.cs's
+/// ExecuteClipboardReceive). A failed item is logged and skipped.
+fn push_items(cfg: &Config, addr: SocketAddr, post_action: u32, items: &[Item]) {
+    for (i, item) in items.iter().enumerate() {
+        if let Err(e) = push_item(cfg, addr, post_action, item) {
+            eprintln!("[big-send] Sending {:?} ({} of {}) failed: {e}", item.1, i + 1, items.len());
+        }
+    }
+}
+
+fn push_item(cfg: &Config, addr: SocketAddr, post_action: u32, item: &Item) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stream = connect_clipboard(addr)?;
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
     let hs = build_clipboard_handshake_with_action(PACKAGE_TYPE_CLIPBOARD_PUSH, post_action, cfg.machine_id, &cfg.machine_name);
@@ -650,8 +689,15 @@ pub fn push_to_windows(cfg: &Config, peer_addr: Option<SocketAddr>, post_action:
     stream.read_exact(&mut peer_hs_ct)?;
     let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
 
-    // Returning drops the stream, closing it.
-    send_outbound(&mut stream, &cipher, &mut write_chain, &outbound)
+    send_item(&mut stream, &cipher, &mut write_chain, item)?;
+    // Windows keeps reading past the file's size until we close our side,
+    // then saves the file and closes its side: wait for that, so the next
+    // transfer doesn't arrive while this one is still being saved.
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+    Ok(())
 }
 
 /// Listens on the clipboard-server port for Windows connecting in to pull
@@ -697,3 +743,68 @@ pub fn peer_machine_id(shared: &ClipboardShared) -> Option<u32> {
     *shared.peer_machine_id.lock().unwrap()
 }
 
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Plays Windows' side of pushed transfers (Clipboard.cs's receive
+    /// path) for `count` connections: handshake, header, body, then keeps
+    /// reading until the sender closes its side, as Windows does, and only
+    /// then closes. Returns each file's name and bytes.
+    fn fake_windows(listener: TcpListener, key: String, count: usize) -> std::thread::JoinHandle<Vec<(String, Vec<u8>, u32)>> {
+        std::thread::spawn(move || {
+            let mut received = Vec::new();
+            for _ in 0..count {
+                let (mut s, _) = listener.accept().unwrap();
+                let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut s, &key).unwrap();
+                let hs = build_clipboard_handshake(PACKAGE_TYPE_CLIPBOARD_PUSH, 7, "windows");
+                s.write_all(&cipher.encrypt(&mut write_chain, &hs)).unwrap();
+                let mut peer_hs = [0u8; PACKAGE_SIZE_EX];
+                s.read_exact(&mut peer_hs).unwrap();
+                let peer_hs = cipher.decrypt(&mut read_chain, &peer_hs);
+                assert_eq!(peer_hs[0], PACKAGE_TYPE_CLIPBOARD_PUSH);
+                let post_action = unpack_u32_le(&peer_hs, 16);
+                let mut header = [0u8; CLIPBOARD_FILE_HEADER_SIZE];
+                s.read_exact(&mut header).unwrap();
+                let header: [u8; CLIPBOARD_FILE_HEADER_SIZE] = cipher.decrypt(&mut read_chain, &header).try_into().unwrap();
+                let (size, name) = parse_file_header(&header).unwrap();
+                let mut body = Vec::new();
+                read_body_into(&mut s, &cipher, &mut read_chain, size, &mut body).unwrap();
+                // Windows reads on past the size until the sender closes.
+                let mut rest = Vec::new();
+                s.read_to_end(&mut rest).unwrap();
+                received.push((name, body, post_action));
+            }
+            received
+        })
+    }
+
+    #[test]
+    fn several_files_are_pushed_one_connection_each_in_order() {
+        let dir = std::env::temp_dir().join(format!("mwb-push-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("one.txt"), dir.join("two.bin"));
+        std::fs::write(&a, b"first file").unwrap();
+        std::fs::write(&b, vec![7u8; 64]).unwrap(); // a multiple of 32: needs the full padding tail
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let key = "SharedKey0123456".to_string();
+        let windows = fake_windows(listener, key.clone(), 2);
+
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "security_key": key, "windows_ip": "unused", "machine_name": "mac", "machine_id": 3,
+        }))
+        .unwrap();
+        push_items(&cfg, addr, POST_ACTION_DESKTOP, &outbound_items(&Outbound::Files(vec![a, b])));
+
+        let received = windows.join().unwrap();
+        assert_eq!(received, vec![
+            ("one.txt".to_string(), b"first file".to_vec(), POST_ACTION_DESKTOP),
+            ("two.bin".to_string(), vec![7u8; 64], POST_ACTION_DESKTOP),
+        ]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
