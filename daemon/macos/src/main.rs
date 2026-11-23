@@ -374,6 +374,7 @@ fn run_session(
             | PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION
             | PACKAGE_TYPE_EXPLORER_DRAG_DROP => {
                 let des_id = unpack_u32_le(&full, 12);
+                println!("{} [drag] Received drag package type {package_type} (src {src_id}, des {des_id}).", timestamp());
                 let was_dropping = drag.is_dropping();
                 let action = drag.on_package(package_type, src_id, des_id);
                 if drag.is_dropping() != was_dropping {

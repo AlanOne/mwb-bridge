@@ -40,7 +40,8 @@ impl DragOut {
         }
         let files = drag_pasteboard_files();
         if files.len() > 1 {
-            println!("[drag-out] {} files dragged, only the first goes to Windows (one file at a time, as on real MWB).", files.len());
+            let names: Vec<String> = files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+            println!("[drag-out] {} files dragged ({}), only the first goes to Windows (one file at a time, as on real MWB).", files.len(), names.join(", "));
         }
         files.into_iter().next()
     }
