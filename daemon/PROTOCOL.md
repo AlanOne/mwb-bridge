@@ -648,8 +648,12 @@ PowerToys' drag-and-drop can't do more: its helper only reports
 single-file drags (`DragDrop.cs`: "check if dragging a single file"), and
 the receiving side always saves to `Desktop\MouseWithoutBorders\`. So
 `windows/companion/` takes it over on Windows, with PowerToys' "Transfer
-file" off. That setting only gates `DragDrop.cs` (`DragDropStep01` returns
-early); file copy and paste is `ShareClipboard`, unaffected. With it off,
+file" off (in the settings UI: "Transfer copied files to the remote
+machine's clipboard", under "Share clipboard"). That setting gates
+`DragDrop.cs` (`DragDropStep01` returns early) and also sending a file
+copied on Windows (`Clipboard.CheckClipboardEx`'s `isFilePath` branch), but
+not receiving one, so with it off files copied on Windows no longer reach
+the other machine's clipboard. With it off,
 PowerToys sends none of the drag packages above, not even 72, so the
 bridge drives everything from two packages every switch sends anyway:
 `MachineSwitched` (77) to the machine that gets control and `HideMouse`

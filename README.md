@@ -160,10 +160,15 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
 - No size limit per file; folders still aren't supported (zip them).
 
 Setup:
-1. Turn **off** "Transfer file" in PowerToys' Mouse Without Borders
-   settings. PowerToys' own drag-and-drop catches the same drags, and the
-   two fight (the companion shows a warning while it's on). File copy and
-   paste is a separate setting and keeps working.
+1. Untick "Transfer copied files to the remote machine's clipboard" under
+   "Share clipboard" in PowerToys' Mouse Without Borders settings (the
+   setting called `TransferFile`). It also switches PowerToys' own
+   drag-and-drop on, which catches the same drags as the companion, and the
+   two fight (the companion shows a warning while it's on). **Known gap:**
+   it also stops PowerToys sending files *copied on Windows*, so pasting
+   those on the Mac doesn't work with it off, until the companion takes
+   file copy and paste over too. Copying on the Mac and pasting on Windows
+   isn't affected.
 2. From the Mac: `windows/companion/install.sh <ssh-host>`. It needs SSH
    access to the PC (PowerShell as the SSH shell) and the .NET 8 SDK on the
    Mac (`~/.dotnet` works). It builds the app, copies it to
