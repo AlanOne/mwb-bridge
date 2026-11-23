@@ -582,6 +582,8 @@ Past that point, everything is automatic.
 
 - `manifest.json`, `BarWidget.qml` — the Omarchy plugin (repo root, so it
   can be checked out directly as `~/.config/omarchy/plugins/<id>/`).
+- `docs/plans/` — implementation plans; `2026-11-23-review-plan.md` holds
+  the findings of two deep code reviews and the plan to act on them.
 - `AGENTS.md` — notes for coding agents working on this repo: rules, how it
   works, setup on both platforms and the Linux gaps. `CLAUDE.md` just
   imports it.

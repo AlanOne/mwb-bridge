@@ -1,0 +1,134 @@
+# Review findings and implementation plan (2026-11-23)
+
+Two independent deep reviews of commit `cd0e06b`, both read-only:
+Claude Fable 5.2 and Grok 4.7, each at xhigh effort. This file merges them,
+drops duplicates, and records which findings were checked against the code
+or the PowerToys source. Nothing here is live-tested yet.
+
+"Both" means both reviewers found it independently. "Checked" means the
+claim was confirmed against our code or PowerToys' (`microsoft/PowerToys`,
+`src/modules/MouseWithoutBorders/App`).
+
+## 1. Bugs
+
+### High
+
+| # | Bug | Where | Found by | Status |
+|---|-----|-------|----------|--------|
+| B1 | Held modifiers, keys and buttons aren't released when control leaves. Real MWB calls `ReleaseAllKeys()` on `HideMouse`. After a hotkey switch (Ctrl+Alt+F1) the key-ups go to the new machine, so Ctrl and Alt stay down on the Mac and every later click is a shortcut. A re-press counts as a repeat, so it doesn't heal. On Linux, a stuck non-modifier key auto-repeats. | `macos/src/main.rs` HideMouse arm; `linux/src/bin/daemon.rs`; `protocol/src/input_handling.rs` repeat dedup | Fable | Checked: `CgInput::reset` only runs at connection start and end |
+| B2 | The Linux daemon prints every key VK and mouse packet to the journal. Passwords end up in `journalctl --user`, and every event pays for a synchronous write. | `daemon.rs` (key and mouse logging) | Both | Both reviewers cite the same lines |
+| B3 | Releasing over the Mac before a dragged file has arrived blocks the input thread for up to 120s. Starting a drag also sleeps 40ms, polls for up to 300ms, and waits up to 1s for the main thread on that thread. `cancel_drag` sleeps 50ms. Input freezes, then replays late. | `macos/src/drag_in.rs` `dropped`, `on_move`; `cg_input.rs` `cancel_drag` | Both | Checked |
+| B4 | The companion link survives sleep: `watch_for_wake` only cuts the MWB socket. The companion socket has no read or write timeout and no keepalive, so `is_connected` stays true on a dead link. Copies go to the companion only and are lost, with no fallback to the PowerToys path. `send_frame` writes on the input thread while holding the writer lock. | `macos/src/main.rs` `watch_for_wake`; `macos/src/companion.rs` | Grok | Checked |
+| B5 | Linux never answers `ClipboardAsk` (78), so files and big images never reach Windows from Linux. It also still sends `HideMouse` with the announcement. | `daemon.rs` receive match, `announce_big_path` | Grok (known, in AGENTS.md) | Checked |
+
+### Medium
+
+| # | Bug | Where | Found by | Status |
+|---|-----|-------|----------|--------|
+| B6 | Outbound clipboard, file copies and companion offers only go out when a packet arrives from Windows, because the queue is drained just before a blocking read. An inactive machine only gets a heartbeat every 1 or 5 minutes. A copy made on the Mac just before flicking to Windows can wait that long. PROTOCOL.md's "well under a second" is wrong for an idle machine. | `macos/src/main.rs` loop head; Linux the same | Fable | Checked: `frmScreen.cs` "Send out Heartbeat every 1 or 5 mins" |
+| B7 | Letting go on Windows before every file of a Mac drag has arrived: `QueryContinueDrag` answers `Continue` with the button up. The drop then lands wherever the cursor is when the last byte arrives, not where you let go. It may also wait for the next input event, since nothing wakes OLE when a file finishes. | `windows/companion/Coordinator.cs` `OnSourcePressed`, `IncomingDrop.FileDone` | Both | Checked |
+| B8 | Two files with the same name in one Mac-to-Windows offer overwrite each other. The Mac side has `unique_path`, the companion doesn't. | `Coordinator.cs` `IncomingDrop.Create` | Both | Checked |
+| B9 | When a control connection is replaced (Mac reconnects), the old one's `finally` still sets the status to "waiting" and cancels every in-flight drop, including the new connection's. | `windows/companion/Server.cs` `RunControl` | Fable | Checked |
+| B10 | `INACTIVE.button_held` is the Mac's synthetic button state, and the companion reads it as "the drag came back to Windows". Drop on the Mac, then come back with the button held for something else, and Explorer's leftover drag goes live again. A quick bounce can end a drag that's still held. Disconnecting hides the catcher while a leftover drag exists. | `macos/src/main.rs` HideMouse; `Coordinator.cs` `OnInactive`, `OnBridgeDisconnected` | Fable | Plausible, needs a live test |
+| B11 | Mouse and keyboard packages are injected before the handshake challenge has matched. Each direction's key comes from the sender's own salt, so a recorded Windows-to-bridge stream can be replayed to a bridge whose connection is redirected on the LAN. | `macos/src/main.rs`, `daemon.rs` | Fable | Checked: the ack only sets the status |
+| B12 | Without the companion (PowerToys path), Windows treats any header name starting with `image` or `text` (case-insensitive) as clipboard data. Dragging `image001.png` or `Text notes.txt` from the Mac delivers nothing. Real MWB sends a full path, so it never collides. | `macos/src/clipboard.rs` `outbound_items`; `daemon.rs` | Fable | Checked: `Clipboard.cs` `StartsWith("image"/"text")` |
+| B13 | Text over 1MB (deflated) copied on Windows arrives as the header `{len}*text`, and the bridges save it as a file named `text`. | `macos/src/clipboard.rs` `pull_from_windows`; `daemon.rs` | Fable | Checked: `SocketStuff.cs` `headerString = $"{data.Length}*{"text"}"` |
+| B14 | Linux waits for `omarchy-system-lock` on the input thread, so nothing is read while the screen is locked and Windows' sends can block. | `daemon.rs` `lock_local_machine` | Grok | Reviewer quoted the code |
+| B15 | Windows-style keys do an Accessibility lookup (`focused_app`) on the input thread for many keys, up to 100ms each, and mouse packets queue behind it. | `macos/src/windows_keys.rs`, `cg_input.rs` | Grok | Known trade-off, worth caching |
+| B16 | The 300s socket timeout equals MWB's 5-minute heartbeat, so an idle healthy connection can time out, and a dead peer takes 5 minutes to notice. | `macos/src/main.rs` `SOCKET_TIMEOUT` | Fable | Plausible |
+
+### Low
+
+- Every `DragEnter` on the catcher sends a new `OFFER_TO_MAC`. A re-entry can start a second, unwanted Mac drag. Offer once per catch.
+- The 1.5s stand-down timer from an earlier `OnActive` can hide a newer catch session.
+- The companion's accept loop has no try/catch, so one accept error ends the server. There's no timeout before `HELLO`.
+- Companion temp folders (drops, copies) are only pruned at startup, with no size cap.
+- The companion link has no MAC and no freshness: a recorded stream replays (including the injected press), and file bytes can be altered undetected.
+- When a pulled body's size is a multiple of 32, Windows' 32 padding bytes are left unread and the socket closes with a reset.
+- No `panic = "abort"`: a panic on the network thread leaves a live tray icon over a dead bridge that launchd won't restart.
+- The Mac clipboard watcher prefers an image over text; real MWB prefers text, so spreadsheet cells may arrive as a picture. Suspicion.
+- "Restart App" spawns a copy and exits; under launchd's KeepAlive a plain exit would do. Suspicion.
+
+## 2. Optimizations
+
+Input path (biggest wins first):
+- Keep the input thread to read, decrypt and inject. Move waits, sleeps, Accessibility lookups and network sends off it (B3, B4, B15).
+- One mutex around encrypt-and-write on the MWB connection, so the clipboard watcher and companion threads can send directly. This fixes B6 and takes big sends off the input thread. Encrypt and write must stay under the same lock to keep the CBC chain in order.
+- Coalesce queued mouse moves after a stall: when `FIONREAD` shows more packets waiting, inject only the latest position. Never coalesce clicks or wheel steps.
+- Cache the focused app for a few hundred milliseconds, and only look it up for keys whose rewrite depends on it.
+- Linux: drop the per-packet logging, replace the `roundtrip()` after every event with a flush, set `TCP_NODELAY`.
+
+Clipboard and transfers:
+- Poll `NSPasteboard.changeCount` and only decode the image when it changes. Today an image on the clipboard is fetched as TIFF, converted to RGBA and compared every 500ms.
+- Linux: use `wl-paste --watch` (or the data-control protocol) instead of spawning up to three `wl-paste` processes every 500ms.
+- Stream big-path bodies in 1MB chunks, both ways and on both platforms. Today a 100MB file costs about 200MB of memory and can't start sending until it's fully read.
+- Batch small-path clipboard sends into one write. A 900KB image is about 19,000 separate 64-byte writes with Nagle off.
+- Companion data connections: create placeholder files before connecting, and cache the PBKDF2 derivation per salt (each connection runs it twice per side).
+- Transfer policy: with the companion, every file copy is sent immediately, at any size. Consider fetching on switch with a size cap.
+
+Connection:
+- Detect a dead peer in seconds with TCP keepalive or an MWB `Hello` ping (Windows answers with a Heartbeat), instead of the 300s timeout.
+- Reconnect faster: no fixed 3s sleep after a wake or wired cut, back off from 250ms, try candidate addresses in parallel, cache `get_24bit_hash`.
+
+## 3. New features
+
+| Feature | Value | Effort |
+|---------|-------|--------|
+| Full-size big images Mac to Windows (big path plus `ClipboardAsk`, or the companion) instead of downscaling | Screenshots arrive at full resolution | Small to medium |
+| Folders through the companion (relative paths in `FILE_HEADER`), or auto-zip | Removes the "zip it first" limit | Medium |
+| Transfer progress and cancel in both trays, wiring up the unused `CANCEL` frame | You can see big transfers and stop them | Small to medium |
+| Paste-time transfer (virtual files on Windows, file promises on the Mac) | No eager copies; drops finish at once, which fixes B3 and B7 properly | Large |
+| Self-registration: send MWB `Heartbeat`s so Windows adds the bridge to `MachinePool` itself (`MachineStuff.AddToMachinePool`) | Possibly no more hand-editing `settings.json` | Small, needs a careful live test |
+| Companion setup check: warn when the bridge is missing from the pool or matrix (it already warns about "Transfer file") | Faster setup and diagnosis | Small |
+| Media and missing keys: volume, play/pause, Print Screen, the menu key, F13-F24 | Fewer dead keys on the Mac and Linux | Small |
+| Keep-awake: act on MWB's `Awake` packages | The bridged display stays on while you work on Windows | Small |
+| Mac settings and health panel: edit config in the app, show link type and latency, "Reconnect now" | No hand-editing JSON | Small to medium |
+| Linux parity: `ClipboardAsk`, several PCs, HTML-only copies, diagnostics, companion client | Linux catches up with the Mac | Medium |
+
+## 4. Implementation plan
+
+Each phase is a few commits; every commit updates README and AGENTS.md as the repo rules require, and marks what was live-tested.
+
+### Phase 0: safety and privacy (small, do first)
+- Remove Linux key and mouse logging (B2).
+- Add a shared `release_all` to the input sinks and call it on `HideMouse` (after the drag handling) and at session end, Mac and Linux (B1).
+- Inject nothing until the handshake challenge has matched (B11).
+- `panic = "abort"` in the release profile, so launchd restarts a crashed bridge.
+- Tests: unit tests for release-on-HideMouse and for input gating.
+- Live: hotkey-switch away with Ctrl+Alt held, come back by mouse; no stuck modifiers on either machine.
+- Risk: releasing buttons during a drag-out. Keep the drag cancel first.
+
+### Phase 1: the input thread never blocks (B3, B4, B6, B14, B16)
+- Shared locked writer for the MWB connection. The clipboard watcher and the companion thread send directly.
+- `dropped()` records "release when the fetch completes" and returns. A worker waits for the fetch and then signals the input thread, which posts the release, so injection stays on one thread. Drag start becomes a small state machine instead of sleeps.
+- Companion socket: read and write timeouts, keepalive, cut on wake with the MWB socket. A failed send marks it disconnected and falls back to the PowerToys path.
+- Linux: spawn the locker without waiting.
+- Keepalive or `Hello` ping on the MWB connection, then a longer read timeout.
+- Tests: a socketpair test with concurrent writers; `dropped()` returns immediately with a blocked fetch.
+- Live: drag a large file to the Mac and release early while moving the mouse; copy on the Mac and flick to Windows at once; sleep and wake the Mac with the companion connected, then copy a file.
+
+### Phase 2: companion correctness (B7-B10, low-severity companion items)
+- Unique names in `IncomingDrop.Create`, with a C# test.
+- Early release on Windows: keep a short UI timer during the drag so `QueryContinueDrag` is re-polled. If the files aren't complete within about a second of letting go, cancel the drag and save to `Desktop\MouseWithoutBorders\` rather than dropping at a moving cursor.
+- `RunControl`'s `finally` only resets state when it's still the current connection.
+- Send "a drop is over this Mac" (`drag.is_dropping()`) rather than the synthetic button state. The companion ends the leftover drag itself in every case except a real drag-back.
+- One offer per catch session, a cancellable stand-down timer, a try/catch around accept, a `HELLO` timeout, periodic pruning, and a protocol version field in `HELLO`.
+- Live: round-trip drag, quick bounce, Mac sleep right after a drop, two same-named files, a large file released early.
+
+### Phase 3: PowerToys-path correctness (B12, B13)
+- Send a path-like name in the file header (Windows keeps `Path.GetFileName`).
+- Recognise the `text` header and apply it as clipboard text.
+- Read Windows' padding tail before closing.
+- Check the image-over-text clipboard order against real MWB.
+- Tests: extend the `fake_windows` test. Live: drag `image001.png` with the companion off; copy more than 1MB of text on Windows.
+
+### Phase 4: performance
+- `changeCount` polling, streaming bodies, batched small-path sends, mouse-move coalescing, the focused-app cache, faster reconnect, cached key derivation, placeholders before connecting.
+- Linux: flush instead of roundtrip, `TCP_NODELAY`, `wl-paste --watch`.
+- Live: a 100MB file both ways and a large screenshot left on the clipboard, watching CPU and memory.
+
+### Phase 5: features
+In order: full-size images, folders, progress and cancel, the companion setup check, media keys, keep-awake, self-registration (careful: it rewrites the matrix on first registration), the Mac settings panel. Paste-time transfer and an authenticated companion cipher come after.
+
+### Phase 6: Linux parity
+First a live v0.102 connection test (Linux has never connected to a v0.102 PowerToys). Then `ClipboardAsk`, `other_windows_pcs`, HTML-only copies, diagnostics, and a companion client for multi-file copy. Wayland drag-and-drop stays a separate project.
