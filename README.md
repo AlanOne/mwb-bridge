@@ -18,6 +18,12 @@ double-tapping Windows' own lock hotkey locks this machine too, and it runs
 as an auto-starting, auto-reconnecting systemd user service. See **Known
 bugs** below for current rough edges.
 
+**Needs PowerToys v0.102 or newer.** v0.102 changed how each connection is
+encrypted (a random salt and IV per connection instead of fixed ones), and
+both daemons only speak the new scheme. With an older PowerToys the
+connection opens but nothing decrypts. See `daemon/PROTOCOL.md` for the
+details.
+
 ## Known bugs
 
 - **Keyboard layout issues.** VK→evdev translation (`daemon/protocol/src/
@@ -81,7 +87,19 @@ double-click-to-zoom and held-key auto-repeat), clipboard sync (plain text,
 HTML-only copies, and images, both directions), Windows -> Mac file
 copy/paste, and lock-both-machines all working end-to-end, packaged as a
 proper autostarting `.app`, all live-tested against a real Windows PC.**
-Not ported: suspend/resume handling.
+
+**After sleep** the bridge reconnects as soon as the Mac wakes. A
+connection that lived through a sleep is usually dead without either side
+noticing, so a watchdog spots the wall clock jumping ahead and drops it,
+and the normal reconnect runs straight away instead of after the 5-minute
+read timeout.
+
+**Wired over Wi-Fi**: when Windows answers on both an Ethernet cable and
+Wi-Fi (mDNS returns an address per interface), the bridge tries the wired
+addresses first, and a connection that ended up on Wi-Fi moves to the
+cable once a wired path appears. Live-found: the same PC answered in under
+1 ms over the cable versus 50 ms on average (135 ms worst) over Wi-Fi,
+where input arrived in bursts. See `daemon/macos/src/route.rs`.
 
 **Mac -> Windows is limited to the small (<1MB) transfer path**, the same
 unresolved wall as the Linux build (see `daemon/PROTOCOL.md`'s big-path section):
@@ -93,7 +111,8 @@ big path. Consequences:
 - **Mac -> Windows file copy isn't possible** — real MWB always sends files
   over the big path. Copying a file in Finder leaves Windows' clipboard
   untouched (instead of sending the file's icon, which a Finder copy also
-  puts on the pasteboard).
+  puts on the pasteboard). Dragging files across does work, though (see
+  below).
 
 **Windows -> Mac files** are saved to
 `~/Library/Caches/mwb-mac-bridge/received-files/` and put on the clipboard
@@ -236,11 +255,10 @@ First run needs a one-time manual step (can't be scripted — it's a macOS
 security gate): add `MWB Mac Bridge.app` in System Settings > Privacy &
 Security > Accessibility. It won't necessarily be listed automatically
 until it's actually tried to post an input event — use the **+** button
-and browse to `~/Applications/MWB Mac Bridge.app` if it's missing. Ad-hoc
-code signing (no paid Apple Developer account needed) means this grant may
-need re-confirming after a rebuild, since the signature changes each time
-— see the comment in `install.sh` for the stable-signing alternative if
-that gets annoying.
+and browse to `~/Applications/MWB Mac Bridge.app` if it's missing. The
+grant survives later rebuilds, thanks to the stable self-signed certificate
+`install.sh` sets up (see **Fixed: Accessibility grant now survives
+rebuilds** above).
 
 **Keyboard layout (one-time, also manual).** Apple's own "Slovenian" layout
 is a different layout from the Windows one (QWERTY, different punctuation and
@@ -308,8 +326,10 @@ config.json to fix it instead.
 If an edge leads to another machine instead of Windows (e.g. a desk laid out laptop | Mac | PC),
 map it in `neighbors` by that machine's MWB id (its number in Windows' `MachinePool`, e.g.
 `alan-mac:3`): `"neighbors": { "right": 3 }`. Pushing off that edge asks Windows to switch straight
-to that machine. A neighbour edge wins over a learned `windows_side`. While an app hides the cursor (a game's mouse-look), the macOS bridge
-never switches back at an edge; free the cursor (usually Esc) or use MWB's switch hotkey.
+to that machine. A neighbour edge wins over a learned `windows_side`. While an app hides the cursor, the macOS bridge
+only switches back once the cursor has really reached that edge. A game's mouse-look keeps it locked or warped to
+the middle, so games don't switch, while a cursor hidden for typing (e.g. Ghostty's mouse-hide-while-typing) can
+still leave. To get out of a game, free the cursor (usually Esc) or use MWB's switch hotkey.
 
 The setting applies to every machine Windows controls, so update both bridges before turning it on.
 
@@ -510,25 +530,27 @@ Past that point, everything is automatic.
 
 - `manifest.json`, `BarWidget.qml` — the Omarchy plugin (repo root, so it
   can be checked out directly as `~/.config/omarchy/plugins/<id>/`).
-- `daemon/src/lib.rs` — shared library: `mwb_protocol` (crypto/framing/
-  handshake primitives), `vk_keycode` (Windows VK → Linux evdev
-  translation), `wayland_input` (the Wayland virtual pointer/keyboard
-  injector), `config` (reads `config.json`, writes `status.json`).
-- `daemon/src/bin/daemon.rs` — **the real thing.** A persistent, auto-
-  reconnecting client connection to Windows' message server, decoding
-  Mouse/Keyboard packets into Wayland input; plus a listener on the same
-  port for Windows' side of the connection pair (see `daemon/PROTOCOL.md`
-  for why — it turned out not to be load-bearing, but is harmless to keep).
-- `daemon/src/main.rs` — Phase 1 PoC: Wayland virtual pointer/keyboard
-  injection, no networking. Kept as a minimal standalone reference.
+- `daemon/protocol/` — the shared, OS-agnostic crate: `mwb_protocol`
+  (crypto/framing/handshake primitives), `vk_keycode` (Windows VK → Linux
+  evdev translation), `input_handling`, `drag_drop`, and `config` (reads
+  `config.json`, writes `status.json`).
+- `daemon/linux/src/bin/daemon.rs` — **the Linux daemon.** A persistent,
+  auto-reconnecting client connection to Windows' message server, decoding
+  Mouse/Keyboard packets into Wayland input (`daemon/linux/src/
+  wayland_input.rs`); plus a listener on the same port for Windows' side
+  of the connection pair (see `daemon/PROTOCOL.md` for why — it turned out
+  not to be load-bearing, but is harmless to keep).
+- `daemon/macos/` — the macOS menu-bar app (`src/main.rs`) and its
+  packaging (`packaging/install.sh`, `Info.plist`, LaunchAgent template).
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
   plus everything learned about Windows-side state (the Matrix/MachinePool
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).
   Read this before changing any of the crypto/framing/handshake/keymap
   code.
-- `daemon/systemd/mwb-omarchy-bridge.service` — a reference unit for
+- `daemon/linux/systemd/mwb-omarchy-bridge.service` — a reference unit for
   building and running the daemon manually (`cd daemon && cargo build
-  --release`, which lands the binary at `daemon/target/release/daemon` —
+  --release -p mwb_omarchy_bridge`, which lands the binary at
+  `daemon/target/release/daemon` —
   matching this template's `ExecStart`). The plugin's own automatic setup
   doesn't use this file; it generates an equivalent unit itself, pointing
   at wherever it actually built the binary (`~/.cache/omarchy-mwb-bridge-
