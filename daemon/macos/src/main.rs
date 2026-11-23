@@ -10,7 +10,9 @@
 
 mod cg_input;
 mod clipboard;
+mod drag_in;
 mod drag_out;
+mod drag_source;
 mod keycode_macos;
 mod route;
 mod windows_keys;
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::{self, Config};
 use mwb_protocol::drag_drop::{DragAction, DragDropState};
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN, WM_MOUSEMOVE};
 use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
@@ -168,6 +170,7 @@ fn run_session(
     let mut invalid_count = 0u32;
     let mut drag = DragDropState::new(cfg.machine_id);
     let mut drag_out = DragOut::new();
+    let mut incoming = drag_in::IncomingDrag::default();
     // Package types this loop ignores, logged once each so new traffic
     // from Windows (like a ClipboardAsk this bridge didn't handle for a
     // long time) shows up in the log instead of vanishing.
@@ -279,21 +282,19 @@ fn run_session(
                     if flags == WM_LBUTTONDOWN {
                         drag_out.mouse_down();
                     }
+                    // A drag from Windows is settled before this packet is
+                    // posted: the release posted below is what drops it.
+                    match drag.on_mouse(flags) {
+                        DragAction::Dropped => {
+                            println!("{} [drop] A file dragged on Windows was let go over this Mac.", timestamp());
+                            incoming.dropped(cg);
+                        }
+                        DragAction::DropCancelled => incoming.cancelled(cg),
+                        _ if flags == WM_MOUSEMOVE => incoming.on_move(cg),
+                        _ => {}
+                    }
                     let started = std::time::Instant::now();
                     let switch = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed);
-                    if drag.on_mouse(flags) == DragAction::PullDrop
-                        && let Some((_, shared)) = clipboard.as_ref()
-                    {
-                        println!("{} [drop] A file dragged on Windows was dropped here, fetching it.", timestamp());
-                        let cfg = cfg.clone();
-                        let shared = (*shared).clone();
-                        let peer_addr = stream.peer_addr().ok();
-                        std::thread::spawn(move || {
-                            if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared, POST_ACTION_DESKTOP) {
-                                eprintln!("[drop] Fetching the dropped file failed: {e}");
-                            }
-                        });
-                    }
                     lag.injected(if flags == 0x200 { "a mouse move" } else { "a click/scroll" }, started);
                     // Relative mode: the cursor was pushed off the edge facing
                     // Windows or a configured neighbour, so ask Windows to switch.
@@ -357,7 +358,7 @@ fn run_session(
                     let shared = (*shared).clone();
                     let peer_addr = stream.peer_addr().ok();
                     std::thread::spawn(move || {
-                        if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared, POST_ACTION_OTHER) {
+                        if let Err(e) = clipboard::pull_from_windows(&cfg, peer_addr, &shared) {
                             eprintln!("(clipboard: big-path pull failed: {e})");
                         }
                     });
@@ -381,10 +382,15 @@ fn run_session(
                     let what = if was_dropping { "left without a drop" } else { "is over this Mac" };
                     println!("{} [drop] A file dragged on Windows {what}.", timestamp());
                 }
-                if let DragAction::CheckOutgoingDrag { to } = action
-                    && let (Some(cg), Some((_, shared))) = (cg.as_deref_mut(), clipboard.as_ref())
-                {
-                    offer_outgoing_drag(stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, to, &mut next_clip_id, cg, &drag_out, shared)?;
+                if let (Some(cg), Some((_, shared))) = (cg.as_deref_mut(), clipboard.as_ref()) {
+                    match action {
+                        DragAction::DropStarted => incoming.start(cfg, stream.peer_addr().ok()),
+                        DragAction::DropCancelled => incoming.cancelled(cg),
+                        DragAction::CheckOutgoingDrag { to } => {
+                            offer_outgoing_drag(stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, to, &mut next_clip_id, cg, &drag_out, shared)?;
+                        }
+                        _ => {}
+                    }
                 }
             }
             PACKAGE_TYPE_CLIPBOARD_ASK => {
@@ -477,6 +483,11 @@ fn run_client(
     cg.reset();
     let result = run_session(&mut stream, Some(&mut *cg), cfg, Some((clip_rx, clip_shared)), handshook);
     CURRENT_STREAM.lock().unwrap().take();
+    // A drag from Windows cut off by the connection ending: cancel it, or
+    // releasing the button in reset() would drop it wherever the cursor is.
+    if drag_source::is_active() {
+        cg.cancel_drag();
+    }
     cg.reset();
     result
 }

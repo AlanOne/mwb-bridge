@@ -368,6 +368,12 @@ impl CgInput {
         self.win_as_control = true;
     }
 
+    /// Where the cursor is, in Quartz global coordinates.
+    pub fn cursor(&mut self) -> (f64, f64) {
+        self.sync_position();
+        (self.pos.x, self.pos.y)
+    }
+
     pub fn left_button_held(&self) -> bool {
         self.held_buttons.iter().any(|b| b.0 == mwb_protocol::input_handling::BTN_LEFT)
     }

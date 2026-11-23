@@ -15,9 +15,16 @@ use crate::mwb_protocol::{
 #[derive(Debug, PartialEq, Eq)]
 pub enum DragAction {
     None,
-    /// A file dragged on Windows was released over this machine: pull it
-    /// (real MWB's `DragDropStep10`, `GetRemoteClipboard("desktop")`).
-    PullDrop,
+    /// A file dragged on Windows is now over this machine (real MWB's
+    /// `DragDropStep08_2`). Windows already serves it, so it can be fetched
+    /// before the drop.
+    DropStarted,
+    /// That file was released over this machine (real MWB's
+    /// `DragDropStep10`, which pulls it then: `GetRemoteClipboard("desktop")`).
+    Dropped,
+    /// That drag ended without a drop here: it went back, or a right click
+    /// cancelled it.
+    DropCancelled,
     /// Windows saw the mouse leave this machine with the left button held
     /// and asks whether that's a file being dragged out (`ExplorerDragDrop`,
     /// `DragDropStep03`). If it is, offer it to machine `to`.
@@ -47,22 +54,25 @@ impl DragDropState {
             // is the connection it came over, so nothing to remember here.
             PACKAGE_TYPE_CLIPBOARD_DRAG_DROP => DragAction::None,
             // "You're the drop target" (DragDropStep08_2).
-            PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION => {
-                if des == self.my_id {
-                    self.dropping = true;
-                }
-                DragAction::None
+            PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION if des == self.my_id && !self.dropping => {
+                self.dropping = true;
+                DragAction::DropStarted
             }
             // The drag went back without a drop (DragDropStep12).
-            PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END => {
-                self.dropping = false;
-                DragAction::None
-            }
+            PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END => self.cancel(),
+            // While a drop is over us, this means the cursor went back to
+            // Windows with the button still held: Windows stops tracking its
+            // own drag once the file has been fetched, so it takes this for
+            // a drag starting here. It's the same drag leaving.
             PACKAGE_TYPE_EXPLORER_DRAG_DROP if des == self.my_id || des == ID_ALL => {
-                DragAction::CheckOutgoingDrag { to: src }
+                if self.dropping { self.cancel() } else { DragAction::CheckOutgoingDrag { to: src } }
             }
             _ => DragAction::None,
         }
+    }
+
+    fn cancel(&mut self) -> DragAction {
+        if std::mem::take(&mut self.dropping) { DragAction::DropCancelled } else { DragAction::None }
     }
 
     /// Handles a mouse message (a Mouse package's dwFlags) forwarded from
@@ -71,13 +81,10 @@ impl DragDropState {
         match flags {
             WM_LBUTTONUP if self.dropping => {
                 self.dropping = false;
-                DragAction::PullDrop
+                DragAction::Dropped
             }
             // A right click while dropping cancels it, as on real MWB.
-            WM_RBUTTONUP => {
-                self.dropping = false;
-                DragAction::None
-            }
+            WM_RBUTTONUP => self.cancel(),
             _ => DragAction::None,
         }
     }
@@ -94,15 +101,21 @@ mod tests {
     fn dropping() -> DragDropState {
         let mut s = DragDropState::new(ME);
         assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP, WINDOWS, ID_ALL), DragAction::None);
-        assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, WINDOWS, ME), DragAction::None);
+        assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, WINDOWS, ME), DragAction::DropStarted);
         s
     }
 
     #[test]
-    fn releasing_the_left_button_over_us_pulls_the_dropped_file() {
+    fn a_repeated_drop_operation_starts_nothing_new() {
+        let mut s = dropping();
+        assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, WINDOWS, ME), DragAction::None);
+    }
+
+    #[test]
+    fn releasing_the_left_button_over_us_drops_the_file() {
         let mut s = dropping();
         assert_eq!(s.on_mouse(WM_MOUSEMOVE), DragAction::None);
-        assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::PullDrop);
+        assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::Dropped);
         // Only once: the next release is an ordinary click.
         assert_eq!(s.on_mouse(WM_LBUTTONDOWN), DragAction::None);
         assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::None);
@@ -124,14 +137,26 @@ mod tests {
     #[test]
     fn the_drag_going_back_cancels_the_drop() {
         let mut s = dropping();
-        s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END, WINDOWS, ME);
+        assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END, WINDOWS, ME), DragAction::DropCancelled);
         assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::None);
+        // Nothing left to cancel.
+        assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END, WINDOWS, ME), DragAction::None);
     }
 
     #[test]
     fn a_right_click_cancels_the_drop() {
         let mut s = dropping();
-        s.on_mouse(WM_RBUTTONUP);
+        assert_eq!(s.on_mouse(WM_RBUTTONUP), DragAction::DropCancelled);
+        assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::None);
+    }
+
+    #[test]
+    fn leaving_mid_drop_cancels_it_instead_of_offering_the_file_back() {
+        // Fetching the file early makes Windows forget it is dragging, so
+        // the cursor going back to Windows with the button still held
+        // looks to it like a new drag starting here.
+        let mut s = dropping();
+        assert_eq!(s.on_package(PACKAGE_TYPE_EXPLORER_DRAG_DROP, WINDOWS, ME), DragAction::DropCancelled);
         assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::None);
     }
 

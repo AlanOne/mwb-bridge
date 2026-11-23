@@ -105,10 +105,14 @@ overwrites the earlier one.
 in Explorer or Finder across the screen edge and let go on the other
 machine, as with real MWB (PowerToys' "Transfer file" setting must be on).
 One file at a time, 100MB max, no folders, same as real MWB.
-- **Windows -> Mac**: the file is saved to `~/Desktop/MouseWithoutBorders/`
-  and shown in Finder (the counterpart of real MWB's
-  `Desktop\MouseWithoutBorders\` on Windows). macOS may ask once for
-  permission to use the Desktop folder.
+- **Windows -> Mac**: drops into whatever app you let go over (a Finder
+  window, the Desktop, a chat app's attachment area...), not yet
+  live-tested. As soon as the drag reaches the Mac the file starts
+  downloading and a real macOS drag of it is started under the cursor (see
+  `daemon/macos/src/drag_source.rs`); letting go waits for the download to
+  finish if needed. If you let go before the drag could start, the file is
+  saved to `~/Desktop/MouseWithoutBorders/` and shown in Finder instead
+  (where real MWB saves drops on Windows).
 - **Mac -> Windows**: when the cursor leaves the Mac mid-drag, the drag
   here is cancelled (so nothing is dropped at the screen edge) and the
   file is offered to Windows, which fetches it when you let go there and

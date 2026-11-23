@@ -601,6 +601,19 @@ file when the forwarded `WM_LBUTTONUP` arrives while that 75 is live
 pull over Windows' port 15100, which serves `LastDragDropFile`. 71, or a
 right click, cancels. The pure state machine is `protocol/src/drag_drop.rs`.
 
+To let the file drop into any app instead, the Mac fetches it as soon as 75
+arrives rather than on release, and starts a real macOS drag of it the way
+real MWB catches drags on Windows: a tiny invisible panel under the cursor
+takes one synthetic left press and turns it into an `NSDraggingSession`
+(`macos/src/drag_source.rs`), then forwarded moves post as drags and the
+forwarded release drops it (after waiting for the download, if needed).
+Fetching early has a side effect on Windows: accepting the clipboard
+connection resets its own drag state (`SendOrReceiveClipboardData` sets
+`IsDragging = false`, `DragMachine = 1`). So if the cursor goes back to
+Windows with the button still held, Windows doesn't send 71: it sends 72 as
+if a new drag were starting on the Mac. While a drop is over us, 72 is
+therefore treated as the drag leaving, not as a question to answer.
+
 **Mac -> Windows.** Windows tracks the left button for every machine, so
 when the cursor crosses back with it held (`Event.PrepareToSwitchToMachine`
 -> `DragDropStep02`) it sends us 72 with `Src` = where the cursor went. A

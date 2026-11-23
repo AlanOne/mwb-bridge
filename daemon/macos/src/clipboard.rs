@@ -401,20 +401,23 @@ fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     }
 }
 
-fn read_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], size: usize) -> std::io::Result<Vec<u8>> {
+/// Reads a `size`-byte body (sent padded to a multiple of 32 bytes) and
+/// writes its `size` real bytes to `out` as they arrive.
+fn read_body_into(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], size: usize, out: &mut impl std::io::Write) -> std::io::Result<()> {
     const CHUNK: usize = 1 << 20;
-    let padded_len = size.div_ceil(32) * 32;
-    let mut decrypted = Vec::with_capacity(padded_len);
-    let mut remaining = padded_len;
-    while remaining > 0 {
-        let this_chunk = remaining.min(CHUNK);
+    let mut remaining_padded = size.div_ceil(32) * 32;
+    let mut remaining_real = size;
+    while remaining_padded > 0 {
+        let this_chunk = remaining_padded.min(CHUNK);
         let mut ct = vec![0u8; this_chunk];
         stream.read_exact(&mut ct)?;
-        decrypted.extend_from_slice(&cipher.decrypt(chain, &ct));
-        remaining -= this_chunk;
+        let pt = cipher.decrypt(chain, &ct);
+        let real = remaining_real.min(pt.len());
+        out.write_all(&pt[..real])?;
+        remaining_real -= real;
+        remaining_padded -= this_chunk;
     }
-    decrypted.truncate(size);
-    Ok(decrypted)
+    Ok(())
 }
 
 /// Sends a file's bytes plus the zero tail real MWB always adds (see
@@ -448,14 +451,28 @@ fn connect_to_windows_clipboard_port(cfg: &Config, peer_addr: Option<SocketAddr>
     Ok(stream)
 }
 
-/// Connects to Windows' separate clipboard-server socket (port 15100) to
-/// pull whatever it has for us — a big-path image (header name `"image"`)
-/// or a copied or dragged file (header name = its full Windows path) —
-/// once fully received. `post_action` says what to do with a file:
-/// `POST_ACTION_OTHER` puts it on the clipboard (copy and paste),
-/// `POST_ACTION_DESKTOP` saves it where it can be seen (a drop). Mirrors the
-/// Linux build's `pull_file_from_windows`.
-pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared, post_action: u32) -> std::io::Result<()> {
+/// A pull from Windows' clipboard-server socket with the header read, ready
+/// for its body.
+struct Pull {
+    stream: TcpStream,
+    cipher: CbcState,
+    read_chain: [u8; 16],
+    size: usize,
+    name: String,
+}
+
+impl Pull {
+    fn read_body_into(&mut self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        read_body_into(&mut self.stream, &self.cipher, &mut self.read_chain, self.size, out)
+    }
+}
+
+/// Connects to Windows' separate clipboard-server socket (port 15100) and
+/// reads the header of whatever it has for us: a big-path image (name
+/// `"image"`) or a copied or dragged file (name = its full Windows path).
+/// `post_action` tells Windows why we're asking (`POST_ACTION_*`). `None`
+/// when Windows sends no real payload (its errors come as a size-0 header).
+fn open_pull(cfg: &Config, peer_addr: Option<SocketAddr>, post_action: u32) -> std::io::Result<Option<Pull>> {
     use std::io::Write;
     let mut stream = connect_to_windows_clipboard_port(cfg, peer_addr)?;
 
@@ -477,32 +494,28 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
     let header_pt = cipher.decrypt(&mut read_chain, &header_ct);
     let header_arr: [u8; CLIPBOARD_FILE_HEADER_SIZE] = header_pt.try_into().unwrap();
     let Some((size, name)) = parse_file_header(&header_arr) else {
-        eprintln!("[image-pull] Couldn't parse the file header, aborting.");
-        return Ok(());
+        eprintln!("[pull] Couldn't parse the file header, aborting.");
+        return Ok(None);
     };
     if size == 0 || size > MAX_CLIPBOARD_FILE_SIZE {
-        eprintln!("[image-pull] Rejected: size={size} name={name:?} (likely a sender-side error, not a real payload).");
-        return Ok(());
+        eprintln!("[pull] Rejected: size={size} name={name:?} (likely a sender-side error, not a real payload).");
+        return Ok(None);
     }
+    Ok(Some(Pull { stream, cipher, read_chain, size, name }))
+}
 
-    let body = read_padded_body(&mut stream, &cipher, &mut read_chain, size)?;
+/// Pulls whatever Windows announced for copy and paste and puts it on the
+/// clipboard once fully received. Mirrors the Linux build's
+/// `pull_file_from_windows`.
+pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
+    let Some(mut pull) = open_pull(cfg, peer_addr, POST_ACTION_OTHER)? else { return Ok(()) };
+    let (size, name) = (pull.size, pull.name.clone());
+    let mut body = Vec::with_capacity(size);
+    pull.read_body_into(&mut body)?;
 
     if name == BIG_PATH_IMAGE_NAME {
         apply_incoming_clipboard_image(&body, shared);
         println!("[image-pull] Received a big clipboard image ({size} bytes) from Windows.");
-        return Ok(());
-    }
-
-    if post_action == POST_ACTION_DESKTOP {
-        let dir = dropped_files_dir();
-        std::fs::create_dir_all(&dir)?;
-        let dest = dir.join(safe_file_name(&name));
-        std::fs::write(&dest, &body)?;
-        println!("[drop] Received {:?} ({size} bytes) dragged from Windows -> {}", dest.file_name().unwrap_or_default(), dest.display());
-        // Show it, as real MWB opens its Desktop\MouseWithoutBorders folder.
-        if let Err(e) = std::process::Command::new("open").arg("-R").arg(&dest).status() {
-            eprintln!("[drop] Couldn't reveal it in Finder: {e}");
-        }
         return Ok(());
     }
 
@@ -526,12 +539,36 @@ fn received_files_dir() -> PathBuf {
     cache_dir().join("received-files")
 }
 
-/// Where files dragged over from Windows land: the Mac counterpart of where
-/// real MWB saves a drop on Windows (`Desktop\MouseWithoutBorders\`). A
-/// later file with the same name replaces the earlier one, as there.
-fn dropped_files_dir() -> PathBuf {
+/// Where a file dragged from Windows lands when it's let go before it could
+/// be handed to an app: the Mac counterpart of where real MWB saves a drop
+/// on Windows (`Desktop\MouseWithoutBorders\`). A later file with the same
+/// name replaces the earlier one, as there.
+pub fn dropped_files_dir() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME not set");
     PathBuf::from(home).join("Desktop/MouseWithoutBorders")
+}
+
+/// Where files dragged from Windows are fetched to while being dragged
+/// here, one folder per drag: the app they're dropped on reads them from
+/// there, possibly a while later (a chat app uploading an attachment).
+pub fn dragged_files_dir() -> PathBuf {
+    cache_dir().join("dragged-files")
+}
+
+/// Fetches the file being dragged on Windows into `dir`, writing it to disk
+/// as it arrives. `on_created` gets its path as soon as the (still empty)
+/// file exists, so a drag of it can start while the rest downloads.
+pub fn fetch_dragged_file(cfg: &Config, peer_addr: Option<SocketAddr>, dir: &std::path::Path, on_created: impl FnOnce(&std::path::Path)) -> std::io::Result<PathBuf> {
+    let Some(mut pull) = open_pull(cfg, peer_addr, POST_ACTION_DESKTOP)? else {
+        return Err(std::io::Error::other("Windows sent no file"));
+    };
+    std::fs::create_dir_all(dir)?;
+    let dest = dir.join(safe_file_name(&pull.name));
+    let mut file = std::fs::File::create(&dest)?;
+    on_created(&dest);
+    pull.read_body_into(&mut file)?;
+    file.sync_all()?;
+    Ok(dest)
 }
 
 /// The header's `name` is a full Windows path (`C:\Users\...\file.txt`) —
