@@ -31,9 +31,9 @@ sealed class Coordinator
     {
         _ui = ui;
         _catcher.FilesCaught += OnFilesCaught;
-        _catcher.DragEntered += () =>
+        _catcher.DragEntered += keyState =>
         {
-            if (!_caughtDrag) Log.Write("[to-mac] The drag entered the catcher.");
+            if (!_caughtDrag) Log.Write($"[to-mac] A drag entered the catcher (key state {keyState}: left button {((keyState & 1) != 0 ? "down" : "up")} as the drag sees it).");
             _caughtDrag = true;
         };
         _catcher.Dropped += () => Log.Write("[to-mac] The leftover Windows drag ended on the catcher.");
@@ -52,13 +52,16 @@ sealed class Coordinator
 
     // ---- Windows -> Mac ------------------------------------------------
 
-    /// The bridge's machine became the active one. If the left button is
-    /// still down here, something was being dragged across: catch it.
+    /// The bridge's machine became the active one. If something was being
+    /// dragged across, catch it. Windows' own idea of the left button
+    /// can't decide that: live, it reported the button up during every
+    /// drag that crossed, so the catcher goes up on every switch and simply
+    /// stands down again if no drag arrives. While the other machine has
+    /// control the Windows cursor is parked and hidden, so it's unseen.
     public void OnActive()
     {
-        Log.Write($"[to-mac] The bridge's machine is active; left button {(Native.LeftButtonDown() ? "down" : "up")} here.");
-        if (!Native.LeftButtonDown() || _catching) return;
-        Log.Write("[to-mac] Control went to the bridge with the left button held, catching the drag.");
+        if (_catching) return;
+        Log.Write($"[to-mac] The bridge's machine is active (left button {(Native.LeftButtonDown() ? "down" : "up")} as Windows reports it), watching for a drag.");
         _catching = true;
         _caughtDrag = false;
         _catcher.ShowOver(SystemInformation.VirtualScreen);
@@ -71,7 +74,6 @@ sealed class Coordinator
             timer.Dispose();
             if (_catching && !_caughtDrag)
             {
-                Log.Write("[to-mac] No drag arrived, standing down.");
                 HideCatcher();
             }
         };
@@ -105,19 +107,21 @@ sealed class Coordinator
             HideCatcher();
             return;
         }
+        if (!_caughtDrag)
+        {
+            HideCatcher();
+            return;
+        }
         // Let go on the other machine. The release happened over there, so
-        // Windows still thinks the button is down and its drag is still
-        // going: release it here over the catcher, which ends it harmlessly.
+        // Windows' drag is still going: release it here over the catcher,
+        // which ends it harmlessly.
         _catcher.ShowOver(SystemInformation.VirtualScreen);
         var timer = new System.Windows.Forms.Timer { Interval = 50 };
         timer.Tick += (_, _) =>
         {
             timer.Dispose();
-            if (Native.LeftButtonDown())
-            {
-                Log.Write("[to-mac] Released on the other machine, ending the leftover Windows drag.");
-                Native.LeftButton(down: false);
-            }
+            Log.Write("[to-mac] Released on the other machine, ending the leftover Windows drag.");
+            Native.LeftButton(down: false);
             var hide = new System.Windows.Forms.Timer { Interval = 300 };
             hide.Tick += (_, _) => { hide.Dispose(); HideCatcher(); };
             hide.Start();

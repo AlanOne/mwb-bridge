@@ -45,7 +45,7 @@ class GhostWindow : Form
 sealed class CatcherWindow : GhostWindow
 {
     public event Action<string[]>? FilesCaught;
-    public event Action? DragEntered;
+    public event Action<int>? DragEntered;
     public event Action? Dropped;
 
     public CatcherWindow()
@@ -53,7 +53,7 @@ sealed class CatcherWindow : GhostWindow
         AllowDrop = true;
         DragEnter += (_, e) =>
         {
-            DragEntered?.Invoke();
+            DragEntered?.Invoke(e.KeyState);
             if (e.Data?.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
             {
                 e.Effect = DragDropEffects.Copy;
