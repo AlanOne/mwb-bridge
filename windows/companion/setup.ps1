@@ -52,6 +52,16 @@ try {
 }
 
 Remove-Item $Staging -Recurse -Force
-Start-Sleep -Seconds 2
-$running = Get-Process MwbBridgeCompanion -ErrorAction SilentlyContinue
-if ($running) { "Companion running (session $($running.SessionId))." } else { "Companion did not start: see $(Join-Path $env:LOCALAPPDATA 'MwbBridgeCompanion\companion.log')." }
+# Running isn't enough: a missing .NET runtime shows its own dialog from a
+# process of the same name. The app's "Listening" log line means it's up.
+$log = Join-Path $env:LOCALAPPDATA "MwbBridgeCompanion\companion.log"
+$since = Get-Date
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Milliseconds 500
+    if ((Test-Path $log) -and (Get-Item $log).LastWriteTime -ge $since.AddSeconds(-1) -and (Select-String -Path $log -Pattern "Listening on port" -SimpleMatch -Quiet)) {
+        $running = Get-Process MwbBridgeCompanion -ErrorAction SilentlyContinue
+        "Companion running and listening (session $($running.SessionId))."
+        exit 0
+    }
+}
+Write-Error "The companion didn't start listening within 10s. If a .NET dialog is showing, its runtime is missing; otherwise see $log."

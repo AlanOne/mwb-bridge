@@ -179,7 +179,8 @@ Setup:
    for the current user first), or from the Mac with
    `windows/companion/install.sh <ssh-host>` (needs SSH access to the PC,
    PowerShell as the SSH shell, and the .NET 8 SDK on the Mac, `~/.dotnet`
-   works). Either builds the app, copies it to
+   works). Either builds the app (with the .NET runtime bundled in when
+   the PC lacks a machine-wide .NET 8 desktop runtime), copies it to
    `%LOCALAPPDATA%\MwbBridgeCompanion\app\`, opens TCP port 15102 to the
    local network in the firewall and registers a "MWB Bridge Companion"
    logon task that starts it (and starts it now). Without admin rights it
