@@ -142,6 +142,8 @@ From `daemon/`:
 
 - `cargo test -p mwb_protocol` runs the shared protocol tests.
 - `cargo test -p mwb_mac_bridge` runs the macOS tests (on a Mac).
+- `~/.dotnet/dotnet run` in `windows/companion-tests/` checks the Windows
+  companion's protocol code (it runs on the Mac too).
 - `cargo check -p mwb_omarchy_bridge --target x86_64-unknown-linux-gnu`
   type-checks the Linux build from a Mac. It can't be run there, so Linux
   changes made on a Mac are "type-checked only" until tried on the Omarchy

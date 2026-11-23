@@ -91,6 +91,9 @@ sealed class FrameConnection : IDisposable
 
     static byte[] Apply(ICryptoTransform t, byte[] data)
     {
+        // TransformBlock rejects an empty input, and empty frames (Active,
+        // FileEnd...) have no body.
+        if (data.Length == 0) return data;
         var output = new byte[data.Length];
         t.TransformBlock(data, 0, data.Length, output, 0);
         return output;

@@ -31,7 +31,11 @@ sealed class Coordinator
     {
         _ui = ui;
         _catcher.FilesCaught += OnFilesCaught;
-        _catcher.DragEntered += () => _caughtDrag = true;
+        _catcher.DragEntered += () =>
+        {
+            if (!_caughtDrag) Log.Write("[to-mac] The drag entered the catcher.");
+            _caughtDrag = true;
+        };
         _catcher.Dropped += () => Log.Write("[to-mac] The leftover Windows drag ended on the catcher.");
         // Mouse Without Borders keeps its own small topmost window at the
         // parked cursor; stay above it so the drag reaches the catcher.
@@ -52,6 +56,7 @@ sealed class Coordinator
     /// still down here, something was being dragged across: catch it.
     public void OnActive()
     {
+        Log.Write($"[to-mac] The bridge's machine is active; left button {(Native.LeftButtonDown() ? "down" : "up")} here.");
         if (!Native.LeftButtonDown() || _catching) return;
         Log.Write("[to-mac] Control went to the bridge with the left button held, catching the drag.");
         _catching = true;
@@ -144,6 +149,7 @@ sealed class Coordinator
     public void OnOfferToWindows(IncomingDrop drop)
     {
         Log.Write($"[to-windows] Drag {drop.Id}: {drop.Paths.Length} file(s) from the bridge, starting a drag here.");
+        Log.Write($"[to-windows] Cursor at {Cursor.Position}, left button {(Native.LeftButtonDown() ? "down" : "up")} as Windows sees it.");
         if (!Native.LeftButtonDown())
         {
             // Windows doesn't know about the button held on the other
@@ -152,7 +158,16 @@ sealed class Coordinator
             var at = Cursor.Position;
             _source.ShowOver(new Rectangle(at.X - 32, at.Y - 32, 64, 64));
             var press = new System.Windows.Forms.Timer { Interval = 40 };
-            press.Tick += (_, _) => { press.Dispose(); Native.LeftButton(down: true); };
+            press.Tick += (_, _) =>
+            {
+                press.Dispose();
+                // Again right before pressing: other topmost windows (Mouse
+                // Without Borders keeps one at the cursor) may have come up.
+                var now = Cursor.Position;
+                _source.ShowOver(new Rectangle(now.X - 32, now.Y - 32, 64, 64));
+                Log.Write($"[to-windows] Pressing at {now} on {Native.DescribeWindowAt(now)} (the source window is 0x{_source.Handle.ToInt64():x}).");
+                Native.LeftButton(down: true);
+            };
             press.Start();
             // If the press didn't land on the window, release it again and
             // save the files where PowerToys would have.
@@ -180,6 +195,7 @@ sealed class Coordinator
 
     void OnSourcePressed()
     {
+        Log.Write("[to-windows] The press landed on the source window.");
         var drop = _pendingSource;
         _pendingSource = null;
         if (drop == null) return;
