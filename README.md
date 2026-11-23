@@ -530,6 +530,9 @@ Past that point, everything is automatic.
 
 - `manifest.json`, `BarWidget.qml` — the Omarchy plugin (repo root, so it
   can be checked out directly as `~/.config/omarchy/plugins/<id>/`).
+- `AGENTS.md` — notes for coding agents working on this repo: rules, how it
+  works, setup on both platforms and the Linux gaps. `CLAUDE.md` just
+  imports it.
 - `daemon/protocol/` — the shared, OS-agnostic crate: `mwb_protocol`
   (crypto/framing/handshake primitives), `vk_keycode` (Windows VK → Linux
   evdev translation), `input_handling`, `drag_drop`, and `config` (reads
