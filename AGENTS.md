@@ -54,6 +54,19 @@ turns MWB's Mouse/Keyboard packages into local input.
   `CGEventPost` (`cg_input.rs`), and is its own menu-bar app (`tray.rs`)
   packaged as `MWB Mac Bridge.app` and started by a LaunchAgent.
 
+`windows/companion/` is an optional C# (.NET 8, WinForms) tray app for the
+Windows PC that takes over file drag-and-drop from PowerToys (whose
+"Transfer file" must then be off): multi-file drags both ways, and drops
+into any Windows app. The bridge connects to it on port 15102 with MWB's
+encryption; `daemon/protocol/src/companion.rs` and
+`windows/companion/Protocol.cs` are the two ends of that protocol and must
+stay in step. Build it on the Mac with the .NET 8 SDK (`~/.dotnet/dotnet
+build -c Release` in that folder) and install it with
+`windows/companion/install.sh <ssh-host>`. AlanOnePC is reachable as the
+SSH host `alanonepc` (PowerShell shell); a GUI app has to be started in the
+user's session, which setup.ps1 does with a logon scheduled task. Its log is
+`%LOCALAPPDATA%\MwbBridgeCompanion\companion.log`.
+
 Network facts that matter:
 
 - Windows' message server is on port **15101** (not 15100). The clipboard and

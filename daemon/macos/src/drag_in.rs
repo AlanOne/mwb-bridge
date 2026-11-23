@@ -32,8 +32,8 @@ pub enum After {
 
 #[derive(Default)]
 struct State {
-    path: Option<PathBuf>,
-    outcome: Option<Result<PathBuf, String>>,
+    paths: Vec<PathBuf>,
+    outcome: Option<Result<Vec<PathBuf>, String>>,
     after: Option<After>,
 }
 
@@ -51,13 +51,13 @@ impl Fetch {
         Arc::new(Self { state: Mutex::new(State::default()), done: Condvar::new(), drop_dir, reveal })
     }
 
-    /// The fetching thread created the (still empty) destination file.
+    /// The fetching thread created a (still empty) destination file.
     pub fn created(&self, path: &Path) {
-        self.state.lock().unwrap().path = Some(path.to_path_buf());
+        self.state.lock().unwrap().paths.push(path.to_path_buf());
     }
 
     /// The fetching thread is done, one way or the other.
-    pub fn finished(&self, result: std::io::Result<PathBuf>) {
+    pub fn finished(&self, result: std::io::Result<Vec<PathBuf>>) {
         let outcome = result.map_err(|e| e.to_string());
         let after = {
             let mut state = self.state.lock().unwrap();
@@ -70,14 +70,14 @@ impl Fetch {
         }
     }
 
-    /// Where the file is being written, once that's known.
-    pub fn path(&self) -> Option<PathBuf> {
-        self.state.lock().unwrap().path.clone()
+    /// Where the files are being written, as far as that's known yet.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.state.lock().unwrap().paths.clone()
     }
 
-    /// Waits up to `timeout` for the download to end: the file's path, or
+    /// Waits up to `timeout` for the download to end: the files' paths, or
     /// why it failed. `None` if it's still going.
-    pub fn wait(&self, timeout: Duration) -> Option<Result<PathBuf, String>> {
+    pub fn wait(&self, timeout: Duration) -> Option<Result<Vec<PathBuf>, String>> {
         let state = self.state.lock().unwrap();
         let (state, _) = self.done.wait_timeout_while(state, timeout, |s| s.outcome.is_none()).unwrap();
         state.outcome.clone()
@@ -96,33 +96,40 @@ impl Fetch {
         }
     }
 
-    fn apply(&self, after: After, outcome: &Result<PathBuf, String>) {
-        let path = match outcome {
-            Ok(path) => path,
+    fn apply(&self, after: After, outcome: &Result<Vec<PathBuf>, String>) {
+        let paths = match outcome {
+            Ok(paths) => paths,
             Err(e) => {
-                eprintln!("[drop] Fetching the dragged file from Windows failed: {e}");
+                eprintln!("[drop] Fetching the dragged files from Windows failed: {e}");
                 return;
             }
         };
         match after {
             After::Keep => {}
             After::Discard => {
-                let _ = std::fs::remove_file(path);
-                if let Some(dir) = path.parent() {
+                for path in paths {
+                    let _ = std::fs::remove_file(path);
+                }
+                if let Some(dir) = paths.first().and_then(|p| p.parent()) {
                     let _ = std::fs::remove_dir(dir); // only if empty
                 }
             }
-            After::SaveToDropFolder => match save_to(&self.drop_dir, path) {
-                Ok(dest) => {
-                    println!("[drop] Saved {} (released before it could be handed to an app).", dest.display());
-                    if self.reveal
-                        && let Err(e) = std::process::Command::new("open").arg("-R").arg(&dest).status()
-                    {
-                        eprintln!("[drop] Couldn't reveal it in Finder: {e}");
+            After::SaveToDropFolder => {
+                let mut saved = Vec::new();
+                for path in paths {
+                    match save_to(&self.drop_dir, path) {
+                        Ok(dest) => saved.push(dest),
+                        Err(e) => eprintln!("[drop] Couldn't save {} to {}: {e}", path.display(), self.drop_dir.display()),
                     }
                 }
-                Err(e) => eprintln!("[drop] Couldn't save {} to {}: {e}", path.display(), self.drop_dir.display()),
-            },
+                println!("[drop] Saved {} file(s) to {} (released before they could be handed to an app).", saved.len(), self.drop_dir.display());
+                if self.reveal
+                    && !saved.is_empty()
+                    && let Err(e) = std::process::Command::new("open").arg("-R").args(&saved).status()
+                {
+                    eprintln!("[drop] Couldn't reveal them in Finder: {e}");
+                }
+            }
         }
     }
 }
@@ -136,6 +143,9 @@ pub struct IncomingDrag {
 
 struct Incoming {
     fetch: Arc<Fetch>,
+    // How many files the drag carries: its macOS drag starts once they all
+    // exist on disk.
+    expected: usize,
     // A macOS drag of the file is running (the left button is held here).
     dragging: bool,
     // Starting one failed, so don't try again for this drag.
@@ -155,13 +165,32 @@ impl IncomingDrag {
         prune_old_drags(&root, KEEP_DRAGS);
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
-        self.current = Some(Incoming { fetch: fetch.clone(), dragging: false, gave_up: false });
+        self.current = Some(Incoming { fetch: fetch.clone(), expected: 1, dragging: false, gave_up: false });
         let cfg = cfg.clone();
         std::thread::spawn(move || {
             let result = crate::clipboard::fetch_dragged_file(&cfg, peer_addr, &dir, |path| fetch.created(path));
             if let Ok(path) = &result {
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 println!("[drop] Fetched {} ({size} bytes) from Windows.", path.display());
+            }
+            fetch.finished(result.map(|p| vec![p]));
+        });
+    }
+
+    /// Files dragged on Windows reached this Mac through the companion,
+    /// which knows every file of a drag: fetch them all from it.
+    pub fn start_companion(&mut self, link: &Arc<crate::companion::Link>, offer: mwb_protocol::companion::Offer) {
+        let root = crate::clipboard::dragged_files_dir();
+        prune_old_drags(&root, KEEP_DRAGS);
+        let dir = new_drag_dir(&root);
+        let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
+        let expected = offer.files.len();
+        self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false });
+        let link = link.clone();
+        std::thread::spawn(move || {
+            let result = link.fetch_files(&offer, &dir, |path| fetch.created(path));
+            if let Ok(paths) = &result {
+                println!("[drop] Fetched {} file(s) from the companion.", paths.len());
             }
             fetch.finished(result);
         });
@@ -174,10 +203,13 @@ impl IncomingDrag {
         if incoming.dragging || incoming.gave_up || cg.left_button_held() {
             return;
         }
-        let Some(path) = incoming.fetch.path() else { return };
+        let paths = incoming.fetch.paths();
+        if paths.len() < incoming.expected {
+            return;
+        }
         let main_height = core_graphics::display::CGDisplay::main().bounds().size.height;
-        if !crate::drag_source::place_under_cursor(&path, cg.cursor(), main_height) {
-            eprintln!("[drop] Couldn't show the drag panel, the file will be saved instead when dropped.");
+        if !crate::drag_source::place_under_cursor(&paths, cg.cursor(), main_height) {
+            eprintln!("[drop] Couldn't show the drag panel, the files will be saved instead when dropped.");
             incoming.gave_up = true;
             return;
         }
@@ -186,9 +218,10 @@ impl IncomingDrag {
         cg.button(BTN_LEFT, true);
         if crate::drag_source::wait_started(Duration::from_millis(300)) {
             incoming.dragging = true;
-            println!("[drop] Dragging {} on this Mac; let go over any app to drop it there.", path.display());
+            let names: Vec<String> = paths.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+            println!("[drop] Dragging {} on this Mac; let go over any app to drop it there.", names.join(", "));
         } else {
-            eprintln!("[drop] The drag didn't start, the file will be saved instead when dropped.");
+            eprintln!("[drop] The drag didn't start, the files will be saved instead when dropped.");
             cg.button(BTN_LEFT, false);
             crate::drag_source::remove_panel();
             incoming.gave_up = true;
@@ -296,7 +329,7 @@ mod tests {
         let (fetch, path) = fetched(&tmp);
         fetch.then(After::SaveToDropFolder);
         assert!(!tmp.0.join("drop/report.pdf").exists(), "nothing to save before it has arrived");
-        fetch.finished(Ok(path));
+        fetch.finished(Ok(vec![path]));
         assert_eq!(std::fs::read(tmp.0.join("drop/report.pdf")).unwrap(), b"pdf");
     }
 
@@ -304,7 +337,7 @@ mod tests {
     fn a_drag_that_went_back_deletes_the_file_and_its_folder() {
         let tmp = TempDir::new("discard");
         let (fetch, path) = fetched(&tmp);
-        fetch.finished(Ok(path.clone()));
+        fetch.finished(Ok(vec![path.clone()]));
         fetch.then(After::Discard);
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
@@ -314,7 +347,7 @@ mod tests {
     fn a_drop_into_an_app_keeps_the_file() {
         let tmp = TempDir::new("keep");
         let (fetch, path) = fetched(&tmp);
-        fetch.finished(Ok(path.clone()));
+        fetch.finished(Ok(vec![path.clone()]));
         fetch.then(After::Keep);
         assert!(path.exists());
         assert!(!tmp.0.join("drop").exists());
@@ -327,8 +360,8 @@ mod tests {
         assert_eq!(fetch.wait(Duration::from_millis(10)), None);
         let f = fetch.clone();
         let p = path.clone();
-        std::thread::spawn(move || f.finished(Ok(p)));
-        assert_eq!(fetch.wait(Duration::from_secs(5)), Some(Ok(path)));
+        std::thread::spawn(move || f.finished(Ok(vec![p])));
+        assert_eq!(fetch.wait(Duration::from_secs(5)), Some(Ok(vec![path])));
     }
 
     #[test]
@@ -339,6 +372,25 @@ mod tests {
         fetch.then(After::SaveToDropFolder);
         assert_eq!(fetch.wait(Duration::ZERO), Some(Err("connection reset".to_string())));
         assert!(!tmp.0.join("drop").exists());
+    }
+
+    #[test]
+    fn every_file_of_a_multi_file_drag_is_saved_or_discarded() {
+        let tmp = TempDir::new("multi");
+        let fetch = Fetch::new(tmp.0.join("drop"), false);
+        let dir = tmp.0.join("drag");
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<PathBuf> = ["a.txt", "b.txt"].iter().map(|n| dir.join(n)).collect();
+        for p in &paths {
+            std::fs::write(p, b"x").unwrap();
+            fetch.created(p);
+        }
+        assert_eq!(fetch.paths(), paths);
+        fetch.finished(Ok(paths.clone()));
+        fetch.then(After::SaveToDropFolder);
+        assert!(tmp.0.join("drop/a.txt").exists() && tmp.0.join("drop/b.txt").exists());
+        fetch.then(After::Discard);
+        assert!(!dir.exists(), "both files and their folder are gone");
     }
 
     #[test]

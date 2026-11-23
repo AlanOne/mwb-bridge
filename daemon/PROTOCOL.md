@@ -642,6 +642,65 @@ keeps reading past a file's size until the sender closes its side, then
 saves the file and closes its own: so each push half-closes (`shutdown`
 write) after the body and waits for that close before the next.
 
+### The Windows companion app (multi-file drags, drops into any app)
+
+PowerToys' drag-and-drop can't do more: its helper only reports
+single-file drags (`DragDrop.cs`: "check if dragging a single file"), and
+the receiving side always saves to `Desktop\MouseWithoutBorders\`. So
+`windows/companion/` takes it over on Windows, with PowerToys' "Transfer
+file" off. That setting only gates `DragDrop.cs` (`DragDropStep01` returns
+early); file copy and paste is `ShareClipboard`, unaffected. With it off,
+PowerToys sends none of the drag packages above, not even 72, so the
+bridge drives everything from two packages every switch sends anyway:
+`MachineSwitched` (77) to the machine that gets control and `HideMouse`
+(50) to the one that loses it.
+
+**Link** (`protocol/src/companion.rs`, mirrored in
+`windows/companion/Protocol.cs`): the bridge connects to the companion on
+TCP 15102 on the PC its MWB connection goes to, with MWB's own v0.102
+encryption and the same key. Frames are a 16-byte header (type u32,
+reserved u32, length u64, little-endian) plus the payload zero-padded to 16
+bytes. The first frame is `HELLO` (JSON `{"role", "name", "op"?, "id"?}`).
+One long-lived control connection carries `ACTIVE` (2), `INACTIVE` (3,
+`{"button_held"}`), `OFFER_TO_WINDOWS` (4) and `CANCEL` (7) from the bridge
+and `OFFER_TO_MAC` (5) from the companion; an offer is `{"id", "files":
+[{"name", "size"}]}`. File bytes go over a short data connection per drag
+(`op` "get" when the companion sends, "put" when the bridge does): per file
+`FILE_HEADER` (10, `{"index", "name", "size"}`), `FILE_CHUNK`s (11, up to
+1MB) and `FILE_END` (12), then `DONE` (13). The bridge opens every
+connection, so Windows needs one inbound firewall rule.
+
+**Windows -> Mac.** MWB doesn't filter simulated input: anything the
+companion injects while another machine has control is forwarded there,
+and the real release happens on the other machine. So the companion never
+injects while the Mac has control. When the Mac gets 77 it sends `ACTIVE`.
+If Windows still thinks the left button is down, a drag crossed over: MWB
+parks the Windows cursor (`Common.HideMouseCursor`: the primary screen's
+centre, or y=4 with HideMouse on) and the Windows drag keeps hovering
+there. The companion covers the whole desktop with a nearly transparent
+topmost window (fully transparent ones let drags fall through), re-raised
+every 100ms to stay above MWB's own small window at the cursor; OLE's
+periodic `DragOver` makes the drag enter it, which hands over every file
+(`CF_HDROP`). It offers them to the Mac, which fetches them and starts its
+own drag of all of them. When control comes back to Windows the Mac sends
+`INACTIVE`: with the button still held (dragged back to Windows) the
+companion just steps aside and the Windows drag carries on; with it
+released (dropped on the Mac), Windows still thinks it's held, so the
+companion releases it over its window, ending that leftover drag
+harmlessly.
+
+**Mac -> Windows.** On `HideMouse` with the left button held and a file
+drag on the drag pasteboard, the Mac cancels its drag (Escape), sends
+`OFFER_TO_WINDOWS` and the files. Windows is in control by then, so
+injecting is safe: the companion puts a small window under the cursor and
+presses the left button on it (Windows didn't see the real press, made
+while the Mac had control), and turns that into a real `DoDragDrop` of
+placeholder files that fill in as the bytes arrive. Its
+`QueryContinueDrag` holds the drop (`Continue` though the button is up)
+until every file is complete. The user's real release, which Windows does
+see now, ends the drag. Only `Copy` is allowed, so Explorer copies rather
+than moves out of the temp folder.
+
 ## The real blocker was never the wire protocol — it was Windows-side state
 
 Everything above (crypto/framing/handshake) was correct from early in the

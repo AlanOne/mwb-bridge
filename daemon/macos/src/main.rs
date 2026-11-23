@@ -10,6 +10,7 @@
 
 mod cg_input;
 mod clipboard;
+mod companion;
 mod drag_in;
 mod drag_out;
 mod drag_source;
@@ -53,6 +54,11 @@ const LISTEN_PORT: u16 = 15101;
 /// The outbound connection to Windows, kept so a wake from sleep or a newly
 /// plugged-in cable can cut it (see `watch_for_wake`, `watch_for_wired_path`).
 static CURRENT_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
+
+/// The Windows end of the live connection, if there is one.
+pub fn current_peer() -> Option<std::net::SocketAddr> {
+    CURRENT_STREAM.lock().unwrap().as_ref().and_then(|s| s.peer_addr().ok())
+}
 
 /// Local wall-clock time as HH:MM:SS.mmm, for lining log lines up with when
 /// a hitch was felt.
@@ -177,6 +183,20 @@ fn run_session(
     let mut unhandled_seen = std::collections::HashSet::new();
 
     loop {
+        // Files dragged on Windows that the companion says are now over
+        // this Mac.
+        if clipboard.is_some()
+            && let Some(link) = companion::link()
+        {
+            for offer in link.take_offers() {
+                if drag.start_drop() == DragAction::DropStarted {
+                    println!("{} [drop] {} file(s) dragged on Windows are over this Mac.", timestamp(), offer.files.len());
+                    incoming.start_companion(link, offer);
+                } else {
+                    println!("{} [drop] Ignoring the companion's drag {}: another drop is already going on.", timestamp(), offer.id);
+                }
+            }
+        }
         if let Some((clip_rx, shared)) = clipboard.as_ref() {
             let mut latest = None;
             while let Ok(ev) = clip_rx.try_recv() {
@@ -392,7 +412,24 @@ fn run_session(
             | PACKAGE_TYPE_EXPLORER_DRAG_DROP
             | PACKAGE_TYPE_HIDE_MOUSE => {
                 let des_id = unpack_u32_le(&full, 12);
-                if package_type != PACKAGE_TYPE_HIDE_MOUSE {
+                // With the companion connected, it handles drag-and-drop
+                // and PowerToys' own should be off ("Transfer file").
+                let companion = companion::link().filter(|l| l.is_connected() && clipboard.is_some());
+                if package_type == PACKAGE_TYPE_HIDE_MOUSE {
+                    if des_id == cfg.machine_id
+                        && let (Some(link), Some(cg)) = (companion, cg.as_deref_mut())
+                    {
+                        // Read before a drop here is cancelled below.
+                        let held = cg.left_button_held();
+                        if held && !drag.is_dropping() {
+                            offer_to_companion(link, cg, &drag_out);
+                        }
+                        link.send(mwb_protocol::companion::INACTIVE, &mwb_protocol::companion::Inactive { button_held: held });
+                    }
+                } else if companion.is_some() {
+                    println!("{} [drag] Ignoring PowerToys' drag package {package_type}: the companion handles drag-and-drop (turn off \"Transfer file\" in PowerToys).", timestamp());
+                    continue;
+                } else {
                     println!("{} [drag] Received drag package type {package_type} (src {src_id}, des {des_id}).", timestamp());
                 }
                 let was_dropping = drag.is_dropping();
@@ -427,6 +464,16 @@ fn run_session(
                             eprintln!("[big-send] Pushing to Windows failed: {e}");
                         }
                     });
+                }
+            }
+            PACKAGE_TYPE_MACHINE_SWITCHED => {
+                // This Mac just became the active machine: if a drag was
+                // going on on Windows, it's now over here.
+                if unpack_u32_le(&full, 12) == cfg.machine_id
+                    && clipboard.is_some()
+                    && let Some(link) = companion::link().filter(|l| l.is_connected())
+                {
+                    link.send_empty(mwb_protocol::companion::ACTIVE);
                 }
             }
             PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT => {}
@@ -486,6 +533,45 @@ fn offer_outgoing_drag(
     cg.cancel_drag();
     println!("{} [drag-out] Dragging {} to Windows ({}); sent when dropped there.", timestamp(), if names.len() == 1 { "1 file".to_string() } else { format!("{} files", names.len()) }, names.join(", "));
     Ok(())
+}
+
+/// Control just left this Mac with the left button held: if that's a file
+/// drag, hand it to the companion, which carries it on as a Windows drag.
+/// The drag here is cancelled so nothing gets dropped at the screen edge.
+fn offer_to_companion(link: &std::sync::Arc<companion::Link>, cg: &mut CgInput, drag_out: &DragOut) {
+    let dragged = drag_out.dragged_files();
+    if dragged.is_empty() {
+        return;
+    }
+    let (files, skipped): (Vec<_>, Vec<_>) = dragged.into_iter().partition(|p| p.is_file());
+    for path in &skipped {
+        println!("{} [drag-out] Not sending {} to Windows: folders aren't supported, zip it first.", timestamp(), path.display());
+    }
+    cg.cancel_drag();
+    if files.is_empty() {
+        return;
+    }
+    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let offer = mwb_protocol::companion::Offer {
+        id,
+        files: files
+            .iter()
+            .map(|p| mwb_protocol::companion::FileInfo {
+                name: p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+            })
+            .collect(),
+    };
+    if !link.send(mwb_protocol::companion::OFFER_TO_WINDOWS, &offer) {
+        return;
+    }
+    let names: Vec<&str> = offer.files.iter().map(|f| f.name.as_str()).collect();
+    println!("{} [drag-out] Dragging {} to Windows through the companion (drag {id}).", timestamp(), names.join(", "));
+    let link = link.clone();
+    std::thread::spawn(move || match link.put_files(id, &files) {
+        Ok(()) => println!("[drag-out] Sent drag {id}'s {} file(s) to the companion.", files.len()),
+        Err(e) => eprintln!("[drag-out] Sending drag {id} to the companion failed: {e}"),
+    });
 }
 
 fn run_client(
@@ -640,6 +726,7 @@ fn network_thread(cfg: Config) {
         std::thread::spawn(move || watch_for_wired_path(active));
     }
 
+    companion::start(active.clone(), current_peer);
     let clip_shared = ClipboardShared::new();
     let (clip_tx, clip_rx) = mpsc::channel::<ClipboardEvent>();
     {

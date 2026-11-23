@@ -175,6 +175,7 @@ pub fn get_24bit_hash(key: &str) -> u32 {
 /// AES-256-CBC over a continuous stream (chaining persists across calls,
 /// not reset per packet — mirrors .NET's single long-lived CryptoStream per
 /// connection direction).
+#[derive(Clone)]
 pub struct CbcState {
     aes_encrypt: aes::Aes256,
     aes_decrypt: aes::Aes256,

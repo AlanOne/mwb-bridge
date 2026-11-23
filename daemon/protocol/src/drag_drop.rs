@@ -75,6 +75,13 @@ impl DragDropState {
         }
     }
 
+    /// A drop started by the companion app (its offer of files dragged on
+    /// Windows) rather than by MWB's ClipboardDragDropOperation. It ends the
+    /// same ways: a release drops it, HideMouse or a right click cancels it.
+    pub fn start_drop(&mut self) -> DragAction {
+        if std::mem::replace(&mut self.dropping, true) { DragAction::None } else { DragAction::DropStarted }
+    }
+
     fn cancel(&mut self) -> DragAction {
         if std::mem::take(&mut self.dropping) { DragAction::DropCancelled } else { DragAction::None }
     }
@@ -107,6 +114,16 @@ mod tests {
         assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP, WINDOWS, ID_ALL), DragAction::None);
         assert_eq!(s.on_package(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, WINDOWS, ME), DragAction::DropStarted);
         s
+    }
+
+    #[test]
+    fn a_drop_started_by_the_companion_is_dropped_and_cancelled_the_same_way() {
+        let mut s = DragDropState::new(ME);
+        assert_eq!(s.start_drop(), DragAction::DropStarted);
+        assert_eq!(s.start_drop(), DragAction::None, "one drop at a time");
+        assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::Dropped);
+        s.start_drop();
+        assert_eq!(s.on_package(PACKAGE_TYPE_HIDE_MOUSE, WINDOWS, ME), DragAction::DropCancelled);
     }
 
     #[test]

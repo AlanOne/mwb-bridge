@@ -622,7 +622,7 @@ pub fn fetch_dragged_file(cfg: &Config, peer_addr: Option<SocketAddr>, dir: &std
 /// (the Linux build hit this live: a file landed named with the literal
 /// full path). Also refuses `.`/`..`/empty, which would otherwise make
 /// `dir.join` resolve outside the received-files directory.
-fn safe_file_name(windows_path: &str) -> String {
+pub(crate) fn safe_file_name(windows_path: &str) -> String {
     let base = windows_path.rsplit(['/', '\\']).next().unwrap_or(windows_path).trim();
     match base {
         "" | "." | ".." => "received-file".to_string(),

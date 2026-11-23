@@ -144,6 +144,41 @@ since PowerToys only reports single-file drags.
   section), confirmed live as what Windows sends, which likely also
   explains the big-path wall above.
 
+**Windows companion app: several files, and dropping into any Windows
+app.** Not yet live-tested (it connects and decrypts against AlanOnePC,
+2026-11-23; the drags themselves are untried). `windows/companion/` is a
+small C# tray app for the Windows PC that takes over file drag-and-drop
+from PowerToys, which can only hand over one file per drag and always
+saves a drop to `Desktop\MouseWithoutBorders\`. With it:
+- **Windows -> Mac** carries every file of a drag, and drops them into
+  whatever Mac app you let go over.
+- **Mac -> Windows** starts a real Windows drag of the files under the
+  cursor, so they drop into whichever Explorer window or app you let go
+  over. Letting go before they've fully arrived holds the drop until they
+  have. If the drag can't start, they're saved to
+  `Desktop\MouseWithoutBorders\` as before.
+- No size limit per file; folders still aren't supported (zip them).
+
+Setup:
+1. Turn **off** "Transfer file" in PowerToys' Mouse Without Borders
+   settings. PowerToys' own drag-and-drop catches the same drags, and the
+   two fight (the companion shows a warning while it's on). File copy and
+   paste is a separate setting and keeps working.
+2. From the Mac: `windows/companion/install.sh <ssh-host>`. It needs SSH
+   access to the PC (PowerShell as the SSH shell) and the .NET 8 SDK on the
+   Mac (`~/.dotnet` works). It builds the app, copies it to
+   `%LOCALAPPDATA%\MwbBridgeCompanion\app\`, writes
+   `%APPDATA%\MwbBridgeCompanion\config.json` with that PC's security key
+   from the Mac's config, opens TCP port 15102 to the local network in the
+   firewall, and registers a "MWB Bridge Companion" task that starts it at
+   logon (and starts it now). Re-run it to update.
+3. The Mac bridge finds the companion by itself on the PC it's connected
+   to. Without one it uses PowerToys' own drag-and-drop, as above.
+
+The log is `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log` (also under
+the tray icon's menu). How it works, and the protocol between the two, is
+in `daemon/PROTOCOL.md`'s companion section.
+
 **HTML-only copies**: some Windows copies (seen from a browser) arrive as
 HTML with no plain-text version. These are applied as HTML plus a
 tag-stripped plain-text alternative, so rich and plain paste targets both
@@ -535,7 +570,8 @@ Past that point, everything is automatic.
   imports it.
 - `daemon/protocol/` — the shared, OS-agnostic crate: `mwb_protocol`
   (crypto/framing/handshake primitives), `vk_keycode` (Windows VK → Linux
-  evdev translation), `input_handling`, `drag_drop`, and `config` (reads
+  evdev translation), `input_handling`, `drag_drop`, `companion` (the
+  link to the Windows companion app), and `config` (reads
   `config.json`, writes `status.json`).
 - `daemon/linux/src/bin/daemon.rs` — **the Linux daemon.** A persistent,
   auto-reconnecting client connection to Windows' message server, decoding
@@ -545,6 +581,9 @@ Past that point, everything is automatic.
   not to be load-bearing, but is harmless to keep).
 - `daemon/macos/` — the macOS menu-bar app (`src/main.rs`) and its
   packaging (`packaging/install.sh`, `Info.plist`, LaunchAgent template).
+- `windows/companion/` — the optional Windows tray app that takes over file
+  drag-and-drop (C#, .NET 8), with `install.sh` (run on the Mac) and
+  `setup.ps1` (run on the PC by it).
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
   plus everything learned about Windows-side state (the Matrix/MachinePool
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).

@@ -15,7 +15,7 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -43,7 +43,7 @@ pub fn is_active() -> bool {
 }
 
 pub struct Ivars {
-    path: RefCell<PathBuf>,
+    paths: RefCell<Vec<PathBuf>>,
 }
 
 define_class!(
@@ -85,7 +85,7 @@ define_class!(
         #[unsafe(method(draggingSession:endedAtPoint:operation:))]
         fn ended(&self, _session: &NSDraggingSession, _point: NSPoint, operation: NSDragOperation) {
             ACTIVE.store(false, Ordering::SeqCst);
-            let name = self.ivars().path.borrow().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let name = self.ivars().paths.borrow().iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect::<Vec<_>>().join(", ");
             if operation.is_empty() {
                 println!("[drop] {name} wasn't dropped anywhere that takes it (or the drag was cancelled).");
             } else {
@@ -99,25 +99,38 @@ define_class!(
 );
 
 impl DragSourceView {
-    fn new(mtm: MainThreadMarker, frame: NSRect, path: PathBuf) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars { path: RefCell::new(path) });
+    fn new(mtm: MainThreadMarker, frame: NSRect, paths: Vec<PathBuf>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Ivars { paths: RefCell::new(paths) });
         // SAFETY: initWithFrame: is NSView's designated initializer.
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
     fn start_drag(&self, event: &NSEvent) {
-        let path = self.ivars().path.borrow().clone();
-        let ns_path = NSString::from_str(&path.to_string_lossy());
-        let url = NSURL::fileURLWithPath(&ns_path);
-        let item = NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), ProtocolObject::from_ref(&*url));
-        let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns_path);
-        icon.setSize(NSSize::new(PANEL_SIZE, PANEL_SIZE));
+        let paths = self.ivars().paths.borrow().clone();
         let at = self.convertPoint_fromView(event.locationInWindow(), None);
-        let frame = NSRect::new(NSPoint::new(at.x - PANEL_SIZE / 2.0, at.y - PANEL_SIZE / 2.0), NSSize::new(PANEL_SIZE, PANEL_SIZE));
-        let contents: &AnyObject = &icon;
-        // SAFETY: the contents of a dragging frame may be an NSImage.
-        unsafe { item.setDraggingFrame_contents(frame, Some(contents)) };
-        let items = NSArray::from_retained_slice(&[item]);
+        // One item per file, each a few points further along so several
+        // read as a stack, as in a Finder drag.
+        let items: Vec<Retained<NSDraggingItem>> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let ns_path = NSString::from_str(&path.to_string_lossy());
+                let url = NSURL::fileURLWithPath(&ns_path);
+                let item = NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), ProtocolObject::from_ref(&*url));
+                let icon = NSWorkspace::sharedWorkspace().iconForFile(&ns_path);
+                icon.setSize(NSSize::new(PANEL_SIZE, PANEL_SIZE));
+                let offset = (i.min(4) * 6) as f64;
+                let frame = NSRect::new(
+                    NSPoint::new(at.x - PANEL_SIZE / 2.0 + offset, at.y - PANEL_SIZE / 2.0 - offset),
+                    NSSize::new(PANEL_SIZE, PANEL_SIZE),
+                );
+                let contents: &AnyObject = &icon;
+                // SAFETY: the contents of a dragging frame may be an NSImage.
+                unsafe { item.setDraggingFrame_contents(frame, Some(contents)) };
+                item
+            })
+            .collect();
+        let items = NSArray::from_retained_slice(&items);
         let session = self.beginDraggingSessionWithItems_event_source(&items, event, ProtocolObject::from_ref(self));
         session.setAnimatesToStartingPositionsOnCancelOrFail(true);
         ACTIVE.store(true, Ordering::SeqCst);
@@ -158,12 +171,12 @@ fn on_main<R: Send + 'static>(timeout: Duration, f: impl FnOnce(MainThreadMarker
     rx.recv_timeout(timeout).ok()
 }
 
-/// Puts the drag panel for `path` under `cursor` (Quartz global
+/// Puts the drag panel for `paths` under `cursor` (Quartz global
 /// coordinates: origin at the main display's top left, y down). The caller
 /// then posts a left-button press there and checks `wait_started`.
-pub fn place_under_cursor(path: &Path, cursor: (f64, f64), main_display_height: f64) -> bool {
+pub fn place_under_cursor(paths: &[PathBuf], cursor: (f64, f64), main_display_height: f64) -> bool {
     STARTED.store(false, Ordering::SeqCst);
-    let path = path.to_path_buf();
+    let paths = paths.to_vec();
     // Cocoa screen coordinates have their origin at the main display's
     // bottom left, y up.
     let center = NSPoint::new(cursor.0, main_display_height - cursor.1);
@@ -187,7 +200,7 @@ pub fn place_under_cursor(path: &Path, cursor: (f64, f64), main_display_height: 
         // transparent window lets clicks fall through to what's below.
         panel.setBackgroundColor(Some(&NSColor::colorWithCalibratedWhite_alpha(0.0, 0.01)));
         panel.setIgnoresMouseEvents(false);
-        let view = DragSourceView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), frame.size), path);
+        let view = DragSourceView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), frame.size), paths);
         panel.setContentView(Some(&view));
         panel.orderFrontRegardless();
         PANEL.with(|p| {

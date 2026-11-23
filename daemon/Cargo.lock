@@ -1369,6 +1369,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "rand",
+ "serde",
  "serde_json",
  "tao",
  "tray-icon",
