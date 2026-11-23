@@ -101,18 +101,18 @@ cable once a wired path appears. Live-found: the same PC answered in under
 1 ms over the cable versus 50 ms on average (135 ms worst) over Wi-Fi,
 where input arrived in bursts. See `daemon/macos/src/route.rs`.
 
-**Mac -> Windows is limited to the small (<1MB) transfer path**, the same
-unresolved wall as the Linux build (see `daemon/PROTOCOL.md`'s big-path section):
-Windows never connects back to pull anything this bridge announces for the
-big path. Consequences:
-- **Images over 1MB are sent downscaled** until their PNG fits (e.g. a
-  busy 2560x1440 screenshot arrives around 1046x588) — reduced resolution
-  rather than not arriving at all.
-- **Mac -> Windows file copy isn't possible** — real MWB always sends files
-  over the big path. Copying a file in Finder leaves Windows' clipboard
-  untouched (instead of sending the file's icon, which a Finder copy also
-  puts on the pasteboard). Dragging files across does work, though (see
-  below).
+**Mac -> Windows big transfers** used to be impossible: Windows never
+connected back to fetch anything this bridge announced. The cause turned
+out to be Windows asking the Mac to push instead (`ClipboardAsk`, see
+`daemon/PROTOCOL.md`), which the bridge ignored. Now answered:
+- **Copying a file in Finder** makes it pasteable on Windows (not yet
+  live-tested): it's sent as soon as you copy, and Windows puts it on its
+  clipboard. One file per copy (Windows' clipboard takes one received file
+  per transfer, so a multi-file copy sends its first), 100MB max, no
+  folders.
+- **Images over 1MB are still sent downscaled** until their PNG fits (e.g.
+  a busy 2560x1440 screenshot arrives around 1046x588). Sending them at
+  full size over the big path should now work too, but hasn't been tried.
 
 **Windows -> Mac files** are saved to
 `~/Library/Caches/mwb-mac-bridge/received-files/` and put on the clipboard

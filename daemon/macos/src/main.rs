@@ -200,9 +200,25 @@ fn run_session(
                     }
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
                 }
+                Some(ClipboardEvent::Files(paths)) => {
+                    let (files, skipped) = drag_out::split_sendable(paths);
+                    for (path, reason) in &skipped {
+                        println!("{} [file-copy] Not sending {} to Windows: {reason}.", timestamp(), path.display());
+                    }
+                    // Windows' clipboard takes one received file per
+                    // transfer, so a multi-file copy sends its first.
+                    if let Some(first) = files.first() {
+                        if files.len() > 1 {
+                            println!("{} [file-copy] {} files copied, only the first can be pasted on Windows.", timestamp(), files.len());
+                        }
+                        *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Files(vec![first.clone()]));
+                        clipboard::announce_big(stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, clipboard::peer_machine_id(shared))?;
+                        println!("{} [file-copy] Copied {}, announced to Windows.", timestamp(), first.display());
+                    }
+                }
                 Some(ClipboardEvent::BigImage(path)) => {
                     *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Image(path));
-                    clipboard::announce_big_image(
+                    clipboard::announce_big(
                         stream,
                         &cipher,
                         &mut write_chain,

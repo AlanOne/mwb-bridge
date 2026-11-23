@@ -39,6 +39,7 @@ pub enum ClipboardEvent {
     Text(String),
     Image(Vec<u8>),    // PNG bytes, small-path (<1MB)
     BigImage(PathBuf),  // PNG bytes already written to a temp file, big-path
+    Files(Vec<PathBuf>), // a Finder file copy, sent big-path
 }
 
 /// Big-path content waiting for Windows to fetch it, either by connecting
@@ -74,6 +75,9 @@ fn outbound_items(outbound: &Outbound) -> Vec<Item> {
 #[derive(Clone)]
 pub struct ClipboardShared {
     last_applied_text: Arc<Mutex<Option<String>>>,
+    // The file last put on the clipboard from Windows, so the watcher
+    // doesn't send it straight back as a new copy.
+    last_applied_files: Arc<Mutex<Vec<PathBuf>>>,
     // Decoded RGBA pixels, *not* PNG container bytes — see
     // `apply_incoming_clipboard_image`'s doc comment for why the comparison
     // has to happen on pixels rather than the outer PNG encoding.
@@ -89,6 +93,7 @@ impl ClipboardShared {
     pub fn new() -> Self {
         Self {
             last_applied_text: Arc::new(Mutex::new(None)),
+            last_applied_files: Arc::new(Mutex::new(Vec::new())),
             last_applied_image_rgba: Arc::new(Mutex::new(None)),
             pending_outbound: Arc::new(Mutex::new(None)),
             peer_machine_id: Arc::new(Mutex::new(None)),
@@ -316,19 +321,23 @@ fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usi
 pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShared) {
     let mut last_seen_image = read_local_clipboard_image_rgba();
     let mut last_seen_text = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+    let mut last_seen_files = read_local_clipboard_files();
     loop {
         std::thread::sleep(Duration::from_millis(500));
 
-        // A Finder file copy also puts the file's *icon* on the pasteboard
-        // as TIFF (and its name as plain text) — reading either would send
-        // Windows a picture of a generic document icon, or a bare filename,
-        // clobbering its clipboard with something the user never meant to
-        // copy. File transfer isn't ported, so leave Windows' clipboard
-        // alone entirely while files are what's on ours.
-        let has_files = Clipboard::new().ok().and_then(|mut cb| cb.get().file_list().ok()).is_some_and(|f| !f.is_empty());
-        if has_files {
+        let files = read_local_clipboard_files();
+        if !files.is_empty() {
+            if is_new_file_copy(&files, &last_seen_files, &shared.last_applied_files.lock().unwrap()) {
+                let _ = clip_tx.send(ClipboardEvent::Files(files.clone()));
+            }
+            last_seen_files = files;
+            // A Finder file copy also puts the file's *icon* on the
+            // pasteboard as TIFF (and its name as plain text): sending
+            // either would clobber Windows' clipboard with a picture of a
+            // document icon or a bare file name.
             continue;
         }
+        last_seen_files = files;
 
         let current_image = read_local_clipboard_image_rgba();
         if let Some((width, height, ref raw)) = current_image {
@@ -369,15 +378,29 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
     }
 }
 
-/// Announces big-path image content to the peer: the `Clipboard` beat,
-/// then — if we've learned the peer's machine ID from something it's sent
-/// us already — a follow-up `MachineSwitched` addressed directly to it.
-/// Real MWB's own auto-pull is gated on `MachineSwitched`, not the beat
-/// alone (see PROTOCOL.md); without this follow-up, a real PowerToys
-/// install never actually connects to fetch what's been announced. Mirrors
-/// the Linux build's `announce_big_path` exactly (same protocol, same
-/// gotchas — see its doc comment there for the fuller rationale).
-pub fn announce_big_image(
+/// The files on the local clipboard (a Finder copy), if any.
+fn read_local_clipboard_files() -> Vec<PathBuf> {
+    Clipboard::new().ok().and_then(|mut cb| cb.get().file_list().ok()).unwrap_or_default()
+}
+
+/// Whether the files on the clipboard are a new copy to send to Windows:
+/// not what the last poll already saw, and not the file just received from
+/// Windows (`last_applied`).
+fn is_new_file_copy(current: &[PathBuf], last_seen: &[PathBuf], last_applied: &[PathBuf]) -> bool {
+    !current.is_empty() && current != last_seen && current != last_applied
+}
+
+/// Announces big-path content (a big image, or a copied file) to the peer:
+/// the `Clipboard` beat, then — if we've learned the peer's machine ID from
+/// something it's sent us already — a `MachineSwitched` addressed directly
+/// to it. Windows only fetches announced content around a switch
+/// (Receiver.cs's MachineSwitched case, or its own switch back to itself
+/// within 30s of the beat); the `MachineSwitched` makes it fetch right away,
+/// which reaches us as a ClipboardAsk (see `push_to_windows`). Real switches
+/// also send `HideMouse` first; it's left out here, since on Windows it
+/// hides the cursor and releases every held key while the user is still
+/// working on the Mac.
+pub fn announce_big(
     stream: &mut TcpStream,
     cipher: &CbcState,
     write_chain: &mut [u8; 16],
@@ -392,10 +415,6 @@ pub fn announce_big_image(
     stream.write_all(&cipher.encrypt(write_chain, &beat))?;
 
     if let Some(des_id) = peer_machine_id {
-        let mut hide = build_hide_mouse(rand::rng().random(), src_id, des_id);
-        finalize_send_buf(&mut hide, magic_number);
-        stream.write_all(&cipher.encrypt(write_chain, &hide))?;
-
         let mut switched = build_machine_switched(rand::rng().random(), src_id, des_id);
         finalize_send_buf(&mut switched, magic_number);
         stream.write_all(&cipher.encrypt(write_chain, &switched))?;
@@ -548,7 +567,10 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
     let dest = dir.join(safe_file_name(&name));
     std::fs::write(&dest, &body)?; // fully flushed before the clipboard is touched below
     match Clipboard::new().and_then(|mut cb| cb.set().file_list(&[&dest])) {
-        Ok(()) => println!("[file-pull] Received {:?} ({size} bytes) from Windows -> {}", dest.file_name().unwrap_or_default(), dest.display()),
+        Ok(()) => {
+            *shared.last_applied_files.lock().unwrap() = vec![dest.clone()];
+            println!("[file-pull] Received {:?} ({size} bytes) from Windows -> {}", dest.file_name().unwrap_or_default(), dest.display());
+        }
         Err(e) => eprintln!("[file-pull] Saved {} but failed to put it on the clipboard: {e}", dest.display()),
     }
     Ok(())
@@ -806,5 +828,36 @@ mod push_tests {
             ("two.bin".to_string(), vec![7u8; 64], POST_ACTION_DESKTOP),
         ]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod file_copy_tests {
+    use super::*;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_new_file_copy_is_sent() {
+        assert!(is_new_file_copy(&paths(&["/a.txt"]), &[], &[]));
+        assert!(is_new_file_copy(&paths(&["/b.txt"]), &paths(&["/a.txt"]), &[]));
+    }
+
+    #[test]
+    fn the_same_copy_seen_again_is_not_resent() {
+        assert!(!is_new_file_copy(&paths(&["/a.txt"]), &paths(&["/a.txt"]), &[]));
+    }
+
+    #[test]
+    fn a_file_just_received_from_windows_is_not_bounced_back() {
+        let received = paths(&["/cache/received-files/a.txt"]);
+        assert!(!is_new_file_copy(&received, &[], &received));
+    }
+
+    #[test]
+    fn no_files_is_nothing_to_send() {
+        assert!(!is_new_file_copy(&[], &paths(&["/a.txt"]), &[]));
     }
 }
