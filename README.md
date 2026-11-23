@@ -106,8 +106,9 @@ in Explorer or Finder across the screen edge and let go on the other
 machine, as with real MWB (PowerToys' "Transfer file" setting must be on).
 One file at a time, 100MB max, no folders, same as real MWB.
 - **Windows -> Mac**: drops into whatever app you let go over (a Finder
-  window, the Desktop, a chat app's attachment area...), not yet
-  live-tested. As soon as the drag reaches the Mac the file starts
+  window, the Desktop, a chat app's attachment area...), live-tested
+  2026-11-23, including going back to Windows mid-drag, which cancels it
+  cleanly. As soon as the drag reaches the Mac the file starts
   downloading and a real macOS drag of it is started under the cursor (see
   `daemon/macos/src/drag_source.rs`); letting go waits for the download to
   finish if needed. If you let go before the drag could start, the file is
