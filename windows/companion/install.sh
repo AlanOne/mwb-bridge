@@ -21,7 +21,7 @@ if [ "$HAS_RUNTIME" != "True" ]; then
 fi
 echo "==> Building..."
 rm -rf "$DIR/bin/publish"
-"$DOTNET" publish "$DIR/MwbBridgeCompanion.csproj" -c Release -r win-x64 --self-contained "$SELF_CONTAINED" -o "$DIR/bin/publish" -v quiet
+"$DOTNET" publish "$DIR/MwbBridgeCompanion.csproj" -c Release -r win-x64 --self-contained "$SELF_CONTAINED" --source https://api.nuget.org/v3/index.json -o "$DIR/bin/publish" -v quiet
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT

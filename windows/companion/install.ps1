@@ -31,6 +31,8 @@ if (-not $hasRuntime) { "No machine-wide .NET 8 desktop runtime: bundling the ru
 
 $staging = Join-Path $env:TEMP "mwb-companion-stage"
 Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
-& $dotnet publish (Join-Path $PSScriptRoot "MwbBridgeCompanion.csproj") -c Release -r win-x64 --self-contained $selfContained -o (Join-Path $staging "app") -v quiet
+# nuget.org named explicitly: bundling needs the runtime packs from it, and
+# a PC's own NuGet config may list no sources (seen on CHP-ALANJ).
+& $dotnet publish (Join-Path $PSScriptRoot "MwbBridgeCompanion.csproj") -c Release -r win-x64 --self-contained $selfContained --source https://api.nuget.org/v3/index.json -o (Join-Path $staging "app") -v quiet
 if ($LASTEXITCODE -ne 0) { throw "Build failed." }
 & (Join-Path $PSScriptRoot "setup.ps1") -Staging $staging
