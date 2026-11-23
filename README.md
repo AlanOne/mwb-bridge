@@ -158,8 +158,9 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
   over. Letting go before they've fully arrived holds the drop until they
   have. If the drag can't start, they're saved to
   `Desktop\MouseWithoutBorders\` as before.
-- **File copy and paste** goes through it too, both ways (not yet
-  live-tested): files copied in Explorer land on the Mac's clipboard, and
+- **File copy and paste** goes through it too, both ways (live-tested
+  2026-11-23: 7 files from Finder to Explorer, 2 from Explorer to Finder):
+  files copied in Explorer land on the Mac's clipboard, and
   files copied in Finder on Windows' clipboard, all of them, as soon as
   they've arrived. PowerToys only sends one file per copy, up to 100MB.
 - No size limit per file; folders still aren't supported (zip them).
