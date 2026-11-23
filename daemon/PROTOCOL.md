@@ -610,9 +610,14 @@ forwarded release drops it (after waiting for the download, if needed).
 Fetching early has a side effect on Windows: accepting the clipboard
 connection resets its own drag state (`SendOrReceiveClipboardData` sets
 `IsDragging = false`, `DragMachine = 1`). So if the cursor goes back to
-Windows with the button still held, Windows doesn't send 71: it sends 72 as
-if a new drag were starting on the Mac. While a drop is over us, 72 is
-therefore treated as the drag leaving, not as a question to answer.
+Windows with the button still held, Windows doesn't send 71. In theory it
+sends 72 as if a new drag were starting on the Mac (so while a drop is over
+us, 72 counts as the drag leaving, not a question to answer), but live
+2026-11-23 it sent neither: Windows' own `MouseDown` is apparently already
+cleared by the helper's injected release. The only sign was the `HideMouse`
+(50) every switch away from a machine sends it, and without handling it the
+Mac's drag hung at the screen edge until the next click dropped it wherever
+the cursor was. `HideMouse` addressed to us now cancels a drop too.
 
 **Mac -> Windows.** Windows tracks the left button for every machine, so
 when the cursor crosses back with it held (`Event.PrepareToSwitchToMachine`

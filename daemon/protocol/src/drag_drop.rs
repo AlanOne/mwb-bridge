@@ -8,7 +8,7 @@
 use crate::input_handling::{WM_LBUTTONUP, WM_RBUTTONUP};
 use crate::mwb_protocol::{
     ID_ALL, PACKAGE_TYPE_CLIPBOARD_DRAG_DROP, PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END,
-    PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, PACKAGE_TYPE_EXPLORER_DRAG_DROP,
+    PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, PACKAGE_TYPE_EXPLORER_DRAG_DROP, PACKAGE_TYPE_HIDE_MOUSE,
 };
 
 /// What the platform build should do after a package or mouse message.
@@ -60,6 +60,10 @@ impl DragDropState {
             }
             // The drag went back without a drop (DragDropStep12).
             PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_END => self.cancel(),
+            // Control left this machine (Windows sends this on every switch
+            // away from us). Once the file has been fetched early, Windows
+            // no longer tracks the drag and this is the only sign it left.
+            PACKAGE_TYPE_HIDE_MOUSE if des == self.my_id => self.cancel(),
             // While a drop is over us, this means the cursor went back to
             // Windows with the button still held: Windows stops tracking its
             // own drag once the file has been fetched, so it takes this for
@@ -158,6 +162,18 @@ mod tests {
         let mut s = dropping();
         assert_eq!(s.on_package(PACKAGE_TYPE_EXPLORER_DRAG_DROP, WINDOWS, ME), DragAction::DropCancelled);
         assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::None);
+    }
+
+    #[test]
+    fn control_leaving_this_machine_mid_drop_cancels_it() {
+        // Live 2026-11-23: going back to Windows with the button held sent
+        // no 71 or 72, only the HideMouse every switch away from us sends,
+        // and the drag here was left hanging at the screen edge.
+        let mut s = dropping();
+        assert_eq!(s.on_package(PACKAGE_TYPE_HIDE_MOUSE, WINDOWS, ME), DragAction::DropCancelled);
+        assert_eq!(s.on_mouse(WM_LBUTTONUP), DragAction::None);
+        // An ordinary switch away, with no drop going on, is nothing to us.
+        assert_eq!(s.on_package(PACKAGE_TYPE_HIDE_MOUSE, WINDOWS, ME), DragAction::None);
     }
 
     #[test]
