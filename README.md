@@ -145,9 +145,9 @@ since PowerToys only reports single-file drags.
   explains the big-path wall above.
 
 **Windows companion app: several files, and dropping into any Windows
-app.** Mac -> Windows live-tested 2026-11-23 (four files dragged from
-Finder into a Windows app); Windows -> Mac doesn't work yet (the drag isn't
-caught when it crosses, being worked on). `windows/companion/` is a
+app.** Live-tested both ways 2026-11-23: four files dragged from Finder
+into a Windows app, and 3 and then 12 files dragged from Explorer straight
+into a Mac app. `windows/companion/` is a
 small C# tray app for the Windows PC that takes over file drag-and-drop
 from PowerToys, which can only hand over one file per drag and always
 saves a drop to `Desktop\MouseWithoutBorders\`. With it:

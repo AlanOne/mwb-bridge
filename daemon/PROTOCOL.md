@@ -680,8 +680,9 @@ and the real release happens on the other machine. So the companion never
 injects while the Mac has control. When the Mac gets 77 it sends `ACTIVE`,
 and the companion watches for a drag that crossed over. (It can't tell
 from Windows' button state: live, `GetAsyncKeyState(VK_LBUTTON)` reported
-the button up while a drag was crossing, so it puts the catcher up on every
-switch and stands down after 1.5s if no drag arrives.) MWB
+the button up while a drag was crossing, though the drag's own key state,
+handed to the catcher on `DragEnter`, had it down. So it puts the catcher up
+on every switch and stands down after 1.5s if no drag arrives.) MWB
 parks the Windows cursor (`Common.HideMouseCursor`: the primary screen's
 centre, or y=4 with HideMouse on) and the Windows drag keeps hovering
 there. The companion covers the whole desktop with a nearly transparent
