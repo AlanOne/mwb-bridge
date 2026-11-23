@@ -143,6 +143,70 @@ sealed class Coordinator
 
     /// Files dragged on the Mac came to Windows: start a Windows drag of
     /// them under the cursor while the bytes arrive.
+    // ---- File copy and paste ----------------------------------------
+
+    string[] _lastSetOnClipboard = Array.Empty<string>();
+    string[] _lastOffered = Array.Empty<string>();
+    DateTime _lastOfferedAt;
+
+    /// Files copied on the Mac: put them on Windows' clipboard once they've
+    /// all arrived, as if copied in Explorer.
+    public IncomingDrop RegisterCopy(OfferMsg offer)
+    {
+        var drop = IncomingDrop.Create(offer, IncomingDrop.CopiesRoot);
+        _fromMac[offer.Id] = drop;
+        drop.Completed = () => Post(() =>
+        {
+            try
+            {
+                var list = new System.Collections.Specialized.StringCollection();
+                list.AddRange(drop.Paths);
+                Clipboard.SetFileDropList(list);
+                _lastSetOnClipboard = drop.Paths;
+                Log.Write($"[copy] {drop.Paths.Length} file(s) copied on the Mac are on the clipboard.");
+            }
+            catch (Exception e)
+            {
+                Log.Write($"[copy] Couldn't put the files copied on the Mac on the clipboard: {e.Message}");
+            }
+        });
+        return drop;
+    }
+
+    /// The Windows clipboard changed: if it's a file copy made here, offer
+    /// the files to the bridge.
+    public void OnClipboardChanged()
+    {
+        string[] files;
+        try
+        {
+            if (!Clipboard.ContainsFileDropList()) return;
+            files = Clipboard.GetFileDropList().Cast<string>().ToArray();
+        }
+        catch (Exception e)
+        {
+            Log.Write($"[copy] Couldn't read the clipboard: {e.Message}");
+            return;
+        }
+        // Our own paste of the Mac's files, or Explorer announcing the same
+        // copy twice in a row.
+        if (files.SequenceEqual(_lastSetOnClipboard)) return;
+        if (files.SequenceEqual(_lastOffered) && DateTime.Now - _lastOfferedAt < TimeSpan.FromSeconds(2)) return;
+        foreach (var skipped in files.Where(f => !File.Exists(f)))
+        {
+            Log.Write($"[copy] Skipping {skipped}: folders aren't supported, zip it first.");
+        }
+        var sendable = files.Where(File.Exists).ToArray();
+        if (sendable.Length == 0) return;
+        _lastOffered = files;
+        _lastOfferedAt = DateTime.Now;
+        var id = Interlocked.Increment(ref _nextId);
+        _toMac[id] = sendable;
+        var offer = new OfferMsg(id, sendable.Select(f => new FileInfoMsg(Path.GetFileName(f), (ulong)new FileInfo(f).Length)).ToList());
+        var sent = SendToBridge?.Invoke(Frames.ClipboardToMac, offer) == true;
+        Log.Write($"[copy] {sendable.Length} file(s) copied here {(sent ? "offered to the bridge" : "not sent: no bridge connected")} ({id}): {string.Join(", ", offer.Files.Select(f => f.Name))}");
+    }
+
     public IncomingDrop Register(OfferMsg offer)
     {
         var drop = IncomingDrop.Create(offer);
@@ -272,10 +336,14 @@ sealed class IncomingDrop
     }
 
     public static string Root { get; } = Path.Combine(Path.GetTempPath(), "MwbBridgeCompanion", "drops");
+    public static string CopiesRoot { get; } = Path.Combine(Path.GetTempPath(), "MwbBridgeCompanion", "copies");
 
-    public static IncomingDrop Create(OfferMsg offer)
+    /// Runs (on a network thread) once every file has arrived.
+    public Action? Completed { get; set; }
+
+    public static IncomingDrop Create(OfferMsg offer, string? root = null)
     {
-        var dir = Path.Combine(Root, offer.Id.ToString());
+        var dir = Path.Combine(root ?? Root, offer.Id.ToString());
         Directory.CreateDirectory(dir);
         var paths = offer.Files.Select(f => Path.Combine(dir, SafeName(f.Name))).ToArray();
         // Empty placeholders, so the drag can start before the bytes arrive.
@@ -300,7 +368,8 @@ sealed class IncomingDrop
         }
         if (all)
         {
-            Log.Write($"[to-windows] Drag {Id}: all {Paths.Length} file(s) arrived.");
+            Log.Write($"[to-windows] {Id}: all {Paths.Length} file(s) arrived.");
+            Completed?.Invoke();
             if (_saveToDesktop) SaveToDesktop();
         }
     }
@@ -326,7 +395,7 @@ sealed class IncomingDrop
     {
         try
         {
-            foreach (var d in Directory.Exists(Root) ? Directory.GetDirectories(Root) : Array.Empty<string>())
+            foreach (var d in new[] { Root, CopiesRoot }.Where(Directory.Exists).SelectMany(Directory.GetDirectories))
             {
                 if (DateTime.Now - Directory.GetLastWriteTime(d) > TimeSpan.FromDays(1)) Directory.Delete(d, recursive: true);
             }

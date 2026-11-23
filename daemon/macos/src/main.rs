@@ -184,10 +184,13 @@ fn run_session(
 
     loop {
         // Files dragged on Windows that the companion says are now over
-        // this Mac.
-        if clipboard.is_some()
+        // this Mac, and files copied there.
+        if let Some((_, shared)) = clipboard.as_ref()
             && let Some(link) = companion::link()
         {
+            for offer in link.take_clipboard_offers() {
+                clipboard::receive_companion_copy(link, offer, shared);
+            }
             for offer in link.take_offers() {
                 if drag.start_drop() == DragAction::DropStarted {
                     println!("{} [drop] {} file(s) dragged on Windows are over this Mac.", timestamp(), offer.files.len());
@@ -219,6 +222,17 @@ fn run_session(
                         stream.write_all(&ct)?;
                     }
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
+                }
+                Some(ClipboardEvent::Files(paths)) if companion::link().is_some_and(|l| l.is_connected()) => {
+                    // The companion takes every file, of any size.
+                    let (files, folders): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.is_file());
+                    for path in &folders {
+                        println!("{} [file-copy] Not sending {} to Windows: folders aren't supported, zip it first.", timestamp(), path.display());
+                    }
+                    if !files.is_empty() {
+                        let link = companion::link().unwrap();
+                        link.offer_files(mwb_protocol::companion::CLIPBOARD_TO_WINDOWS, files, "copy");
+                    }
                 }
                 Some(ClipboardEvent::Files(paths)) => {
                     let (files, skipped) = drag_out::split_sendable(paths);
@@ -548,30 +562,9 @@ fn offer_to_companion(link: &std::sync::Arc<companion::Link>, cg: &mut CgInput, 
         println!("{} [drag-out] Not sending {} to Windows: folders aren't supported, zip it first.", timestamp(), path.display());
     }
     cg.cancel_drag();
-    if files.is_empty() {
-        return;
+    if !files.is_empty() {
+        link.offer_files(mwb_protocol::companion::OFFER_TO_WINDOWS, files, "drag");
     }
-    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-    let offer = mwb_protocol::companion::Offer {
-        id,
-        files: files
-            .iter()
-            .map(|p| mwb_protocol::companion::FileInfo {
-                name: p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
-                size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
-            })
-            .collect(),
-    };
-    if !link.send(mwb_protocol::companion::OFFER_TO_WINDOWS, &offer) {
-        return;
-    }
-    let names: Vec<&str> = offer.files.iter().map(|f| f.name.as_str()).collect();
-    println!("{} [drag-out] Dragging {} to Windows through the companion (drag {id}).", timestamp(), names.join(", "));
-    let link = link.clone();
-    std::thread::spawn(move || match link.put_files(id, &files) {
-        Ok(()) => println!("[drag-out] Sent drag {id}'s {} file(s) to the companion.", files.len()),
-        Err(e) => eprintln!("[drag-out] Sending drag {id} to the companion failed: {e}"),
-    });
 }
 
 fn run_client(

@@ -27,6 +27,7 @@ sealed class TrayContext : ApplicationContext
     readonly NotifyIcon _tray;
     readonly ToolStripMenuItem _statusItem = new("Waiting for the bridge") { Enabled = false };
     readonly Control _ui = new();
+    ClipboardWatcher? _clipboard;
 
     public TrayContext(Config config)
     {
@@ -40,6 +41,7 @@ sealed class TrayContext : ApplicationContext
 
         var coordinator = new Coordinator(_ui);
         new Server(config, coordinator, SetStatus).Start();
+        _clipboard = new ClipboardWatcher(coordinator.OnClipboardChanged);
 
         if (Config.MwbTransferFileOn())
         {
@@ -56,5 +58,27 @@ sealed class TrayContext : ApplicationContext
             _statusItem.Text = bridge == null ? "Waiting for the bridge" : $"Connected to {bridge}";
             _tray.Text = bridge == null ? "MWB Bridge Companion: waiting" : $"MWB Bridge Companion: {bridge}";
         });
+    }
+}
+
+/// Calls back on the UI thread whenever the clipboard changes.
+sealed class ClipboardWatcher : NativeWindow
+{
+    readonly Action _changed;
+
+    public ClipboardWatcher(Action changed)
+    {
+        _changed = changed;
+        CreateHandle(new CreateParams());
+        if (!Native.AddClipboardFormatListener(Handle))
+        {
+            Log.Write($"Couldn't watch the clipboard: {System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
+        }
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == Native.WM_CLIPBOARDUPDATE) _changed();
+        base.WndProc(ref m);
     }
 }

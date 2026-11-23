@@ -709,6 +709,17 @@ until every file is complete. The user's real release, which Windows does
 see now, ends the drag. Only `Copy` is allowed, so Explorer copies rather
 than moves out of the temp folder.
 
+**File copy and paste** goes through the companion too while it's
+connected, since "Transfer file" off stops PowerToys sending files copied
+on Windows. The companion watches the Windows clipboard
+(`AddClipboardFormatListener`) and offers a new file copy with
+`CLIPBOARD_TO_MAC` (6); the bridge fetches the files over a "get" data
+connection and puts them all on its clipboard. A Finder copy goes the other
+way with `CLIPBOARD_TO_WINDOWS` (8) and a "put" connection, and the
+companion puts the files on the Windows clipboard once they've all arrived.
+Each side remembers what it last put on its own clipboard, so a received
+copy isn't offered straight back.
+
 ## The real blocker was never the wire protocol — it was Windows-side state
 
 Everything above (crypto/framing/handshake) was correct from early in the

@@ -24,6 +24,8 @@ pub struct Link {
     connected: AtomicBool,
     /// Offers of files dragged on Windows, waiting for the network thread.
     offers: Mutex<Vec<Offer>>,
+    /// Offers of files copied on Windows, waiting for the network thread.
+    clipboard_offers: Mutex<Vec<Offer>>,
     /// The Windows PC currently connected to (its key and our name).
     config: Arc<Mutex<Config>>,
 }
@@ -43,6 +45,7 @@ pub fn start(config: Arc<Mutex<Config>>, peer: fn() -> Option<SocketAddr>) {
         addr: Mutex::new(None),
         connected: AtomicBool::new(false),
         offers: Mutex::new(Vec::new()),
+        clipboard_offers: Mutex::new(Vec::new()),
         config,
     });
     if LINK.set(link.clone()).is_ok() {
@@ -123,6 +126,14 @@ impl Link {
                     }
                     Err(e) => eprintln!("[companion] Unreadable offer: {e}"),
                 },
+                Ok((proto::CLIPBOARD_TO_MAC, body)) => match serde_json::from_slice::<Offer>(&body) {
+                    Ok(offer) => {
+                        let names: Vec<&str> = offer.files.iter().map(|f| f.name.as_str()).collect();
+                        println!("[companion] Files copied on Windows ({}): {}", offer.id, names.join(", "));
+                        self.clipboard_offers.lock().unwrap().push(offer);
+                    }
+                    Err(e) => eprintln!("[companion] Unreadable clipboard offer: {e}"),
+                },
                 Ok((other, _)) => println!("[companion] Ignoring frame {other}."),
                 Err(e) => {
                     println!("[companion] Connection to the companion ended: {e}");
@@ -164,6 +175,39 @@ impl Link {
     /// Offers of files dragged on Windows that arrived since the last call.
     pub fn take_offers(&self) -> Vec<Offer> {
         std::mem::take(&mut *self.offers.lock().unwrap())
+    }
+
+    /// Offers of files copied on Windows that arrived since the last call.
+    pub fn take_clipboard_offers(&self) -> Vec<Offer> {
+        std::mem::take(&mut *self.clipboard_offers.lock().unwrap())
+    }
+
+    /// Offers `files` under a fresh id with `frame` (a drag or a copy) and
+    /// sends their bytes in the background. False if the companion isn't
+    /// reachable.
+    pub fn offer_files(self: &Arc<Self>, frame: u32, files: Vec<PathBuf>, what: &'static str) -> bool {
+        let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let offer = Offer {
+            id,
+            files: files
+                .iter()
+                .map(|p| proto::FileInfo {
+                    name: p.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                    size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+                })
+                .collect(),
+        };
+        if !self.send(frame, &offer) {
+            return false;
+        }
+        let names: Vec<&str> = offer.files.iter().map(|f| f.name.as_str()).collect();
+        println!("[companion] Sending {what} {id} to Windows: {}", names.join(", "));
+        let link = self.clone();
+        std::thread::spawn(move || match link.put_files(id, &files) {
+            Ok(()) => println!("[companion] Sent {what} {id}'s {} file(s).", files.len()),
+            Err(e) => eprintln!("[companion] Sending {what} {id} failed: {e}"),
+        });
+        true
     }
 
     fn data_connection(&self, op: &str, id: u64) -> std::io::Result<(FrameWriter<TcpStream>, proto::FrameReader<TcpStream>)> {

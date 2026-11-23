@@ -84,6 +84,11 @@ static class Native
         return $"0x{hwnd.ToInt64():x} {name} ({process})";
     }
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool AddClipboardFormatListener(IntPtr hwnd);
+
+    public const int WM_CLIPBOARDUPDATE = 0x031D;
+
     /// Whether Windows thinks the left button is down.
     public static bool LeftButtonDown() => (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
 

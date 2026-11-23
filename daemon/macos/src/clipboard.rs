@@ -585,6 +585,27 @@ fn received_files_dir() -> PathBuf {
     cache_dir().join("received-files")
 }
 
+/// Files copied on Windows, offered by the companion: fetches them all
+/// into a folder of their own under `received_files_dir`, then puts them on
+/// the clipboard, as a Finder copy of them would.
+pub fn receive_companion_copy(link: &Arc<crate::companion::Link>, offer: mwb_protocol::companion::Offer, shared: &ClipboardShared) {
+    let root = received_files_dir().join("copies");
+    crate::drag_in::prune_old_drags(&root, Duration::from_secs(24 * 3600));
+    let dir = root.join(offer.id.to_string());
+    let link = link.clone();
+    let shared = shared.clone();
+    std::thread::spawn(move || match link.fetch_files(&offer, &dir, |_| {}) {
+        Ok(paths) => match Clipboard::new().and_then(|mut cb| cb.set().file_list(&paths)) {
+            Ok(()) => {
+                *shared.last_applied_files.lock().unwrap() = paths.clone();
+                println!("[file-copy] {} file(s) copied on Windows are on the clipboard.", paths.len());
+            }
+            Err(e) => eprintln!("[file-copy] Received {} file(s) but couldn't put them on the clipboard: {e}", paths.len()),
+        },
+        Err(e) => eprintln!("[file-copy] Fetching files copied on Windows failed: {e}"),
+    });
+}
+
 /// Where a file dragged from Windows lands when it's let go before it could
 /// be handed to an app: the Mac counterpart of where real MWB saves a drop
 /// on Windows (`Desktop\MouseWithoutBorders\`). A later file with the same

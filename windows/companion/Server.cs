@@ -113,6 +113,9 @@ sealed class Server
                         var drop = _coordinator.Register(FrameConnection.Parse<OfferMsg>(body));
                         _coordinator.Post(() => _coordinator.OnOfferToWindows(drop));
                         break;
+                    case Frames.ClipboardToWindows:
+                        _coordinator.RegisterCopy(FrameConnection.Parse<OfferMsg>(body));
+                        break;
                     case Frames.Cancel:
                         var cancel = FrameConnection.Parse<CancelMsg>(body);
                         _coordinator.Post(() => _coordinator.OnCancel(cancel.Id));

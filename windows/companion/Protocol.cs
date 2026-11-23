@@ -17,7 +17,9 @@ static class Frames
     public const uint Inactive = 3;
     public const uint OfferToWindows = 4;
     public const uint OfferToMac = 5;
+    public const uint ClipboardToMac = 6;
     public const uint Cancel = 7;
+    public const uint ClipboardToWindows = 8;
     public const uint FileHeader = 10;
     public const uint FileChunk = 11;
     public const uint FileEnd = 12;

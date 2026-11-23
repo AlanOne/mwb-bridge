@@ -38,10 +38,16 @@ pub const INACTIVE: u32 = 3;
 pub const OFFER_TO_WINDOWS: u32 = 4;
 /// The drag of an offer ended without a drop. `Cancel` payload.
 pub const CANCEL: u32 = 7;
+/// Files copied on this machine: put them on Windows' clipboard once they
+/// arrive. `Offer` payload; the bytes follow over a `put` data connection.
+pub const CLIPBOARD_TO_WINDOWS: u32 = 8;
 // Control connection, companion -> bridge.
 /// Files dragged on Windows went to this machine. `Offer` payload; fetch
 /// the bytes over a `get` data connection.
 pub const OFFER_TO_MAC: u32 = 5;
+/// Files copied on Windows: fetch them (a `get` data connection) and put
+/// them on this machine's clipboard. `Offer` payload.
+pub const CLIPBOARD_TO_MAC: u32 = 6;
 // Data connections: per file a header, its bytes in chunks, an end; then
 // one `DONE` after the last file.
 pub const FILE_HEADER: u32 = 10;
