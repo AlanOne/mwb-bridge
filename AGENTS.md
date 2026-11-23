@@ -62,9 +62,14 @@ encryption; `daemon/protocol/src/companion.rs` and
 `windows/companion/Protocol.cs` are the two ends of that protocol and must
 stay in step. Build it on the Mac with the .NET 8 SDK (`~/.dotnet/dotnet
 build -c Release` in that folder) and install it with
-`windows/companion/install.sh <ssh-host>`. AlanOnePC is reachable as the
-SSH host `alanonepc` (PowerShell shell); a GUI app has to be started in the
-user's session, which setup.ps1 does with a logon scheduled task. Its log is
+`windows/companion/install.sh <ssh-host>`, or on the PC itself with
+`windows\companion\install.ps1` (`-InstallSdk` adds a user-level .NET 8 SDK).
+It reads the security key from MWB's own `settings.json` (`SecurityKey`,
+stored in plain text), unless `%APPDATA%\MwbBridgeCompanion\config.json`
+sets one. AlanOnePC is reachable as the SSH host `alanonepc` (PowerShell
+shell); CHP-ALANJ has no SSH, only a T3 linked environment. A GUI app has to
+be started in the user's session, which setup.ps1 does with a logon
+scheduled task (or a Startup shortcut without admin). Its log is
 `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log`.
 
 Network facts that matter:

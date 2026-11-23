@@ -62,7 +62,7 @@ sealed class Server
         try
         {
             client.NoDelay = true;
-            conn = FrameConnection.Open(client, _config.SecurityKey);
+            conn = FrameConnection.Open(client, _config.SecurityKey ?? throw new IOException("no security key"));
             var hello = conn.ReadJson<HelloMsg>(Frames.Hello);
             if (hello.Role == "control")
             {

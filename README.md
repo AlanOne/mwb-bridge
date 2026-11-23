@@ -173,14 +173,21 @@ Setup:
    two fight (the companion shows a warning while it's on). It also stops
    PowerToys sending files copied on Windows, which the companion does
    instead.
-2. From the Mac: `windows/companion/install.sh <ssh-host>`. It needs SSH
-   access to the PC (PowerShell as the SSH shell) and the .NET 8 SDK on the
-   Mac (`~/.dotnet` works). It builds the app, copies it to
-   `%LOCALAPPDATA%\MwbBridgeCompanion\app\`, writes
-   `%APPDATA%\MwbBridgeCompanion\config.json` with that PC's security key
-   from the Mac's config, opens TCP port 15102 to the local network in the
-   firewall, and registers a "MWB Bridge Companion" task that starts it at
-   logon (and starts it now). Re-run it to update.
+2. Install it, either on the PC itself with
+   `powershell -ExecutionPolicy Bypass -File windows\companion\install.ps1`
+   from a checkout of this repo (add `-InstallSdk` to install the .NET 8 SDK
+   for the current user first), or from the Mac with
+   `windows/companion/install.sh <ssh-host>` (needs SSH access to the PC,
+   PowerShell as the SSH shell, and the .NET 8 SDK on the Mac, `~/.dotnet`
+   works). Either builds the app, copies it to
+   `%LOCALAPPDATA%\MwbBridgeCompanion\app\`, opens TCP port 15102 to the
+   local network in the firewall and registers a "MWB Bridge Companion"
+   logon task that starts it (and starts it now). Without admin rights it
+   uses a Startup-folder shortcut instead, and the firewall rule is left to
+   Windows' own prompt. The security key is read from PowerToys' Mouse
+   Without Borders settings, so there's nothing to configure;
+   `%APPDATA%\MwbBridgeCompanion\config.json` can override it
+   (`{"security_key": "...", "port": 15102}`). Re-run either to update.
 3. The Mac bridge finds the companion by itself on the PC it's connected
    to. Without one it uses PowerToys' own drag-and-drop, as above.
 
@@ -591,8 +598,9 @@ Past that point, everything is automatic.
 - `daemon/macos/` — the macOS menu-bar app (`src/main.rs`) and its
   packaging (`packaging/install.sh`, `Info.plist`, LaunchAgent template).
 - `windows/companion/` — the optional Windows tray app that takes over file
-  drag-and-drop (C#, .NET 8), with `install.sh` (run on the Mac) and
-  `setup.ps1` (run on the PC by it).
+  drag-and-drop and file copy (C#, .NET 8), with `install.ps1` (run on the
+  PC), `install.sh` (run on the Mac, over SSH) and `setup.ps1` (run on the
+  PC by both). `windows/companion-tests/` checks its protocol code.
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
   plus everything learned about Windows-side state (the Matrix/MachinePool
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).

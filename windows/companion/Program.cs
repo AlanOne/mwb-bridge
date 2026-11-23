@@ -11,9 +11,9 @@ static class Program
         ApplicationConfiguration.Initialize();
         Log.Write("Starting.");
         var config = Config.Load();
-        if (config == null)
+        if (config.SecurityKey == null)
         {
-            MessageBox.Show($"No security key configured.\n\nCreate {Config.FilePath} with\n{{\"security_key\": \"<the Mouse Without Borders key>\"}}",
+            MessageBox.Show($"No security key found: Mouse Without Borders doesn't seem to be set up in PowerToys.\n\nSet it up there, or put one in {Config.FilePath} as\n{{\"security_key\": \"...\"}}",
                 "MWB Bridge Companion", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
