@@ -65,7 +65,7 @@ fn set_socket_timeouts(stream: &TcpStream) {
 // `mwb_protocol::input_handling`, shared verbatim with the macOS daemon —
 // see that module's doc comment. `WaylandInput`'s `InputSink` impl (in
 // wayland_input.rs) is this platform's only actual divergence.
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, release_keys, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP};
 
 /// Shared state between the client connection's receive loop, the file-
 /// server listener (port 15100), and the local clipboard-watcher thread —
@@ -550,6 +550,8 @@ fn run_session(
     // Must stay unique across reconnects, not just within this connection
     // (see initial_package_id and build_clipboard_text_packages).
     let mut next_clip_id: u32 = initial_package_id();
+    let mut authenticated = false;
+    let mut ignored_before_handshake = false;
 
     loop {
         if let Some(rx) = clipboard_rx {
@@ -610,6 +612,15 @@ fn run_session(
         if !valid {
             continue;
         }
+        // Nothing but the handshake counts until the peer has answered our
+        // challenge: a replayed or redirected stream must not inject input.
+        if !authenticated && !matches!(package_type, PACKAGE_TYPE_HANDSHAKE | PACKAGE_TYPE_HANDSHAKE_ACK) {
+            if !ignored_before_handshake {
+                println!("[{role}] Ignoring packages until the peer answers the handshake challenge.");
+                ignored_before_handshake = true;
+            }
+            continue;
+        }
         let src_id = unpack_u32_le(&full, 8);
         if src_id != 0 && src_id != ID_ALL {
             *shared.peer_machine_id.lock().unwrap() = Some(src_id);
@@ -629,6 +640,7 @@ fn run_session(
                 let m3 = unpack_u32_le(&full, 24);
                 let m4 = unpack_u32_le(&full, 28);
                 let matched = m1 == our_flipped[0] && m2 == our_flipped[1] && m3 == our_flipped[2] && m4 == our_flipped[3];
+                authenticated |= matched;
                 println!("[{role}] HandshakeAck received, challenge match: {matched}");
                 if role == "client" {
                     let peer = String::from_utf8_lossy(&full[32..64]).trim_end().to_string();
@@ -642,7 +654,6 @@ fn run_session(
                 let wheel = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(w) = wl.as_deref_mut() {
-                    println!(">>> MOUSE x={x} y={y} wheel={wheel} flags=0x{flags:x}");
                     // Relative mode: the cursor was pushed off the edge facing
                     // Windows or a configured neighbour, so ask Windows to switch.
                     if let Some(back) = handle_mouse(w, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed) {
@@ -664,8 +675,17 @@ fn run_session(
                     lock_local_machine();
                 }
                 if let Some(w) = wl.as_deref_mut() {
-                    println!(">>> KEYBOARD vk=0x{vk:x} flags=0x{flags:x}");
                     handle_keyboard(w, &mut kb_state, vk, flags);
+                }
+            }
+            PACKAGE_TYPE_HIDE_MOUSE => {
+                // Control left this machine: let go of the keys Windows left
+                // held, as real MWB does (`ReleaseAllKeys`). Mouse buttons
+                // stay held, as there: a release would drop a drag at the edge.
+                if unpack_u32_le(&full, 12) == cfg.machine_id
+                    && let Some(w) = wl.as_deref_mut()
+                {
+                    release_keys(w, &mut kb_state);
                 }
             }
             PACKAGE_TYPE_CLIPBOARD_TEXT | PACKAGE_TYPE_CLIPBOARD_IMAGE => {
@@ -905,8 +925,10 @@ fn run_client(
     if let Ok(clone) = stream.try_clone() {
         *current_stream.lock().unwrap() = Some(clone);
     }
-    let result = run_session(stream, Some(wl), "client", cfg, Some(clipboard_rx), shared);
+    let result = run_session(stream, Some(&mut *wl), "client", cfg, Some(clipboard_rx), shared);
     *current_stream.lock().unwrap() = None;
+    // Anything still held when the connection dropped would stay down.
+    wl.release_everything();
     result
 }
 

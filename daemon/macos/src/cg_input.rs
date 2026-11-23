@@ -340,15 +340,28 @@ impl CgInput {
     /// (every later click became a Command-click, and every key a shortcut)
     /// or the left button held (every later move became a drag).
     pub fn reset(&mut self) {
-        while let Some((_, down_type, field)) = self.held_buttons.pop() {
-            let up_type = match down_type {
-                CGEventType::LeftMouseDown => CGEventType::LeftMouseUp,
-                CGEventType::RightMouseDown => CGEventType::RightMouseUp,
-                _ => CGEventType::OtherMouseUp,
-            };
-            self.sync_position();
-            self.post_mouse(up_type, field, Some(self.click_count));
+        // A drag cut off by the connection: cancel it before letting go, or
+        // the release drops it wherever the cursor is.
+        if self.left_button_held() {
+            self.post_escape();
         }
+        self.release_held_buttons();
+        self.reset_keys();
+    }
+
+    /// Forgets a pending tap of the Windows key (or Ctrl's AltGr pairing),
+    /// so the release that follows isn't taken as a tap: a Windows-key tap
+    /// opens Spotlight. For releases made here rather than by the user.
+    pub fn forget_taps(&mut self) {
+        self.win_tapped = false;
+        self.altgr_ctrl_cancelled = false;
+    }
+
+    /// The keyboard half of `reset`: lets go of every modifier and key this
+    /// sink posted and forgets the modifier state, leaving mouse buttons
+    /// alone (control leaving mid-drag must not drop the drag).
+    pub fn reset_keys(&mut self) {
+        self.forget_taps();
         self.mods = ModifierState::default();
         self.flags = CGEventFlags::CGEventFlagNull;
         for (_, keycode) in std::mem::take(&mut self.posted_modifiers) {
@@ -362,8 +375,6 @@ impl CgInput {
         if std::mem::take(&mut self.app_switch_open) {
             self.post_key(windows_keys::VK_COMMAND, false, self.flags, CGEventTapLocation::Session, false);
         }
-        self.win_tapped = false;
-        self.altgr_ctrl_cancelled = false;
         self.ctrl_as_command = true;
         self.win_as_control = true;
     }
@@ -372,6 +383,18 @@ impl CgInput {
     pub fn cursor(&mut self) -> (f64, f64) {
         self.sync_position();
         (self.pos.x, self.pos.y)
+    }
+
+    fn release_held_buttons(&mut self) {
+        while let Some((_, down_type, field)) = self.held_buttons.pop() {
+            let up_type = match down_type {
+                CGEventType::LeftMouseDown => CGEventType::LeftMouseUp,
+                CGEventType::RightMouseDown => CGEventType::RightMouseUp,
+                _ => CGEventType::OtherMouseUp,
+            };
+            self.sync_position();
+            self.post_mouse(up_type, field, Some(self.click_count));
+        }
     }
 
     pub fn left_button_held(&self) -> bool {
@@ -384,15 +407,23 @@ impl CgInput {
     /// cursor was parked at the screen edge, e.g. moving it to the Desktop.
     /// Real MWB does the same job by releasing over its own helper window.
     pub fn cancel_drag(&mut self) {
-        const KVK_ESCAPE: u16 = 53;
-        self.post_key(KVK_ESCAPE, true, self.flags, CGEventTapLocation::HID, false);
-        self.post_key(KVK_ESCAPE, false, self.flags, CGEventTapLocation::HID, false);
-        // Let the drag session see the cancel before the release arrives.
-        std::thread::sleep(Duration::from_millis(50));
+        self.post_escape();
         if self.left_button_held() {
             use mwb_protocol::input_handling::InputSink;
             self.button(mwb_protocol::input_handling::BTN_LEFT, false);
         }
+    }
+
+    /// Escape, which cancels a drag in progress, then a pause so the drag
+    /// session sees it before any release that follows.
+    fn post_escape(&mut self) {
+        const KVK_ESCAPE: u16 = 53;
+        // Without modifiers: a held Ctrl or Alt must not turn it into a
+        // shortcut that doesn't cancel the drag.
+        let none = CGEventFlags::CGEventFlagNull;
+        self.post_key(KVK_ESCAPE, true, none, CGEventTapLocation::HID, false);
+        self.post_key(KVK_ESCAPE, false, none, CGEventTapLocation::HID, false);
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     fn desktop_bounds(&mut self) -> CGRect {

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::{self, Config};
 use mwb_protocol::drag_drop::{DragAction, DragDropState};
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN, WM_MOUSEMOVE};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, release_keys, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN, WM_MOUSEMOVE};
 use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
@@ -181,6 +181,7 @@ fn run_session(
     // from Windows (like a ClipboardAsk this bridge didn't handle for a
     // long time) shows up in the log instead of vanishing.
     let mut unhandled_seen = std::collections::HashSet::new();
+    let mut ignored_before_handshake = false;
 
     loop {
         // Files dragged on Windows that the companion says are now over
@@ -293,6 +294,15 @@ fn run_session(
             if invalid_count == 5 {
                 println!("{} [client] Peer's packets don't decrypt with our security key — has it changed in PowerToys?", timestamp());
                 config::write_status(false, "", "Peer's packets don't decrypt — check the security key");
+            }
+            continue;
+        }
+        // Nothing but the handshake counts until the peer has answered our
+        // challenge: a replayed or redirected stream must not inject input.
+        if !*handshook && !matches!(package_type, PACKAGE_TYPE_HANDSHAKE | PACKAGE_TYPE_HANDSHAKE_ACK) {
+            if !ignored_before_handshake {
+                println!("{} [client] Ignoring packages until the peer answers the handshake challenge.", timestamp());
+                ignored_before_handshake = true;
             }
             continue;
         }
@@ -461,6 +471,24 @@ fn run_session(
                         }
                         _ => {}
                     }
+                }
+                // Control left this Mac: let go of the keys Windows left held,
+                // after the drag handling above has had its say. The mouse
+                // button stays held, as on real MWB (a release would drop a
+                // drag at the edge), except that a file drag nobody took
+                // (no companion, PowerToys' own drag-and-drop off) is
+                // cancelled, not left hanging.
+                if package_type == PACKAGE_TYPE_HIDE_MOUSE
+                    && des_id == cfg.machine_id
+                    && let Some(cg) = cg.as_deref_mut()
+                {
+                    if cg.left_button_held() && !drag_out.dragged_files().is_empty() {
+                        println!("{} [drag-out] A file drag left for Windows with nothing to take it, cancelling it here.", timestamp());
+                        cg.cancel_drag();
+                    }
+                    cg.forget_taps();
+                    release_keys(cg, &mut kb_state);
+                    cg.reset_keys();
                 }
             }
             PACKAGE_TYPE_CLIPBOARD_ASK => {

@@ -1,3 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["protocol", "linux", "macos"]
+
+# A panic on any thread ends the process, so launchd (KeepAlive) or systemd
+# (Restart=always) restarts the bridge, instead of leaving a live tray icon
+# over a dead network thread.
+[profile.release]
+panic = "abort"

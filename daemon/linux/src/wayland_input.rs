@@ -176,6 +176,10 @@ pub struct WaylandInput {
     // moves fall back to plain relative motion without edge switching.
     layout: Option<(f64, f64)>,
     rel_pos: (f64, f64),
+    // What's held down right now, so it can all be let go of when the
+    // connection ends (`release_everything`).
+    held_keys: std::collections::HashSet<u32>,
+    held_buttons: std::collections::HashSet<u32>,
 }
 
 /// Logical size of the whole monitor layout (bounding box), from Hyprland.
@@ -241,7 +245,16 @@ impl WaylandInput {
             Some((w, h)) => println!("[mouse] Output layout {w}x{h} (for relative mode)."),
             None => println!("[mouse] Couldn't read the monitor layout from hyprctl; relative mode won't switch back at edges."),
         }
-        Self { event_queue, state, pointer, keyboard, layout, rel_pos: (0.0, 0.0) }
+        Self {
+            event_queue,
+            state,
+            pointer,
+            keyboard,
+            layout,
+            rel_pos: (0.0, 0.0),
+            held_keys: Default::default(),
+            held_buttons: Default::default(),
+        }
     }
 
     fn flush(&mut self) {
@@ -269,6 +282,11 @@ impl WaylandInput {
     /// BTN_LEFT, 0x111 = BTN_RIGHT, 0x112 = BTN_MIDDLE).
     pub fn button(&mut self, button_code: u32, pressed: bool) {
         let state = if pressed { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+        if pressed {
+            self.held_buttons.insert(button_code);
+        } else {
+            self.held_buttons.remove(&button_code);
+        }
         self.pointer.button(now_ms(), button_code, state);
         self.pointer.frame();
         self.flush();
@@ -295,8 +313,39 @@ impl WaylandInput {
     /// XKB keycode (which is evdev + 8).
     pub fn key(&mut self, evdev_code: u32, pressed: bool) {
         let state = if pressed { 1 } else { 0 };
+        if pressed {
+            self.held_keys.insert(evdev_code);
+        } else {
+            self.held_keys.remove(&evdev_code);
+        }
         self.keyboard.key(now_ms(), evdev_code, state);
         self.flush();
+    }
+
+    /// Releases every held mouse button.
+    pub fn release_buttons(&mut self) {
+        for button in std::mem::take(&mut self.held_buttons) {
+            self.button(button, false);
+        }
+    }
+
+    /// Releases every held key and button and clears the modifiers: for a
+    /// connection that ended with something still down, which the
+    /// compositor would otherwise keep held (and auto-repeat). A held button
+    /// may be a drag: Escape first cancels it rather than dropping it
+    /// wherever the cursor is.
+    pub fn release_everything(&mut self) {
+        for key in std::mem::take(&mut self.held_keys) {
+            self.key(key, false);
+        }
+        // Modifiers cleared first, so Escape goes out plain.
+        self.raw_modifiers(0, 0, 0, 0);
+        if !self.held_buttons.is_empty() {
+            const KEY_ESC: u32 = 1;
+            self.key(KEY_ESC, true);
+            self.key(KEY_ESC, false);
+        }
+        self.release_buttons();
     }
 
     /// Sets the full modifier mask directly (depressed/latched/locked groups

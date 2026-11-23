@@ -236,6 +236,21 @@ pub trait InputSink {
     fn modifiers(&mut self, state: ModifierState, numlock: bool);
 }
 
+/// Lets go of every key Windows left held here: every key `handle_keyboard`
+/// pressed and hasn't released, and the modifiers. Real MWB does the same
+/// (`ReleaseAllKeys`) when control leaves a machine (`HideMouse`): after a
+/// hotkey switch like Ctrl+Alt+F1 the key releases go to the new machine,
+/// so without this Ctrl and Alt stay down here and every later click and
+/// key is a shortcut. Mouse buttons are left alone, as real MWB does:
+/// releasing one would drop whatever is being dragged at the screen edge.
+pub fn release_keys(sink: &mut impl InputSink, state: &mut KeyboardState) {
+    for code in state.pressed_keys.drain() {
+        sink.key(code, false);
+    }
+    state.mods = ModState::new();
+    sink.modifiers(ModifierState::default(), false);
+}
+
 struct ModState {
     state: ModifierState,
 }
@@ -563,5 +578,67 @@ mod relative_mode_tests {
         let (mut sink, mut st) = (FakeSink::default(), MouseState::new(None, vec![]));
         handle_mouse(&mut sink, &mut st, rel(0), rel(0), 0, WM_LBUTTONDOWN, 1.0);
         assert!(sink.relative.is_empty() && sink.absolute.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorder {
+        keys: Vec<(u32, bool)>,
+        repeats: Vec<u32>,
+        last_mods: Option<ModifierState>,
+        buttons: Vec<(u32, bool)>,
+    }
+
+    impl InputSink for Recorder {
+        fn move_absolute(&mut self, _: u32, _: u32, _: u32, _: u32) {}
+        fn move_relative(&mut self, _: i32, _: i32) -> Option<EdgeExit> { None }
+        fn button(&mut self, code: u32, pressed: bool) { self.buttons.push((code, pressed)); }
+        fn scroll_vertical(&mut self, _: f64) {}
+        fn scroll_horizontal(&mut self, _: f64) {}
+        fn key(&mut self, code: u32, pressed: bool) { self.keys.push((code, pressed)); }
+        fn key_repeat(&mut self, code: u32) { self.repeats.push(code); }
+        fn modifiers(&mut self, state: ModifierState, _: bool) { self.last_mods = Some(state); }
+    }
+
+    const VK_LCONTROL: u32 = 0xA2;
+    const VK_A: u32 = 0x41;
+
+    #[test]
+    fn releasing_lets_go_of_held_keys_and_modifiers_but_not_buttons() {
+        let (mut sink, mut kb) = (Recorder::default(), KeyboardState::new());
+        // Ctrl+A held, as when a hotkey switch happens with keys down.
+        handle_keyboard(&mut sink, &mut kb, VK_LCONTROL, 0);
+        handle_keyboard(&mut sink, &mut kb, VK_A, 0);
+        let mut mouse = MouseState::new(None, vec![]);
+        handle_mouse(&mut sink, &mut mouse, 100, 100, 0, WM_LBUTTONDOWN, 1.0);
+        sink.keys.clear();
+        sink.buttons.clear();
+
+        release_keys(&mut sink, &mut kb);
+
+        let mut released: Vec<u32> = sink.keys.iter().map(|&(c, p)| { assert!(!p); c }).collect();
+        released.sort();
+        let mut expected = vec![vk_to_evdev(VK_LCONTROL).unwrap(), vk_to_evdev(VK_A).unwrap()];
+        expected.sort();
+        assert_eq!(released, expected);
+        assert!(!sink.last_mods.unwrap().ctrl);
+        // A held button may be a drag on its way to Windows: releasing it
+        // here would drop it at the screen edge.
+        assert!(sink.buttons.is_empty());
+    }
+
+    #[test]
+    fn after_releasing_a_new_press_is_a_press_not_a_repeat() {
+        let (mut sink, mut kb) = (Recorder::default(), KeyboardState::new());
+        handle_keyboard(&mut sink, &mut kb, VK_A, 0);
+        release_keys(&mut sink, &mut kb);
+        sink.keys.clear();
+        handle_keyboard(&mut sink, &mut kb, VK_A, 0);
+        assert_eq!(sink.keys, vec![(vk_to_evdev(VK_A).unwrap(), true)]);
+        assert!(sink.repeats.is_empty());
     }
 }

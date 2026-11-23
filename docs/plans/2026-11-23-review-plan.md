@@ -90,6 +90,14 @@ Connection:
 Each phase is a few commits; every commit updates README and AGENTS.md as the repo rules require, and marks what was live-tested.
 
 ### Phase 0: safety and privacy (small, do first)
+
+**Done** (Grok-reviewed; type-checked and unit-tested, not live-tested).
+The review changed the plan: real MWB's `ReleaseAllKeys` releases keys
+only, so `release_keys` leaves mouse buttons alone (releasing one drops a
+drag at the edge). On the Mac a file drag nothing on Windows takes is
+cancelled instead, a pending Windows-key tap is forgotten first (else
+Spotlight opens), and on disconnect Escape goes before any button release.
+
 - Remove Linux key and mouse logging (B2).
 - Add a shared `release_all` to the input sinks and call it on `HideMouse` (after the drag handling) and at session end, Mac and Linux (B1).
 - Inject nothing until the handshake challenge has matched (B11).

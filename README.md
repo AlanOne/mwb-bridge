@@ -94,6 +94,19 @@ noticing, so a watchdog spots the wall clock jumping ahead and drops it,
 and the normal reconnect runs straight away instead of after the 5-minute
 read timeout.
 
+**Switching away releases held keys** (both builds, type-checked and
+unit-tested only): when control leaves this machine, every key and
+modifier Windows left held is released, as real MWB does. Before, a hotkey
+switch such as Ctrl+Alt+F1 could leave Ctrl and Alt held here, turning
+every later click and key into a shortcut. Mouse buttons stay held, as on
+real MWB, since releasing one would drop a drag at the screen edge; on the
+Mac a file drag that nothing on Windows takes over is cancelled instead.
+When the connection drops with a button held, Escape cancels any drag
+before the button is released. Both builds also ignore
+everything but the handshake until Windows has answered the handshake
+challenge, so a replayed or redirected connection can't inject input, and
+the Linux build no longer logs every key and mouse packet to the journal.
+
 **Wired over Wi-Fi**: when Windows answers on both an Ethernet cable and
 Wi-Fi (mDNS returns an address per interface), the bridge tries the wired
 addresses first, and a connection that ended up on Wi-Fi moves to the
