@@ -139,6 +139,10 @@ impl Fetch {
 #[derive(Default)]
 pub struct IncomingDrag {
     current: Option<Incoming>,
+    // Let go of over this Mac before the files had arrived: the release
+    // is held back (the macOS drag stays where it was let go) until they
+    // have, or until EARLY_RELEASE_WAIT runs out.
+    held_release: Option<(Arc<Fetch>, std::time::Instant)>,
 }
 
 struct Incoming {
@@ -152,9 +156,31 @@ struct Incoming {
     gave_up: bool,
 }
 
-// How long a release waits for the file to finish downloading before the
-// drop goes ahead (an app reads the file when it's dropped).
-const DOWNLOAD_WAIT: Duration = Duration::from_secs(120);
+// How long a release let go before the files have arrived is held back
+// waiting for them (an app reads the files when they're dropped). After
+// that the drag is cancelled and the files are saved to the drop folder
+// once they arrive, rather than keeping the cursor frozen.
+pub const EARLY_RELEASE_WAIT: Duration = Duration::from_secs(3);
+
+/// What to do about a held-back release, given the download's outcome so
+/// far and how long the release has been held.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReleaseStep {
+    Wait,
+    /// Post the release: the files are in, drop them into the app.
+    Drop,
+    /// Cancel the macOS drag, then this for the files.
+    Cancel(After),
+}
+
+pub fn release_step(outcome: &Option<Result<Vec<PathBuf>, String>>, waited: Duration) -> ReleaseStep {
+    match outcome {
+        Some(Ok(_)) => ReleaseStep::Drop,
+        Some(Err(_)) => ReleaseStep::Cancel(After::Discard),
+        None if waited >= EARLY_RELEASE_WAIT => ReleaseStep::Cancel(After::SaveToDropFolder),
+        None => ReleaseStep::Wait,
+    }
+}
 // Drag folders older than this are deleted when a new drag starts.
 const KEEP_DRAGS: Duration = Duration::from_secs(24 * 3600);
 
@@ -229,25 +255,79 @@ impl IncomingDrag {
     }
 
     /// The button was released over this Mac. Called before the release is
-    /// posted, which is what drops the file into the app under the cursor.
-    pub fn dropped(&mut self, cg: &mut CgInput) {
-        let Some(incoming) = self.current.take() else { return };
+    /// posted, which is what drops the files into the app under the cursor.
+    /// Returns true when the release must not be posted yet: the files are
+    /// still arriving, and `tick` posts it once they have.
+    pub fn dropped(&mut self, cg: &mut CgInput) -> bool {
+        let Some(incoming) = self.current.take() else { return false };
         if !incoming.dragging {
             incoming.fetch.then(After::SaveToDropFolder);
-            return;
+            return false;
         }
-        match incoming.fetch.wait(DOWNLOAD_WAIT) {
-            Some(Ok(_)) => incoming.fetch.then(After::Keep),
-            failed => {
-                let why = match failed {
-                    Some(Err(e)) => e,
-                    _ => "it took too long".to_string(),
-                };
-                eprintln!("[drop] Fetching the file failed ({why}), cancelling the drop.");
+        match release_step(&incoming.fetch.wait(Duration::ZERO), Duration::ZERO) {
+            ReleaseStep::Drop => {
+                incoming.fetch.then(After::Keep);
+                false
+            }
+            ReleaseStep::Cancel(after) => {
+                eprintln!("[drop] Fetching the files failed, cancelling the drop.");
                 cg.cancel_drag();
-                incoming.fetch.then(After::Discard);
+                incoming.fetch.then(after);
+                false
+            }
+            ReleaseStep::Wait => {
+                println!("[drop] Let go before the files arrived, holding the drop for up to {}s.", EARLY_RELEASE_WAIT.as_secs());
+                self.held_release = Some((incoming.fetch, std::time::Instant::now()));
+                true
             }
         }
+    }
+
+    /// Whether a release is being held back: mouse moves mustn't be posted
+    /// meanwhile, or the drop would land somewhere else.
+    pub fn holding_release(&self) -> bool {
+        self.held_release.is_some()
+    }
+
+    /// Called regularly by the input loop: finishes a held-back release
+    /// once the files are in, or once it has waited long enough.
+    pub fn tick(&mut self, cg: &mut CgInput) {
+        let Some((_, since)) = self.held_release.as_ref() else { return };
+        let waited = since.elapsed();
+        self.finish_held(cg, waited);
+    }
+
+    /// Ends a held-back release now, without waiting any longer: dropped
+    /// into the app if the files are in, otherwise cancelled and saved to
+    /// the drop folder (or discarded if fetching them failed). For anything
+    /// but a mouse move happening meanwhile (a click, a key, the wheel, a
+    /// new drag) and for control leaving this Mac, since each of those
+    /// would otherwise end the macOS drag behind this one's back. Leaves
+    /// the left button up either way.
+    pub fn settle(&mut self, cg: &mut CgInput) {
+        self.finish_held(cg, EARLY_RELEASE_WAIT);
+    }
+
+    fn finish_held(&mut self, cg: &mut CgInput, waited: Duration) {
+        let Some((fetch, _)) = self.held_release.as_ref() else { return };
+        match release_step(&fetch.wait(Duration::ZERO), waited) {
+            ReleaseStep::Wait => return,
+            ReleaseStep::Drop => {
+                println!("[drop] The files arrived, dropping them.");
+                cg.button(BTN_LEFT, false);
+                fetch.then(After::Keep);
+            }
+            ReleaseStep::Cancel(after) => {
+                if after == After::SaveToDropFolder {
+                    println!("[drop] The files are still arriving, saving them to the drop folder instead.");
+                } else {
+                    eprintln!("[drop] Fetching the files failed, cancelling the drop.");
+                }
+                cg.cancel_drag();
+                fetch.then(after);
+            }
+        }
+        self.held_release = None;
     }
 
     /// The drag left without a drop here.
@@ -257,6 +337,17 @@ impl IncomingDrag {
             cg.cancel_drag();
         }
         incoming.fetch.then(After::Discard);
+    }
+}
+
+impl Drop for IncomingDrag {
+    // The connection ended while a release was held back. The caller
+    // cancels the macOS drag (CgInput::reset); the user did let go, so the
+    // files still end up in the drop folder once they arrive.
+    fn drop(&mut self) {
+        if let Some((fetch, _)) = self.held_release.take() {
+            fetch.then(After::SaveToDropFolder);
+        }
     }
 }
 
@@ -391,6 +482,31 @@ mod tests {
         assert!(tmp.0.join("drop/a.txt").exists() && tmp.0.join("drop/b.txt").exists());
         fetch.then(After::Discard);
         assert!(!dir.exists(), "both files and their folder are gone");
+    }
+
+    #[test]
+    fn an_early_release_waits_then_drops_or_gives_up() {
+        let done: Option<Result<Vec<PathBuf>, String>> = Some(Ok(vec![PathBuf::from("/a")]));
+        let failed: Option<Result<Vec<PathBuf>, String>> = Some(Err("reset".into()));
+        assert_eq!(release_step(&None, Duration::from_millis(100)), ReleaseStep::Wait);
+        assert_eq!(release_step(&done, Duration::from_millis(100)), ReleaseStep::Drop);
+        assert_eq!(release_step(&failed, Duration::from_millis(100)), ReleaseStep::Cancel(After::Discard));
+        // Still downloading after the wait: hand control back and save the
+        // files where a drop would have gone without an app.
+        assert_eq!(release_step(&None, EARLY_RELEASE_WAIT), ReleaseStep::Cancel(After::SaveToDropFolder));
+        // Finished just in time still drops.
+        assert_eq!(release_step(&done, EARLY_RELEASE_WAIT), ReleaseStep::Drop);
+    }
+
+    #[test]
+    fn a_connection_lost_during_a_held_drop_still_saves_the_files() {
+        let tmp = TempDir::new("held-lost");
+        let (fetch, path) = fetched(&tmp);
+        let mut incoming = IncomingDrag::default();
+        incoming.held_release = Some((fetch.clone(), std::time::Instant::now()));
+        drop(incoming); // the session ended
+        fetch.finished(Ok(vec![path]));
+        assert_eq!(std::fs::read(tmp.0.join("drop/report.pdf")).unwrap(), b"pdf");
     }
 
     #[test]

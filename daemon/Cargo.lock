@@ -1399,6 +1399,7 @@ dependencies = [
  "cbc",
  "flate2",
  "hex",
+ "libc",
  "pbkdf2",
  "rand",
  "serde",

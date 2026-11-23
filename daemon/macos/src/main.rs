@@ -40,6 +40,9 @@ use drag_out::DragOut;
 // gaps) — see the mwb-omarchy-bridge project memory.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 
+// The input loop's longest sleep while Windows sends nothing.
+const INPUT_LOOP_TICK: Duration = Duration::from_millis(50);
+
 // Same message-server port MWB uses on every machine. Windows expects a
 // symmetric pair of sockets (one per direction) between two paired
 // machines — live-tested against the real Windows PC on 2026-09-22:
@@ -147,6 +150,11 @@ fn run_session(
     clipboard: Option<(&Receiver<ClipboardEvent>, &ClipboardShared)>,
     handshook: &mut bool,
 ) -> std::io::Result<()> {
+    // A peer that vanished (sleep, cable, Windows crash) is noticed within
+    // about half a minute, on the reverse leg as well as ours.
+    if let Err(e) = mwb_protocol::net::keep_session_alive(stream) {
+        eprintln!("[client] Couldn't turn on TCP keepalive: {e}");
+    }
     let magic_number = get_24bit_hash(&cfg.security_key);
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(stream, &cfg.security_key)?;
 
@@ -182,8 +190,13 @@ fn run_session(
     // long time) shows up in the log instead of vanishing.
     let mut unhandled_seen = std::collections::HashSet::new();
     let mut ignored_before_handshake = false;
+    let mut last_data = std::time::Instant::now();
 
     loop {
+        // A release held back for files still arriving (see IncomingDrag).
+        if let Some(cg) = cg.as_deref_mut() {
+            incoming.tick(cg);
+        }
         // Files dragged on Windows that the companion says are now over
         // this Mac, and files copied there.
         if let Some((_, shared)) = clipboard.as_ref()
@@ -195,6 +208,9 @@ fn run_session(
             for offer in link.take_offers() {
                 if drag.start_drop() == DragAction::DropStarted {
                     println!("{} [drop] {} file(s) dragged on Windows are over this Mac.", timestamp(), offer.files.len());
+                    if let Some(cg) = cg.as_deref_mut() {
+                        incoming.settle(cg);
+                    }
                     incoming.start_companion(link, offer);
                 } else {
                     println!("{} [drop] Ignoring the companion's drag {}: another drop is already going on.", timestamp(), offer.id);
@@ -224,17 +240,16 @@ fn run_session(
                     }
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
                 }
-                Some(ClipboardEvent::Files(paths)) if companion::link().is_some_and(|l| l.is_connected()) => {
-                    // The companion takes every file, of any size.
-                    let (files, folders): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.is_file());
-                    for path in &folders {
+                Some(ClipboardEvent::Files(paths)) if companion::link().is_some_and(|l| l.is_connected()) && {
+                    // The companion takes every file, of any size. If the
+                    // offer can't be sent (the link just died), the copy
+                    // goes the PowerToys way below instead.
+                    let files: Vec<_> = paths.iter().filter(|p| p.is_file()).cloned().collect();
+                    for path in paths.iter().filter(|p| !p.is_file()) {
                         println!("{} [file-copy] Not sending {} to Windows: folders aren't supported, zip it first.", timestamp(), path.display());
                     }
-                    if !files.is_empty() {
-                        let link = companion::link().unwrap();
-                        link.offer_files(mwb_protocol::companion::CLIPBOARD_TO_WINDOWS, files, "copy");
-                    }
-                }
+                    files.is_empty() || companion::link().unwrap().offer_files(mwb_protocol::companion::CLIPBOARD_TO_WINDOWS, files, "copy")
+                } => {}
                 Some(ClipboardEvent::Files(paths)) => {
                     let (files, skipped) = drag_out::split_sendable(paths);
                     for (path, reason) in &skipped {
@@ -267,6 +282,15 @@ fn run_session(
             }
         }
 
+        // Wake up at least this often even when Windows sends nothing (an
+        // inactive machine gets a heartbeat only every few minutes), so a
+        // copy made here, a companion offer or a held-back drop isn't left
+        // waiting for the next package. A dead peer is caught by TCP
+        // keepalive (set above), which makes the socket readable with an
+        // error, or else by nothing arriving for SOCKET_TIMEOUT.
+        if !mwb_protocol::net::wait_for_package(stream, INPUT_LOOP_TICK, &mut last_data, SOCKET_TIMEOUT)? {
+            continue;
+        }
         let mut ct = [0u8; PACKAGE_SIZE];
         stream.read_exact(&mut ct)?;
         let mut pt = cipher.decrypt(&mut read_chain, &ct);
@@ -339,22 +363,36 @@ fn run_session(
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(cg) = cg.as_deref_mut() {
                     lag.arrived(stream);
+                    // Anything but a move while a release is held back
+                    // (a click, the wheel) would end the macOS drag behind
+                    // its back, so the held drop is settled first.
+                    if flags != WM_MOUSEMOVE {
+                        incoming.settle(cg);
+                    }
                     if flags == WM_LBUTTONDOWN {
                         drag_out.mouse_down();
                     }
                     // A drag from Windows is settled before this packet is
                     // posted: the release posted below is what drops it.
+                    let mut post = true;
                     match drag.on_mouse(flags) {
                         DragAction::Dropped => {
                             println!("{} [drop] A file dragged on Windows was let go over this Mac.", timestamp());
-                            incoming.dropped(cg);
+                            // Held back while the files are still arriving.
+                            post = !incoming.dropped(cg);
                         }
                         DragAction::DropCancelled => incoming.cancelled(cg),
                         _ if flags == WM_MOUSEMOVE => incoming.on_move(cg),
                         _ => {}
                     }
+                    // While a release is held back, the drag mustn't move
+                    // away from where it was let go (other input settles it,
+                    // above).
+                    if incoming.holding_release() {
+                        post = false;
+                    }
                     let started = std::time::Instant::now();
-                    let switch = handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed);
+                    let switch = if post { handle_mouse(cg, &mut mouse_state, x, y, wheel, flags, cfg.scroll_speed) } else { None };
                     lag.injected(if flags == 0x200 { "a mouse move" } else { "a click/scroll" }, started);
                     // Relative mode: the cursor was pushed off the edge facing
                     // Windows or a configured neighbour, so ask Windows to switch.
@@ -379,6 +417,9 @@ fn run_session(
                 }
                 if let Some(cg) = cg.as_deref_mut() {
                     lag.arrived(stream);
+                    // A key during a held-back drop (Escape, say) would end
+                    // the macOS drag behind its back: settle it first.
+                    incoming.settle(cg);
                     let started = std::time::Instant::now();
                     handle_keyboard(cg, &mut kb_state, vk, flags);
                     lag.injected("a key", started);
@@ -440,6 +481,15 @@ fn run_session(
                 // and PowerToys' own should be off ("Transfer file").
                 let companion = companion::link().filter(|l| l.is_connected() && clipboard.is_some());
                 if package_type == PACKAGE_TYPE_HIDE_MOUSE {
+                    // A drop held back here ends now (the user let go here),
+                    // before the button state is read: it holds the left
+                    // button down, which the companion would take for a
+                    // drag going back to Windows.
+                    if des_id == cfg.machine_id
+                        && let Some(cg) = cg.as_deref_mut()
+                    {
+                        incoming.settle(cg);
+                    }
                     if des_id == cfg.machine_id
                         && let (Some(link), Some(cg)) = (companion, cg.as_deref_mut())
                     {
@@ -464,7 +514,10 @@ fn run_session(
                 }
                 if let (Some(cg), Some((_, shared))) = (cg.as_deref_mut(), clipboard.as_ref()) {
                     match action {
-                        DragAction::DropStarted => incoming.start(cfg, stream.peer_addr().ok()),
+                        DragAction::DropStarted => {
+                            incoming.settle(cg);
+                            incoming.start(cfg, stream.peer_addr().ok());
+                        }
                         DragAction::DropCancelled => incoming.cancelled(cg),
                         DragAction::CheckOutgoingDrag { to } => {
                             offer_outgoing_drag(stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, to, &mut next_clip_id, cg, &drag_out, shared)?;
@@ -642,6 +695,10 @@ fn watch_for_wake() {
         {
             println!("[client] {} Woke from sleep, reconnecting.", timestamp());
             let _ = stream.shutdown(Shutdown::Both);
+            // The companion link lived through the same sleep.
+            if let Some(link) = companion::link() {
+                link.disconnect("woke from sleep");
+            }
         }
     }
 }

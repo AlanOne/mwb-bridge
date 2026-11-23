@@ -107,6 +107,25 @@ Spotlight opens), and on disconnect Escape goes before any button release.
 - Risk: releasing buttons during a drag-out. Keep the drag cancel first.
 
 ### Phase 1: the input thread never blocks (B3, B4, B6, B14, B16)
+
+**Done** (Grok-reviewed; type-checked and unit-tested, not live-tested).
+Done differently from the plan below: instead of a shared locked writer,
+the input loop waits for data with `poll` for at most 50ms, so its top
+(clipboard events, companion offers, the held drop release) runs at least
+that often and the MWB connection keeps a single writer. TCP keepalive
+(15s, 5s, 3 probes) on the MWB and companion connections detects a dead
+peer. An early release on the Mac is held back for up to 3 seconds, then
+the macOS drag is cancelled and the files go to the drop folder. The
+review found the hold leaking: a click, key, new drag or HideMouse during
+it ended the macOS drag behind its back (and told the companion the
+button was still held), and a lost connection lost the files. Each of
+those now settles the hold first, and ending the session saves the files.
+It also found that `poll` never trips the read timeout, so the reverse
+connection gets keepalive too and the wait gives up after 5 quiet
+minutes. Kept as it was: the drag start still sleeps (40ms, plus up to 300ms waiting for
+the session to start), which needs the main thread's answer and is left
+for Phase 4.
+
 - Shared locked writer for the MWB connection. The clipboard watcher and the companion thread send directly.
 - `dropped()` records "release when the fetch completes" and returns. A worker waits for the fetch and then signals the input thread, which posts the release, so injection stays on one thread. Drag start becomes a small state machine instead of sleeps.
 - Companion socket: read and write timeouts, keepalive, cut on wake with the MWB socket. A failed send marks it disconnected and falls back to the PowerToys path.

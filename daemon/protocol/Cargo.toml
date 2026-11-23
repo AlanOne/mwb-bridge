@@ -8,6 +8,7 @@ aes = "0.9.3"
 cbc = "0.2.1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hex = "0.4.3"
+libc = "0.2"
 pbkdf2 = "0.13.0"
 rand = "0.10.2"
 serde = { version = "1", features = ["derive"] }

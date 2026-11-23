@@ -336,8 +336,13 @@ fn apply_incoming_clipboard_image(png_bytes: &[u8], last_applied_image: &Arc<Mut
 fn lock_local_machine() {
     println!("[client] Windows' lock-both-machines combo detected — locking this machine too.");
     match Command::new("omarchy-system-lock").spawn() {
+        // Waited for on a thread of its own: the locker stays up until the
+        // screen is unlocked, and waiting here would stop the input loop
+        // reading Windows' packages all that time.
         Ok(mut child) => {
-            let _ = child.wait();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
         Err(e) => eprintln!("(lock: failed to launch omarchy-system-lock: {e})"),
     }
@@ -520,6 +525,11 @@ fn run_session(
     clipboard_rx: Option<&Receiver<ClipboardEvent>>,
     shared: &ClipboardShared,
 ) -> std::io::Result<()> {
+    // A peer that vanished is noticed within about half a minute, on the
+    // reverse leg as well as ours.
+    if let Err(e) = mwb_protocol::net::keep_session_alive(&stream) {
+        eprintln!("[{role}] Couldn't turn on TCP keepalive: {e}");
+    }
     let magic_number = get_24bit_hash(&cfg.security_key);
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
 
@@ -552,6 +562,7 @@ fn run_session(
     let mut next_clip_id: u32 = initial_package_id();
     let mut authenticated = false;
     let mut ignored_before_handshake = false;
+    let mut last_data = std::time::Instant::now();
 
     loop {
         if let Some(rx) = clipboard_rx {
@@ -596,6 +607,15 @@ fn run_session(
             }
         }
 
+        // Wake up at least this often even when Windows sends nothing (an
+        // inactive machine gets a heartbeat only every few minutes), so a
+        // copy made here isn't left waiting for the next package. A dead
+        // peer is caught by TCP keepalive (set above), which makes the
+        // socket readable with an error, or else by nothing arriving for
+        // SOCKET_TIMEOUT.
+        if !mwb_protocol::net::wait_for_package(&stream, Duration::from_millis(50), &mut last_data, SOCKET_TIMEOUT)? {
+            continue;
+        }
         let mut ct = [0u8; PACKAGE_SIZE];
         stream.read_exact(&mut ct)?;
         let mut pt = cipher.decrypt(&mut read_chain, &ct);

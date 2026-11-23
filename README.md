@@ -92,7 +92,12 @@ proper autostarting `.app`, all live-tested against a real Windows PC.**
 connection that lived through a sleep is usually dead without either side
 noticing, so a watchdog spots the wall clock jumping ahead and drops it,
 and the normal reconnect runs straight away instead of after the 5-minute
-read timeout.
+read timeout. The companion connection is dropped and remade the same way,
+and the connections to Windows (both directions) and to the companion use
+TCP keepalive, so a PC that vanishes without a sleep is noticed within
+about half a minute (keepalive not yet live-tested). If keepalive can't be
+turned on, a connection with nothing at all received for 5 minutes is
+still dropped, as before.
 
 **Switching away releases held keys** (both builds, type-checked and
 unit-tested only): when control leaves this machine, every key and
@@ -145,8 +150,13 @@ since PowerToys only reports single-file drags.
   2026-11-23, including going back to Windows mid-drag, which cancels it
   cleanly. As soon as the drag reaches the Mac the file starts
   downloading and a real macOS drag of it is started under the cursor (see
-  `daemon/macos/src/drag_source.rs`); letting go waits for the download to
-  finish if needed. If you let go before the drag could start, the file is
+  `daemon/macos/src/drag_source.rs`). Letting go before the files have
+  arrived holds the drop (the cursor stays put) for up to 3 seconds; if
+  they're still arriving then, the drag is cancelled and they're saved to
+  `~/Desktop/MouseWithoutBorders/` once they have, so the mouse never stays
+  frozen. A click, a key or switching machines meanwhile ends the wait
+  straight away the same way, and so does a lost connection (not yet
+  live-tested). If you let go before the drag could start, the file is
   saved to `~/Desktop/MouseWithoutBorders/` and shown in Finder instead
   (where real MWB saves drops on Windows).
 - **Mac -> Windows**: when the cursor leaves the Mac mid-drag, the drag

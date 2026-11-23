@@ -379,9 +379,21 @@ direction already owns; funneling everything through the one thread that
 already holds it sidesteps that entirely. Only the client-role connection
 checks this channel (the reverse-listener connection is cosmetic — see
 "Ports" above), so there's no ambiguity about which of our two sockets a
-locally-detected change goes out on. Practical latency is bounded by however
-often *some* packet arrives from Windows to unblock that read (Hi/Heartbeat
-keep this well under a second in practice, even with an idle mouse).
+locally-detected change goes out on. That read used to block until *some*
+packet arrived from Windows, which was assumed to happen often; it doesn't
+for an inactive machine, which only gets a heartbeat every 1 or 5 minutes
+(`frmScreen.cs`), so a copy made just before switching away could wait that
+long. Both builds now wait for data with `poll` and a 50ms timeout instead
+(`mwb_protocol::net::wait_for_package`), draining the channel on every
+wake-up, and rely on TCP keepalive (`net::keep_session_alive`, on both the
+outbound and the reverse connection) rather than a read timeout to notice a
+dead peer. A read timeout can't be used for this: it could cut a package in
+half and break the decryption chain, and `poll` never trips it anyway. As a
+fallback the wait itself gives up once nothing has arrived for
+`SOCKET_TIMEOUT` (5 minutes), the old read timeout's behavior. Once the
+first byte of a package is there the rest is read with a blocking
+`read_exact`, so a peer dying mid-package is caught by keepalive, not by
+the 50ms tick.
 
 Applying Windows' clipboard to the Linux clipboard, then having our own poll
 loop immediately notice that same content moments later and try to bounce it

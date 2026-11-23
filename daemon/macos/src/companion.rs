@@ -107,6 +107,12 @@ impl Link {
         let cfg = self.config.lock().unwrap().clone();
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
         let _ = stream.set_nodelay(true);
+        // Sends happen on the input thread: never let one hang there. A
+        // companion that vanished is noticed by keepalive within ~30s.
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        if let Err(e) = mwb_protocol::net::set_keepalive(&stream, Duration::from_secs(15), Duration::from_secs(5), 3) {
+            eprintln!("[companion] Couldn't turn on TCP keepalive: {e}");
+        }
         let read_half = stream.try_clone()?;
         let (mut writer, mut reader) = proto::open(stream, read_half, &cfg.security_key)?;
         writer.write_json(proto::HELLO, &Hello { role: "control".into(), name: cfg.machine_name.clone(), op: None, id: None })?;
@@ -143,6 +149,16 @@ impl Link {
         }
     }
 
+    /// Drops the control connection (its session then reconnects), e.g.
+    /// after a sleep it is unlikely to have survived.
+    pub fn disconnect(&self, why: &str) {
+        if let Some(w) = self.writer.lock().unwrap().take() {
+            println!("[companion] Dropping the companion connection: {why}.");
+            let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
+        }
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
     }
@@ -156,6 +172,7 @@ impl Link {
                 eprintln!("[companion] Sending to the companion failed: {e}");
                 let _ = w.get_ref().shutdown(std::net::Shutdown::Both);
                 *writer = None;
+                self.connected.store(false, Ordering::SeqCst);
                 false
             }
         }
