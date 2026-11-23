@@ -67,7 +67,11 @@ build -c Release` in that folder) and install it with
 It reads the security key from MWB's own `settings.json` (`SecurityKey`,
 stored in plain text), unless `%APPDATA%\MwbBridgeCompanion\config.json`
 sets one. AlanOnePC is reachable as the SSH host `alanonepc` (PowerShell
-shell); CHP-ALANJ has no SSH, only a T3 linked environment. A GUI app has to
+shell); CHP-ALANJ has no SSH, only a T3 linked environment, with this repo
+checked out at `C:\Users\Alan\Work\omarchy-plugins\mwb-bridge` (install
+there with `install.ps1 -InstallSdk`: it has no machine-wide .NET 8, so the
+runtime gets bundled, and its NuGet config lists no sources, hence the
+explicit `--source`). A GUI app has to
 be started in the user's session, which setup.ps1 does with a logon
 scheduled task (or a Startup shortcut without admin). Its log is
 `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log`.
