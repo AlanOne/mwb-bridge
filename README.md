@@ -101,7 +101,7 @@ as a file, so pasting in Finder copies them out. One file per copy, 100MB
 max, no folders — real MWB's own limits. A later file with the same name
 overwrites the earlier one.
 
-**Dragging a file between machines** (not yet live-tested): drag a file
+**Dragging a file between machines** (live-tested both ways 2026-11-23): drag a file
 in Explorer or Finder across the screen edge and let go on the other
 machine, as with real MWB (PowerToys' "Transfer file" setting must be on).
 One file at a time, 100MB max, no folders, same as real MWB.
@@ -114,7 +114,8 @@ One file at a time, 100MB max, no folders, same as real MWB.
   file is offered to Windows, which fetches it when you let go there and
   saves it to `Desktop\MouseWithoutBorders\`. This relies on answering
   Windows' `ClipboardAsk` (see `daemon/PROTOCOL.md`'s drag-and-drop
-  section), which may also be what the big-path wall below was missing.
+  section), confirmed live as what Windows sends, which likely also
+  explains the big-path wall above.
 
 **HTML-only copies**: some Windows copies (seen from a browser) arrive as
 HTML with no plain-text version. These are applied as HTML plus a

@@ -577,9 +577,11 @@ Type=`ClipboardPush` and the ask's `PostAction` echoed, then the usual
 1024-byte header and body (`Receiver.cs`'s `ClipboardAsk` case). Both
 builds used to drop Type=78 silently in the receive loop's catch-all, which
 fits every observation above: correct beats and `MachineSwitched`, and
-never a connection. **Not yet confirmed live.** The macOS build now answers
-it (`push_to_windows`) and logs the first package of every type it ignores,
-so the next test shows whether it arrives. The Windows receiver stops at
+never a connection. **Confirmed live 2026-11-23:** a Finder file dragged to
+Windows drew a `ClipboardAsk` with `PostAction` 1 (Desktop) about a second
+after the drop, and the pushed file arrived. The macOS build answers it
+(`push_to_windows`); copy/paste and big images haven't been retried with it
+yet. The Windows receiver stops at
 the header's size, needing the 1..=32 bytes of zero padding real MWB
 always sends after the body (`push_padding_len`) or the socket closing.
 
