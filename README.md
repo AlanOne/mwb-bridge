@@ -175,9 +175,10 @@ out to be Windows asking the Mac to push instead (`ClipboardAsk`, see
 `daemon/PROTOCOL.md`), which the bridge ignored. Now answered:
 - **Copying a file in Finder** makes it pasteable on Windows (not yet
   live-tested): it's sent as soon as you copy, and Windows puts it on its
-  clipboard. One file per copy (Windows' clipboard takes one received file
-  per transfer, so a multi-file copy sends its first), 100MB max, no
-  folders.
+  clipboard. Without the companion, one file per copy (Windows' clipboard
+  takes one received file per transfer, so a multi-file copy sends its
+  first), 100MB max, no folders; with it (see **Windows companion app**
+  below), any number of files and folders, of any size.
 - **Images over 1MB arrive at full size** (type-checked only, not yet
   live-tested): a downscaled copy that fits the small path goes at once
   (a busy 2560x1440 screenshot arrives around 1046x588), then the
@@ -202,14 +203,16 @@ live-tested on the Mac 2026-11-24 (Linux type-checked only):
 
 **Windows -> Mac files** are saved to
 `~/Library/Caches/mwb-mac-bridge/received-files/` and put on the clipboard
-as a file, so pasting in Finder copies them out. One file per copy, 100MB
-max, no folders — real MWB's own limits. A later file with the same name
+as a file, so pasting in Finder copies them out. Without the companion,
+one file per copy, 100MB max, no folders — real MWB's own limits; the
+companion (below) lifts all three. A later file with the same name
 overwrites the earlier one.
 
 **Dragging a file between machines** (live-tested both ways 2026-11-23): drag a file
 in Explorer or Finder across the screen edge and let go on the other
 machine, as with real MWB (PowerToys' "Transfer file" setting must be on).
-100MB max per file and no folders, same as real MWB. From the Mac you can
+100MB max per file and no folders, same as real MWB, unless the Windows
+companion app (below) handles drags instead. From the Mac you can
 drag several files at once (live-tested 2026-11-23: they all land in
 one Explorer window); from Windows only one,
 since PowerToys only reports single-file drags.

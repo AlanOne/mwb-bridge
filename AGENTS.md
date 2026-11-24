@@ -136,8 +136,9 @@ Files and commands:
 2. One-time manual steps: add the app under System Settings > Privacy &
    Security > Accessibility (without it, input silently does nothing), and
    pick the "Slovenian (Windows)" input source.
-3. Fill in the config from the menu bar icon's "Edit Config...", then
-   "Restart App".
+3. Fill in the main fields from the menu bar icon's "Settings..." (it saves
+   and restarts the app), or anything else in config.json with "Edit
+   Config...", then "Restart App".
 4. Add the Mac on the Windows side (see above).
 
 Files and commands:
@@ -187,9 +188,20 @@ Most work since early November 2026 went into the macOS build. On Linux:
   unnecessary.
 - **Weaker diagnostics:** no "key or protocol mismatch" status when packages
   don't decrypt, and no logging of unhandled package types.
+- **No companion client.** Linux never connects to the Windows companion,
+  so it has none of what that brings the Mac: several files and folders per
+  copy, any size, and transfer progress and cancel. The shared pieces are
+  ready in `mwb_protocol::companion` (`open`, `send_files`,
+  `receive_files`, `expand_offer_paths`, `Transfers`, `progress_line`);
+  the Mac's `companion.rs` is the client to port.
 
 Already on both, so no porting needed: fast reconnect after sleep (Linux
 uses logind's `PrepareForSleep`, the Mac a wall-clock watchdog), relative
-mouse mode with `windows_side` and `neighbors`, and the lock-both-machines
-double-tap. The Mac's wired-over-Wi-Fi preference and Windows-style key
-remapping are Mac-specific and not needed on Linux.
+mouse mode with `windows_side` and `neighbors`, the lock-both-machines
+double-tap, keeping the screen on while Windows is in use (MWB's `Awake`
+packages: the Mac declares user activity, Linux holds a `systemd-inhibit`
+idle lock), media and extra keys, and `self_register`. The Mac's
+wired-over-Wi-Fi preference, Windows-style key remapping, staying awake on
+power while connected, and its menu bar's Settings window, link line and
+"Reconnect Now" are Mac-specific and not needed on Linux (the Omarchy
+widget is its settings UI).

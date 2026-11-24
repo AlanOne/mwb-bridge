@@ -804,7 +804,13 @@ every 100ms to stay above MWB's own small window at the cursor; OLE's
 periodic `DragOver` makes the drag enter it, which hands over every file
 (`CF_HDROP`). It offers them to the Mac once per catch (the drag can
 leave and re-enter the window), and the Mac fetches them and starts its own
-drag of all of them. When control comes back to Windows the Mac sends
+drag of all of them. A release on the Mac before the files have all
+arrived is held back (mouse moves swallowed, so the drop lands where it
+was let go) only if they'll be in within a second, going by the
+transfer's pace so far, and for a second at most; otherwise the Mac's drag
+is cancelled at once and the files go to `~/Desktop/MouseWithoutBorders/`
+when they arrive (holding up to 3s froze the cursor through most of a
+500 MB transfer, live-found 2026-11-24). When control comes back to Windows the Mac sends
 `INACTIVE` with `drag_over`: whether that drag is still over the Mac, not
 let go, and `let_go`, whether the left button was released on the Mac
 since control came there (plus `button_held`, all a version-1 companion
