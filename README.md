@@ -133,17 +133,19 @@ out to be Windows asking the Mac to push instead (`ClipboardAsk`, see
   full size over the big path should now work too, but hasn't been tried.
 
 **Without the companion** (PowerToys' own file path), three fixes, all
-type-checked and unit-tested only (Linux type-checked only):
+live-tested on the Mac 2026-11-24 (Linux type-checked only):
 - **File names starting with "image" or "text"** (`image001.png`, `Text
   notes.txt`) now arrive. Windows took any name starting that way for
   clipboard data and dropped the file, so the bridges now send the name
   behind a `/`, as real MWB sends a full path.
-- **Text over 1MB copied on Windows** now arrives as text. It used to be
-  saved as a file called `text`.
+- **Text over 1MB copied on Windows** now arrives as text (live-tested
+  with 2MB of random text, which still compresses to over 1MB). It used to
+  be saved as a file called `text`.
 - **A copy holding both text and an image** (spreadsheet cells, for
   example) now goes to Windows as the text, as real MWB does, instead of a
   picture of it. A copy holding an image and only its web address (how
-  browsers copy an image) still goes as the image.
+  browsers copy an image) still goes as the image (live-tested from Chrome
+  and Safari, pasted into Paint and Word).
 
 **Windows -> Mac files** are saved to
 `~/Library/Caches/mwb-mac-bridge/received-files/` and put on the clipboard

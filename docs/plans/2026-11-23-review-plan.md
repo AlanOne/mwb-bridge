@@ -177,7 +177,7 @@ and the companion link's missing MAC and freshness.
 - Check the image-over-text clipboard order against real MWB.
 - Tests: extend the `fake_windows` test. Live: drag `image001.png` with the companion off; copy more than 1MB of text on Windows.
 
-**Done 2026-11-24** (type-checked and unit-tested; Linux type-checked only; nothing live-tested):
+**Done 2026-11-24.** Live-tested on the Mac the same day against CHP-ALANJ with the companion off: `image02.jpg` dragged to Windows arrived (sent as `/image02.jpg`); 2MB of random text copied on Windows was pulled as big-path `text` and pasted as text; spreadsheet cells went as text; Chrome and Safari "Copy Image" arrived as an image in Paint and Word. Linux type-checked only.
 - B12: file names go to Windows as `/` plus the base name (`file_header_name`), on both bridges.
 - B13: a pulled `text` header is applied as clipboard text on both bridges.
 - Padding: one shared reader, `read_pulled_body`, replaces both bridges' own. It reads up to the next multiple of 32, accepts an early close once the body is in (Windows' `SendData` pads by `size % 32` and never sends a final partial AES block), and reads off the tail before closing. Linux now pads what it sends with `push_padding_len`, like the Mac.
