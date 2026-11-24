@@ -289,7 +289,13 @@ fn run_session(
                         println!("{} [file-copy] Copied {}, announced to Windows.", timestamp(), first.display());
                     }
                 }
-                Some(ClipboardEvent::BigImage(path)) => {
+                Some(ClipboardEvent::BigImage { preview, path }) => {
+                    if let Some(png) = preview {
+                        let len = png.len();
+                        let packages = build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png);
+                        stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
+                        println!("[client] Sent a downscaled clipboard image ({len} bytes) to peer, the full-size one follows.");
+                    }
                     *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Image(path));
                     clipboard::announce_big(
                         stream,

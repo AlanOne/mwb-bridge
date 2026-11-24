@@ -38,7 +38,11 @@ pub const FILE_LISTEN_PORT: u16 = 15100;
 pub enum ClipboardEvent {
     Text(String),
     Image(Vec<u8>),    // PNG bytes, small-path (<1MB)
-    BigImage(PathBuf),  // PNG bytes already written to a temp file, big-path
+    // An image too big for the small path: a downscaled copy that fits it
+    // (sent at once, so something arrives even if Windows never fetches
+    // the rest), and the full-size PNG written to a file, offered over the
+    // big path to replace it.
+    BigImage { preview: Option<Vec<u8>>, path: PathBuf },
     Files(Vec<PathBuf>), // a Finder file copy, sent big-path
 }
 
@@ -287,15 +291,11 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Downscales an image until its PNG encoding fits the small path, for
-/// images whose full-resolution PNG doesn't. The big path is the "right"
-/// transport for these, but Windows never connects back to pull an image
-/// this bridge announces (same unresolved wall as the Linux build — see the
-/// project notes' "File/big-image transfer back to Windows"; confirmed live
-/// on macOS 2026-09-29: two announcements, zero pulls), so a full-size
-/// Retina screenshot otherwise never arrives at all. Arriving at reduced
-/// resolution beats not arriving. First guess assumes PNG size scales with
-/// pixel count; each retry shrinks a further 20%. `None` only if even that
-/// fails (caller falls back to the big-path announcement).
+/// images whose full-resolution PNG doesn't: the preview sent at once
+/// while the full-size image goes over the big path (Windows fetches it by
+/// asking us to push it, `ClipboardAsk`). First guess assumes PNG size
+/// scales with pixel count; each retry shrinks a further 20%. `None` if
+/// even that fails.
 fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usize) -> Option<Vec<u8>> {
     use image::{imageops, RgbaImage};
     let full = RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
@@ -312,6 +312,23 @@ fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usi
         scale *= 0.8;
     }
     None
+}
+
+/// Writes a full-size clipboard image for Windows to fetch, under a new
+/// name each time: an earlier one may still be being sent. Older ones are
+/// deleted (one being sent is already open, which unlinking doesn't stop).
+fn write_outbound_image(png: &[u8]) -> std::io::Result<PathBuf> {
+    let dir = cache_dir().join("outbound-images");
+    std::fs::create_dir_all(&dir)?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let path = dir.join(format!("{stamp}.png"));
+    std::fs::write(&path, png)?;
+    Ok(path)
 }
 
 /// macOS -> Windows clipboard sync: polls the local clipboard (no simple
@@ -375,14 +392,17 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
                     if let Some(png_bytes) = encode_png(width, height, raw) {
                         if png_bytes.len() < MAX_SMALL_PATH_SIZE {
                             let _ = clip_tx.send(ClipboardEvent::Image(png_bytes));
-                        } else if let Some(small) = shrink_png_to_fit(width, height, raw, png_bytes.len()) {
-                            let _ = clip_tx.send(ClipboardEvent::Image(small));
                         } else {
-                            let dir = cache_dir();
-                            if std::fs::create_dir_all(&dir).is_ok() {
-                                let path = dir.join("outbound-image.png");
-                                if std::fs::write(&path, &png_bytes).is_ok() {
-                                    let _ = clip_tx.send(ClipboardEvent::BigImage(path));
+                            let preview = shrink_png_to_fit(width, height, raw, png_bytes.len());
+                            match write_outbound_image(&png_bytes) {
+                                Ok(path) => {
+                                    let _ = clip_tx.send(ClipboardEvent::BigImage { preview, path });
+                                }
+                                Err(e) => {
+                                    eprintln!("(clipboard: couldn't save the full-size image for Windows, sending only the downscaled one: {e})");
+                                    if let Some(small) = preview {
+                                        let _ = clip_tx.send(ClipboardEvent::Image(small));
+                                    }
                                 }
                             }
                         }

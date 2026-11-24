@@ -156,9 +156,12 @@ out to be Windows asking the Mac to push instead (`ClipboardAsk`, see
   clipboard. One file per copy (Windows' clipboard takes one received file
   per transfer, so a multi-file copy sends its first), 100MB max, no
   folders.
-- **Images over 1MB are still sent downscaled** until their PNG fits (e.g.
-  a busy 2560x1440 screenshot arrives around 1046x588). Sending them at
-  full size over the big path should now work too, but hasn't been tried.
+- **Images over 1MB arrive at full size** (type-checked only, not yet
+  live-tested): a downscaled copy that fits the small path goes at once
+  (a busy 2560x1440 screenshot arrives around 1046x588), then the
+  full-size PNG is offered over the big path, and Windows' clipboard gets
+  it in place of the small one when Windows fetches it (`ClipboardAsk`).
+  If Windows never fetches it, the downscaled copy stays, as before.
 
 **Without the companion** (PowerToys' own file path), three fixes, all
 live-tested on the Mac 2026-11-24 (Linux type-checked only):

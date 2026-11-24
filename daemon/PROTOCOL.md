@@ -473,9 +473,10 @@ image announcements (beat, then `HideMouse` + `MachineSwitched`), zero
 connections from Windows to port 15100. Since a different OS and network
 stack hit the identical wall, the cause is almost certainly on the Windows
 side (some precondition in real MWB's pull logic this bridge doesn't meet),
-not anything Linux-specific. The macOS build works around it for images by
-downscaling until the PNG fits the small path; files have no such
-workaround (real MWB always sends them big-path).
+not anything Linux-specific. (Solved since: Windows asks us to push
+instead, see the ClipboardAsk section. The macOS build now sends a big
+image as a downscaled small-path copy at once, then offers the full-size
+PNG over the big path, which replaces it when Windows fetches it.)
 
 **On Linux, only "copy a file, paste it elsewhere" is implemented — not
 drag-and-drop** (the macOS build has both directions, see "File
