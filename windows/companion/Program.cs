@@ -37,7 +37,7 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open log", null, (_, _) => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Log.FilePath) { UseShellExecute = true }));
         menu.Items.Add("Quit", null, (_, _) => { _tray!.Visible = false; ExitThread(); });
-        _tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "MWB Bridge Companion", ContextMenuStrip = menu, Visible = true };
+        _tray = new NotifyIcon { Icon = AppIcon(), Text = "MWB Bridge Companion", ContextMenuStrip = menu, Visible = true };
 
         var coordinator = new Coordinator(_ui);
         new Server(config, coordinator, SetStatus).Start();
@@ -49,6 +49,13 @@ sealed class TrayContext : ApplicationContext
             _tray.ShowBalloonTip(10000, "MWB Bridge Companion",
                 "Turn off \"Transfer file\" in PowerToys' Mouse Without Borders settings: it handles the same drags as this app.", ToolTipIcon.Warning);
         }
+    }
+
+    /// The app's own icon at the tray's size, so Windows doesn't scale down a big one.
+    static Icon AppIcon()
+    {
+        using var stream = typeof(TrayContext).Assembly.GetManifestResourceStream("icon.ico");
+        return stream == null ? SystemIcons.Application : new Icon(stream, SystemInformation.SmallIconSize);
     }
 
     void SetStatus(string? bridge)

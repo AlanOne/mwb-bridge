@@ -220,7 +220,8 @@ Setup:
    to. Without one it uses PowerToys' own drag-and-drop, as above.
 
 The log is `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log` (also under
-the tray icon's menu). How it works, and the protocol between the two, is
+the tray icon's menu: a blue tile with a page and an orange two-way
+arrow). How it works, and the protocol between the two, is
 in `daemon/PROTOCOL.md`'s companion section.
 
 **HTML-only copies**: some Windows copies (seen from a browser) arrive as
@@ -630,7 +631,7 @@ Past that point, everything is automatic.
 - `windows/companion/` — the optional Windows tray app that takes over file
   drag-and-drop and file copy (C#, .NET 8), with `install.ps1` (run on the
   PC), `install.sh` (run on the Mac, over SSH) and `setup.ps1` (run on the
-  PC by both). `windows/companion-tests/` checks its protocol code.
+  PC by both). Its icon, `icon.ico`, is drawn by `make-icon.py`. `windows/companion-tests/` checks its protocol code.
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
   plus everything learned about Windows-side state (the Matrix/MachinePool
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).

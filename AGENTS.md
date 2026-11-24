@@ -16,6 +16,13 @@ PROTOCOL.md before touching any crypto, framing, handshake or keymap code.
   change can affect: the status lines, **Known bugs**, the config docs, the
   **Layout** paths and any caveats the change makes stale. Keep this file
   accurate the same way, including the Linux gaps list below.
+- **Reinstall the companion on both PCs after changing it.** Whenever a
+  commit changes `windows/companion/` (or the shared protocol in a way the
+  companion needs), push it and then reinstall on both PCs without asking:
+  AlanOnePC with `windows/companion/install.sh alanonepc`, and CHP-ALANJ
+  through a T3 task on its linked environment that runs `git pull` and
+  `install.ps1 -InstallSdk` in its checkout (see below). Check each ends up
+  running in the user's session and its log shows the bridge connecting.
 - **Say what was live-tested.** Mark features as live-tested (with the date)
   only after trying them against a real Windows PC, and say "type-checked
   only" when that's all that happened.
