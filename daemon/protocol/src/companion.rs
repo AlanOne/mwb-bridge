@@ -24,6 +24,11 @@ use crate::mwb_protocol::{open_encrypted_stream, CbcState, EncryptedStream};
 
 pub const COMPANION_PORT: u16 = 15102;
 
+/// Sent in `Hello`, so the companion can tell when the bridge is from a
+/// different version of this repo. 2: `Inactive` carries `drag_over` and
+/// `let_go` (version 1, sent as no version at all, had only `button_held`).
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// First frame on every connection.
 pub const HELLO: u32 = 1;
 // Control connection, bridge -> companion.
@@ -71,6 +76,19 @@ pub struct Hello {
     pub op: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
+    /// `PROTOCOL_VERSION`; missing (0) from bridges before it existed.
+    #[serde(default)]
+    pub version: u32,
+}
+
+impl Hello {
+    pub fn control(name: &str) -> Self {
+        Self { role: "control".into(), name: name.into(), op: None, id: None, version: PROTOCOL_VERSION }
+    }
+
+    pub fn data(name: &str, op: &str, id: u64) -> Self {
+        Self { role: "data".into(), name: name.into(), op: Some(op.into()), id: Some(id), version: PROTOCOL_VERSION }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -87,9 +105,24 @@ pub struct Offer {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Inactive {
-    /// Whether the left button was still held when control left: a drag
-    /// going on to Windows rather than one that ended here.
+    /// Whether a drag from Windows was still over this machine, not let go,
+    /// when control left: it's going back to Windows. Otherwise any drag
+    /// the companion caught ended here, and it ends Windows' leftover drag.
+    /// Deliberately not the button state: the button may be held for
+    /// something else entirely (a drag that started here) by then.
+    pub drag_over: bool,
+    /// Whether the left button was held: what companions before version 2
+    /// go by instead (they ignore `drag_over`), still sent for them.
+    #[serde(default)]
     pub button_held: bool,
+    /// Whether the left button was let go of on this machine since control
+    /// came here (or the connection to Windows was lost meanwhile). A drag
+    /// from Windows that wasn't let go here is coming back, even when no
+    /// drop of it started here (a quick bounce beats the offer, or it
+    /// carried no files); one that was ended here, even before its offer
+    /// was taken.
+    #[serde(default)]
+    pub let_go: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -260,7 +293,7 @@ mod tests {
     #[test]
     fn frames_round_trip_both_ways_including_unaligned_payloads() {
         let ((mut aw, mut ar), (mut bw, mut br)) = pair();
-        aw.write_json(HELLO, &Hello { role: "control".into(), name: "mac".into(), op: None, id: None }).unwrap();
+        aw.write_json(HELLO, &Hello::control("mac")).unwrap();
         aw.write_frame(ACTIVE, &[]).unwrap();
         bw.write_json(OFFER_TO_MAC, &Offer { id: 7, files: vec![FileInfo { name: "a b.txt".into(), size: 3 }] }).unwrap();
 
@@ -274,11 +307,17 @@ mod tests {
     #[test]
     fn the_wire_format_is_what_the_csharp_side_expects() {
         // Hello's optional fields are left out, not sent as null.
-        let json = serde_json::to_string(&Hello { role: "data".into(), name: "mac".into(), op: Some("get".into()), id: Some(3) }).unwrap();
-        assert_eq!(json, r#"{"role":"data","name":"mac","op":"get","id":3}"#);
-        let json = serde_json::to_string(&Hello { role: "control".into(), name: "mac".into(), op: None, id: None }).unwrap();
-        assert_eq!(json, r#"{"role":"control","name":"mac"}"#);
-        assert_eq!(serde_json::to_string(&Inactive { button_held: true }).unwrap(), r#"{"button_held":true}"#);
+        let json = serde_json::to_string(&Hello::data("mac", "get", 3)).unwrap();
+        assert_eq!(json, r#"{"role":"data","name":"mac","op":"get","id":3,"version":2}"#);
+        let json = serde_json::to_string(&Hello::control("mac")).unwrap();
+        assert_eq!(json, r#"{"role":"control","name":"mac","version":2}"#);
+        assert_eq!(
+            serde_json::to_string(&Inactive { drag_over: true, button_held: false, let_go: false }).unwrap(),
+            r#"{"drag_over":true,"button_held":false,"let_go":false}"#
+        );
+        // A hello from before versions existed still parses.
+        let old: Hello = serde_json::from_str(r#"{"role":"control","name":"mac"}"#).unwrap();
+        assert_eq!(old.version, 0);
     }
 
     #[test]

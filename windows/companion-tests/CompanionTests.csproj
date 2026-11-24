@@ -10,5 +10,6 @@
   <ItemGroup>
     <Compile Include="../companion/Protocol.cs" />
     <Compile Include="../companion/Log.cs" />
+    <Compile Include="../companion/Names.cs" />
   </ItemGroup>
 </Project>

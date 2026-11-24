@@ -115,7 +115,7 @@ impl Link {
         }
         let read_half = stream.try_clone()?;
         let (mut writer, mut reader) = proto::open(stream, read_half, &cfg.security_key)?;
-        writer.write_json(proto::HELLO, &Hello { role: "control".into(), name: cfg.machine_name.clone(), op: None, id: None })?;
+        writer.write_json(proto::HELLO, &Hello::control(&cfg.machine_name))?;
         *self.addr.lock().unwrap() = Some(addr);
         *self.writer.lock().unwrap() = Some(writer);
         self.connected.store(true, Ordering::SeqCst);
@@ -258,7 +258,7 @@ fn data_connection(addr: SocketAddr, cfg: &Config, op: &str, id: u64) -> std::io
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     let read_half = stream.try_clone()?;
     let (mut writer, reader) = proto::open(stream, read_half, &cfg.security_key)?;
-    writer.write_json(proto::HELLO, &Hello { role: "data".into(), name: cfg.machine_name.clone(), op: Some(op.into()), id: Some(id) })?;
+    writer.write_json(proto::HELLO, &Hello::data(&cfg.machine_name, op, id))?;
     Ok((writer, reader))
 }
 

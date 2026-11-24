@@ -12,6 +12,9 @@ namespace MwbBridgeCompanion;
 
 static class Frames
 {
+    /// Same as the bridge's `PROTOCOL_VERSION`: 2 has `Inactive.DragOver`.
+    public const uint Version = 2;
+
     public const uint Hello = 1;
     public const uint Active = 2;
     public const uint Inactive = 3;
@@ -38,10 +41,20 @@ static class Frames
     public static ulong MaxFrameSize => MaxFrame;
 }
 
-record HelloMsg(string Role, string Name, string? Op = null, ulong? Id = null);
+record HelloMsg(string Role, string Name, string? Op = null, ulong? Id = null, uint Version = 0);
 record FileInfoMsg(string Name, ulong Size);
 record OfferMsg(ulong Id, List<FileInfoMsg> Files);
-record InactiveMsg(bool ButtonHeld);
+/// Version 2+: `DragOver`, a drag from Windows was still over the bridge's
+/// machine when control came back; `LetGo`, the button was let go of there
+/// since control went there (or the bridge lost its connection meanwhile).
+/// `ButtonHeld` is what version 1 sent instead (the bridge's button
+/// state); bridges still send it for older companions.
+record InactiveMsg(bool DragOver = false, bool? ButtonHeld = null, bool LetGo = false)
+{
+    /// Whether the drag came back to Windows (still held), read the way the
+    /// bridge's version means it. Otherwise it was let go over there.
+    public bool DragCameBack(uint version) => version >= 2 ? DragOver || !LetGo : ButtonHeld == true;
+}
 record CancelMsg(ulong Id);
 record FileHeaderMsg(uint Index, string Name, ulong Size);
 

@@ -676,9 +676,13 @@ bridge drives everything from two packages every switch sends anyway:
 TCP 15102 on the PC its MWB connection goes to, with MWB's own v0.102
 encryption and the same key. Frames are a 16-byte header (type u32,
 reserved u32, length u64, little-endian) plus the payload zero-padded to 16
-bytes. The first frame is `HELLO` (JSON `{"role", "name", "op"?, "id"?}`).
+bytes. The first frame is `HELLO` (JSON `{"role", "name", "op"?, "id"?,
+"version"}`); `version` is `PROTOCOL_VERSION` (2, missing before it existed)
+and the companion logs a mismatch. It closes a connection that sends no
+`HELLO` within 10s, keeps the control connection alive with TCP keepalive
+(15s, 5s, 3 probes) and gives up on a data connection that stalls for 30s.
 One long-lived control connection carries `ACTIVE` (2), `INACTIVE` (3,
-`{"button_held"}`), `OFFER_TO_WINDOWS` (4) and `CANCEL` (7) from the bridge
+`{"drag_over", "button_held", "let_go"}`), `OFFER_TO_WINDOWS` (4) and `CANCEL` (7) from the bridge
 and `OFFER_TO_MAC` (5) from the companion; an offer is `{"id", "files":
 [{"name", "size"}]}`. File bytes go over a short data connection per drag
 (`op` "get" when the companion sends, "put" when the bridge does): per file
@@ -701,13 +705,47 @@ there. The companion covers the whole desktop with a nearly transparent
 topmost window (fully transparent ones let drags fall through), re-raised
 every 100ms to stay above MWB's own small window at the cursor; OLE's
 periodic `DragOver` makes the drag enter it, which hands over every file
-(`CF_HDROP`). It offers them to the Mac, which fetches them and starts its
-own drag of all of them. When control comes back to Windows the Mac sends
-`INACTIVE`: with the button still held (dragged back to Windows) the
-companion just steps aside and the Windows drag carries on; with it
-released (dropped on the Mac), Windows still thinks it's held, so the
-companion releases it over its window, ending that leftover drag
-harmlessly.
+(`CF_HDROP`). It offers them to the Mac once per catch (the drag can
+leave and re-enter the window), and the Mac fetches them and starts its own
+drag of all of them. When control comes back to Windows the Mac sends
+`INACTIVE` with `drag_over`: whether that drag is still over the Mac, not
+let go, and `let_go`, whether the left button was released on the Mac
+since control came there (plus `button_held`, all a version-1 companion
+reads; the companion goes by whichever the bridge's `HELLO` version means,
+so either side can be updated first). The drag's press happened on
+Windows, so the release (MWB forwards it as `WM_LBUTTONUP`) is the only
+part the Mac sees; neither its own button state nor whether a drop of the
+offer started there says whether the user let go (a quick bounce can beat
+the offer, and a drag of a folder or text has no offer). So the drag came
+back unless `drag_over` is false and `let_go` is true. `let_go` is kept
+across reconnects (Windows may still think the Mac has control), and a lost
+connection sets it, since the Mac cancels its drag then. An offer that
+arrives after a release on the Mac starts no drag, so `drag_over` can't
+turn true after the user let go: its files are saved to the drop folder,
+even if control has left the Mac by then. The Mac ignores any other offer
+that arrives after control has left it (the drag came back before its
+offer, and the companion hands it back on Windows). If the drag came back
+(still held) the companion just steps aside and the Windows drag carries
+on. A drag that never reached the catcher is left alone (known gap: one
+let go on the Mac within the moment OLE takes to enter the catcher, about
+100ms after crossing, then carries on on Windows). Otherwise it was let go
+over a caught drag (dropped on the Mac), and Windows still thinks it's
+held, so the companion releases it over its window,
+ending that leftover drag harmlessly, right away while Windows surely has
+control (an injected release would otherwise go to the other machine), and
+ends the catch so a quick return to the Mac starts a new one. If the
+bridge disconnects mid-catch instead, it injects nothing yet (with no
+`INACTIVE`, the Mac may still have control and would get the release) and
+keeps the catcher up, which is harmless while the cursor is parked. Once
+the parked cursor moves, Windows has control again and it ends the
+leftover drag, giving a bridge that reconnected meanwhile half a second to
+settle it with its own `INACTIVE` first. (Not live-tested; it assumes MWB
+keeps the parked cursor still while another machine has control.) `drag_over` deliberately isn't the Mac's button
+state, which version 1 sent: the button can be held for something else by
+then (a drag that started on the Mac), and a quick bounce can come back
+before the Mac's drag has started. A replaced control connection (the Mac
+reconnected) doesn't reset anything when it ends, since the new one is
+live.
 
 **Mac -> Windows.** On `HideMouse` with the left button held and a file
 drag on the drag pasteboard, the Mac cancels its drag (Escape), sends
@@ -715,10 +753,15 @@ drag on the drag pasteboard, the Mac cancels its drag (Escape), sends
 injecting is safe: the companion puts a small window under the cursor and
 presses the left button on it (Windows didn't see the real press, made
 while the Mac had control), and turns that into a real `DoDragDrop` of
-placeholder files that fill in as the bytes arrive. Its
-`QueryContinueDrag` holds the drop (`Continue` though the button is up)
-until every file is complete. The user's real release, which Windows does
-see now, ends the drag. Only `Copy` is allowed, so Explorer copies rather
+placeholder files that fill in as the bytes arrive (same-named files in
+one drag get Explorer-style " (2)" names). Its `QueryContinueDrag` holds
+the drop (`Continue` though the button is up) until every file is
+complete, for at most a second: the cursor moves on meanwhile and the drop
+lands wherever it is, so after that the drag is cancelled and the files
+are saved to `Desktop\MouseWithoutBorders\` once they arrive. OLE only asks
+`QueryContinueDrag` again when a message arrives, so a 50ms timer runs
+during the drag. The user's real release, which Windows does see now, ends
+the drag. Only `Copy` is allowed, so Explorer copies rather
 than moves out of the temp folder.
 
 **File copy and paste** goes through the companion too while it's

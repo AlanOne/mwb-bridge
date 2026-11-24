@@ -13,6 +13,7 @@ sealed class Coordinator
     readonly System.Windows.Forms.Timer _raise = new() { Interval = 100 };
 
     public Func<uint, object, bool>? SendToBridge { get; set; }
+    public Func<bool>? BridgeConnected { get; set; }
 
     // Windows -> Mac drags offered to the bridge, by id: the files it fetches.
     readonly ConcurrentDictionary<ulong, string[]> _toMac = new();
@@ -23,6 +24,11 @@ sealed class Coordinator
     // Windows -> Mac state.
     bool _catching;      // the catcher is up for a drag that left Windows
     bool _caughtDrag;    // a drag is hovering over it
+    bool _offered;       // its files were offered to the bridge
+    bool _leftoverEnded; // Windows' drag already ended on the catcher
+    // Bumped whenever the catcher goes up or down, so a timer left over
+    // from an earlier catch can't act on a newer one.
+    int _catchSession;
 
     // Mac -> Windows state.
     IncomingDrop? _pendingSource; // waiting for the simulated press to land
@@ -36,7 +42,11 @@ sealed class Coordinator
             if (!_caughtDrag) Log.Write($"[to-mac] A drag entered the catcher (key state {keyState}: left button {((keyState & 1) != 0 ? "down" : "up")} as the drag sees it).");
             _caughtDrag = true;
         };
-        _catcher.Dropped += () => Log.Write("[to-mac] The leftover Windows drag ended on the catcher.");
+        _catcher.Dropped += () =>
+        {
+            Log.Write("[to-mac] The leftover Windows drag ended on the catcher.");
+            if (_catching) _leftoverEnded = true;
+        };
         // Mouse Without Borders keeps its own small topmost window at the
         // parked cursor; stay above it so the drag reaches the catcher.
         _raise.Tick += (_, _) => { if (_catcher.Visible) Native.RaiseTopmost(_catcher.Handle, SystemInformation.VirtualScreen); };
@@ -63,77 +73,109 @@ sealed class Coordinator
         if (_catching) return;
         Log.Write($"[to-mac] The bridge's machine is active (left button {(Native.LeftButtonDown() ? "down" : "up")} as Windows reports it), watching for a drag.");
         _catching = true;
-        _caughtDrag = false;
+        _caughtDrag = _offered = _leftoverEnded = false;
+        var session = ++_catchSession;
         _catcher.ShowOver(SystemInformation.VirtualScreen);
         _raise.Start();
         // Not every held-button crossing is a drag of something (moving a
         // window to the edge): give up if no drag shows up.
-        var timer = new System.Windows.Forms.Timer { Interval = 1500 };
-        timer.Tick += (_, _) =>
+        After(1500, () =>
         {
-            timer.Dispose();
-            if (_catching && !_caughtDrag)
+            if (session == _catchSession && _catching && !_caughtDrag)
             {
                 HideCatcher();
             }
-        };
+        });
+    }
+
+    /// Runs `action` on the UI thread after `ms` milliseconds.
+    static void After(int ms, Action action)
+    {
+        var timer = new System.Windows.Forms.Timer { Interval = ms };
+        timer.Tick += (_, _) => { timer.Dispose(); action(); };
         timer.Start();
     }
 
     void OnFilesCaught(string[] dropped)
     {
-        if (!_catching) return;
+        // Once per catch: the drag can leave and re-enter the catcher, and a
+        // second offer would start a second drag on the Mac.
+        if (!_catching || _offered) return;
         var files = dropped.Where(File.Exists).ToArray();
         foreach (var skipped in dropped.Where(p => !File.Exists(p)))
         {
             Log.Write($"[to-mac] Skipping {skipped}: folders aren't supported, zip it first.");
         }
-        if (files.Length == 0) return;
+        if (files.Length == 0)
+        {
+            _offered = true;
+            return;
+        }
         var id = Interlocked.Increment(ref _nextId);
         _toMac[id] = files;
         var offer = new OfferMsg(id, files.Select(f => new FileInfoMsg(Path.GetFileName(f), (ulong)new FileInfo(f).Length)).ToList());
         Log.Write($"[to-mac] Offering {files.Length} file(s) to the bridge as drag {id}: {string.Join(", ", offer.Files.Select(f => f.Name))}");
-        SendToBridge?.Invoke(Frames.OfferToMac, offer);
+        // Not sent (no bridge right now): tried again if the drag re-enters.
+        _offered = SendToBridge?.Invoke(Frames.OfferToMac, offer) == true;
+        if (!_offered) Log.Write($"[to-mac] Couldn't send drag {id} to the bridge.");
     }
 
-    /// Control came back to Windows.
-    public void OnInactive(bool buttonHeld)
+    /// Control came back to Windows (`version`: the bridge's protocol
+    /// version, which says how to read the message).
+    public void OnInactive(InactiveMsg inactive, uint version)
     {
         if (!_catching) return;
-        if (buttonHeld)
+        if (inactive.DragCameBack(version))
         {
-            // Dragged back to Windows: let the drag carry on here.
+            // Dragged back to Windows without letting go over there: let
+            // the drag carry on here.
             Log.Write("[to-mac] The drag came back to Windows, handing it back.");
             HideCatcher();
             return;
         }
         if (!_caughtDrag)
         {
+            // Nothing reached the catcher. (A drag let go over there within
+            // the moment OLE takes to enter the catcher is missed this way;
+            // watching longer for it misfired on plain clicks and quick
+            // returns, so it isn't.)
             HideCatcher();
             return;
         }
-        // Let go on the other machine. The release happened over there, so
-        // Windows' drag is still going: release it here over the catcher,
-        // which ends it harmlessly.
+        Log.Write("[to-mac] Released on the other machine, ending the leftover Windows drag.");
+        EndLeftoverDrag();
+    }
+
+    /// The drag the catcher caught ended on the other machine (or the
+    /// bridge went away), but Windows' drag is still going: release it
+    /// here over the catcher, which ends it harmlessly. Hiding the catcher
+    /// instead would let it drop on whatever is under the cursor.
+    void EndLeftoverDrag()
+    {
+        // Released right away, while Windows surely has control: anything
+        // injected once control is back on the other machine would be
+        // forwarded there. The catch ends now too, so a quick return to the
+        // other machine starts a new one; the catcher only stays up long
+        // enough for the release to land on it, unless that new catch
+        // needs it.
         _catcher.ShowOver(SystemInformation.VirtualScreen);
-        var timer = new System.Windows.Forms.Timer { Interval = 50 };
-        timer.Tick += (_, _) =>
+        Native.LeftButton(down: false);
+        _catching = _caughtDrag = _offered = _leftoverEnded = false;
+        var session = ++_catchSession;
+        After(300, () =>
         {
-            timer.Dispose();
-            Log.Write("[to-mac] Released on the other machine, ending the leftover Windows drag.");
-            Native.LeftButton(down: false);
-            var hide = new System.Windows.Forms.Timer { Interval = 300 };
-            hide.Tick += (_, _) => { hide.Dispose(); HideCatcher(); };
-            hide.Start();
-        };
-        timer.Start();
+            if (session != _catchSession) return;
+            _raise.Stop();
+            _catcher.Hide();
+        });
     }
 
     void HideCatcher()
     {
         _raise.Stop();
         _catcher.Hide();
-        _catching = _caughtDrag = false;
+        _catching = _caughtDrag = _offered = _leftoverEnded = false;
+        _catchSession++;
     }
 
     /// The bridge fetching a drag's files.
@@ -270,7 +312,8 @@ sealed class Coordinator
         // Out of the way of the drop once the drag is running.
         BeginInvokeLater(() => _source.Bounds = new Rectangle(-32000, -32000, 1, 1));
         var data = new DataObject(DataFormats.FileDrop, drop.Paths);
-        var released = false;
+        DateTime? releasedAt = null;
+        var gaveUp = false;
         void Query(object? sender, QueryContinueDragEventArgs e)
         {
             if (e.EscapePressed || drop.Cancelled)
@@ -279,21 +322,47 @@ sealed class Coordinator
             }
             else if ((e.KeyState & 1) == 0)
             {
-                if (!released)
+                if (releasedAt == null)
                 {
-                    released = true;
-                    if (!drop.IsComplete) Log.Write($"[to-windows] Drag {drop.Id} let go, waiting for its files to finish arriving.");
+                    releasedAt = DateTime.UtcNow;
+                    if (!drop.IsComplete) Log.Write($"[to-windows] Drag {drop.Id} let go, waiting up to {EarlyReleaseWait.TotalSeconds:0.#}s for its files to finish arriving.");
                 }
-                // Hold the drop until every file has fully arrived.
-                e.Action = drop.IsComplete ? DragAction.Drop : drop.Failed ? DragAction.Cancel : DragAction.Continue;
+                // Hold the drop until every file has fully arrived, but not
+                // for long: the cursor moves on meanwhile, and the drop goes
+                // wherever it is by then.
+                if (drop.IsComplete) e.Action = DragAction.Drop;
+                else if (drop.Failed) e.Action = DragAction.Cancel;
+                else if (DateTime.UtcNow - releasedAt > EarlyReleaseWait)
+                {
+                    gaveUp = true;
+                    e.Action = DragAction.Cancel;
+                }
+                else e.Action = DragAction.Continue;
             }
         }
+        // OLE only asks QueryContinueDrag again when a message arrives; a
+        // timer makes sure one does while the files finish arriving.
+        using var poll = new System.Windows.Forms.Timer { Interval = 50 };
+        poll.Tick += (_, _) => { };
+        poll.Start();
         _source.QueryContinueDrag += Query;
         var effect = _source.DoDragDrop(data, DragDropEffects.Copy);
         _source.QueryContinueDrag -= Query;
+        poll.Stop();
         _source.Hide();
-        Log.Write($"[to-windows] Drag {drop.Id} ended: {(effect == DragDropEffects.None ? "not dropped anywhere that takes it (or cancelled)" : "dropped into an app")}.");
+        if (gaveUp)
+        {
+            Log.Write($"[to-windows] Drag {drop.Id}: its files were still arriving, saving them to the desktop instead.");
+            drop.SaveToDesktopWhenComplete();
+        }
+        else
+        {
+            Log.Write($"[to-windows] Drag {drop.Id} ended: {(effect == DragDropEffects.None ? "not dropped anywhere that takes it (or cancelled)" : "dropped into an app")}.");
+        }
     }
+
+    // How long a release let go before the files have all arrived is held.
+    static readonly TimeSpan EarlyReleaseWait = TimeSpan.FromSeconds(1);
 
     void BeginInvokeLater(Action action)
     {
@@ -307,11 +376,62 @@ sealed class Coordinator
         if (_fromMac.TryGetValue(id, out var drop)) drop.Cancelled = true;
     }
 
+    /// After a disconnect mid-catch: once the parked cursor moves (Windows
+    /// has control), end Windows' leftover drag, unless the catch has
+    /// ended some other way first. A bridge that reconnected meanwhile gets
+    /// half a second to settle it with its INACTIVE (the drag may be coming
+    /// back), since it sends one when control leaves its machine.
+    void WaitForControlThenEnd(int session, Point parked)
+    {
+        var poll = new System.Windows.Forms.Timer { Interval = 100 };
+        poll.Tick += (_, _) =>
+        {
+            if (session != _catchSession || !_catching)
+            {
+                poll.Dispose();
+                return;
+            }
+            if (Cursor.Position == parked) return;
+            poll.Dispose();
+            if (_leftoverEnded)
+            {
+                HideCatcher();
+            }
+            else if (BridgeConnected?.Invoke() == true)
+            {
+                After(500, () =>
+                {
+                    if (session != _catchSession || !_catching) return;
+                    Log.Write("[to-mac] Windows has control again and the bridge said nothing, ending the leftover Windows drag.");
+                    EndLeftoverDrag();
+                });
+            }
+            else
+            {
+                Log.Write("[to-mac] Windows has control again, ending the leftover Windows drag.");
+                EndLeftoverDrag();
+            }
+        };
+        poll.Start();
+    }
+
     public IncomingDrop? FromMac(ulong id) => _fromMac.TryGetValue(id, out var d) ? d : null;
 
     public void OnBridgeDisconnected()
     {
-        if (_catching) HideCatcher();
+        // A drag caught here is still going on Windows, but releasing it
+        // now isn't safe: no INACTIVE came, so the other machine may still
+        // have control, and an injected release would be forwarded there.
+        // Hiding the catcher would let the drag drop wherever the cursor
+        // is. So the catcher stays up (harmless while the cursor is parked)
+        // until Windows has control again, which shows as the parked cursor
+        // moving.
+        if (_catching && _caughtDrag && !_leftoverEnded)
+        {
+            Log.Write("[to-mac] The bridge went away during a caught drag; keeping the catcher up until Windows has control again.");
+            WaitForControlThenEnd(_catchSession, Cursor.Position);
+        }
+        else if (_catching) HideCatcher();
         foreach (var drop in _fromMac.Values) drop.Cancelled = true;
     }
 }
@@ -324,7 +444,10 @@ sealed class IncomingDrop
     readonly bool[] _done;
     public volatile bool Cancelled;
     public volatile bool Failed;
+    // Both under _done's lock: the last file can arrive (network thread)
+    // just as the drag gives up (UI thread), and only one may save.
     bool _saveToDesktop;
+    bool _saved;
 
     public bool IsComplete { get { lock (_done) return _done.All(d => d); } }
 
@@ -343,19 +466,13 @@ sealed class IncomingDrop
 
     public static IncomingDrop Create(OfferMsg offer, string? root = null)
     {
+        PruneSoon();
         var dir = Path.Combine(root ?? Root, offer.Id.ToString());
         Directory.CreateDirectory(dir);
-        var paths = offer.Files.Select(f => Path.Combine(dir, SafeName(f.Name))).ToArray();
+        var paths = Names.Unique(offer.Files.Select(f => f.Name)).Select(n => Path.Combine(dir, n)).ToArray();
         // Empty placeholders, so the drag can start before the bytes arrive.
         foreach (var p in paths) File.WriteAllBytes(p, Array.Empty<byte>());
         return new IncomingDrop(offer.Id, paths);
-    }
-
-    static string SafeName(string name)
-    {
-        var bad = Path.GetInvalidFileNameChars();
-        var clean = new string(name.Select(c => bad.Contains(c) ? '_' : c).ToArray()).Trim();
-        return clean is "" or "." or ".." ? "file" : clean;
     }
 
     public void FileDone(int index)
@@ -370,14 +487,31 @@ sealed class IncomingDrop
         {
             Log.Write($"[to-windows] {Id}: all {Paths.Length} file(s) arrived.");
             Completed?.Invoke();
-            if (_saveToDesktop) SaveToDesktop();
+            SaveIfWanted();
         }
     }
 
     public void SaveToDesktopWhenComplete()
     {
-        _saveToDesktop = true;
-        if (IsComplete) SaveToDesktop();
+        lock (_done) _saveToDesktop = true;
+        SaveIfWanted();
+    }
+
+    void SaveIfWanted()
+    {
+        lock (_done)
+        {
+            if (!_saveToDesktop || _saved || !_done.All(d => d)) return;
+            _saved = true;
+        }
+        try
+        {
+            SaveToDesktop();
+        }
+        catch (Exception e)
+        {
+            Log.Write($"[to-windows] Drag {Id}: couldn't save to the desktop: {e.Message}");
+        }
     }
 
     void SaveToDesktop()
@@ -387,6 +521,24 @@ sealed class IncomingDrop
         foreach (var p in Paths) File.Copy(p, Path.Combine(dir, Path.GetFileName(p)), overwrite: true);
         Log.Write($"[to-windows] Drag {Id}: saved to {dir}.");
         Process.Start(new ProcessStartInfo(dir) { UseShellExecute = true });
+    }
+
+    static int _pruning;
+    static DateTime _lastPrune = DateTime.MinValue;
+
+    /// `PruneOld` in the background, at most hourly: on the offer's path
+    /// it would hold up the control connection, and the files' data
+    /// connection only waits about 2s for the offer to be registered.
+    static void PruneSoon()
+    {
+        if (DateTime.UtcNow - _lastPrune < TimeSpan.FromHours(1)) return;
+        if (Interlocked.Exchange(ref _pruning, 1) == 1) return;
+        _lastPrune = DateTime.UtcNow;
+        Task.Run(() =>
+        {
+            try { PruneOld(); }
+            finally { Interlocked.Exchange(ref _pruning, 0); }
+        });
     }
 
     /// Drop folders older than a day: apps may read a dropped file a while

@@ -135,6 +135,34 @@ for Phase 4.
 - Live: drag a large file to the Mac and release early while moving the mouse; copy on the Mac and flick to Windows at once; sleep and wake the Mac with the companion connected, then copy a file.
 
 ### Phase 2: companion correctness (B7-B10, low-severity companion items)
+
+**Done** (Grok-reviewed; type-checked and unit-tested, not live-tested).
+`INACTIVE` now carries `drag_over` (`drag.is_dropping()`) and `HELLO` a
+protocol version (2), so the bridge and the companion must be updated
+together. Also done: keepalive on the companion's control connection, a
+30s stall limit on data connections, a lock so a drop can't be saved to
+the desktop twice, and a disconnect mid-catch keeping the catcher up
+(no injected release, the Mac may still have control) until the parked
+cursor moves, then ending the leftover drag. `INACTIVE` also carries
+`let_go` (the release seen on the Mac, kept across reconnects), so a
+quick bounce that beats the offer is handed back rather than ended, the
+Mac ignores offers once control has left, and an offer arriving after a
+release on the Mac is saved to its drop folder instead of starting a drag.
+A failed offer send is retried when the drag re-enters the catcher. Known
+gap, left after a watch for it misfired: a drag let go on the Mac within
+~100ms of crossing, before OLE entered the catcher, carries on on Windows.
+The review found: ending a leftover drag kept the catch open for 350ms
+(a quick return to the Mac wasn't caught), so the release is now
+immediate and the catch ends at once; pruning on the offer's path could
+outlast the data connection's 2s wait, so it runs in the background at
+most hourly; and a version mismatch broke drag-back, so `INACTIVE` still
+carries `button_held` and the companion reads whichever the bridge's
+version means. Open: whether OLE re-polls `QueryContinueDrag` on the 50ms
+`WM_TIMER` (documented as on input changes). If the live test shows an
+early release still waiting for a mouse move, nudge it with a zero-length
+injected move. Not done: a size cap on the temp folders (pruned by age),
+and the companion link's missing MAC and freshness.
+
 - Unique names in `IncomingDrop.Create`, with a C# test.
 - Early release on Windows: keep a short UI timer during the drag so `QueryContinueDrag` is re-polled. If the files aren't complete within about a second of letting go, cancel the drag and save to `Desktop\MouseWithoutBorders\` rather than dropping at a moving cursor.
 - `RunControl`'s `finally` only resets state when it's still the current connection.

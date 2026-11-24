@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::{self, Config};
 use mwb_protocol::drag_drop::{DragAction, DragDropState};
-use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, release_keys, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN, WM_MOUSEMOVE};
+use mwb_protocol::input_handling::{handle_keyboard, handle_mouse, release_keys, KeyboardState, LockComboDetector, MouseState, ScreenEdge, LLKHF_UP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
 use mwb_protocol::mwb_protocol::*;
 use rand::RngExt;
 
@@ -57,6 +57,15 @@ const LISTEN_PORT: u16 = 15101;
 /// The outbound connection to Windows, kept so a wake from sleep or a newly
 /// plugged-in cable can cut it (see `watch_for_wake`, `watch_for_wired_path`).
 static CURRENT_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
+
+/// Whether the left button was let go of over this Mac since control last
+/// came here (MachineSwitched): the companion's INACTIVE `let_go`, which
+/// says whether a drag it caught ended here or is coming back. The press
+/// of a drag from Windows happened there, so the release is the only part
+/// this Mac sees. Kept across reconnects (Windows may still think this Mac
+/// has control), and a lost connection counts as letting go, since it
+/// cancels the drag here.
+static LET_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The Windows end of the live connection, if there is one.
 pub fn current_peer() -> Option<std::net::SocketAddr> {
@@ -191,6 +200,10 @@ fn run_session(
     let mut unhandled_seen = std::collections::HashSet::new();
     let mut ignored_before_handshake = false;
     let mut last_data = std::time::Instant::now();
+    // Whether this Mac has control (between MachineSwitched to it and
+    // HideMouse): a companion drag offer arriving after control left is
+    // ignored.
+    let mut active_here = false;
 
     loop {
         // A release held back for files still arriving (see IncomingDrag).
@@ -206,7 +219,23 @@ fn run_session(
                 clipboard::receive_companion_copy(link, offer, shared);
             }
             for offer in link.take_offers() {
-                if drag.start_drop() == DragAction::DropStarted {
+                if LET_GO.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Let go here before the offer came (or the connection
+                    // dropped meanwhile), whether or not control has left
+                    // since: the companion ends Explorer's drag, so there's
+                    // no drag to start, and the files go to the drop
+                    // folder, as for a release before a drag could start.
+                    println!("{} [drop] Let go of the companion's drag {} before it arrived, saving its files instead.", timestamp(), offer.id);
+                    if let Some(cg) = cg.as_deref_mut() {
+                        incoming.settle(cg);
+                        incoming.start_companion(link, offer);
+                        incoming.dropped(cg);
+                    }
+                } else if !active_here {
+                    // Came back before the offer did: the companion hands
+                    // the drag back on Windows.
+                    println!("{} [drop] Ignoring the companion's drag {}: control already left this Mac.", timestamp(), offer.id);
+                } else if drag.start_drop() == DragAction::DropStarted {
                     println!("{} [drop] {} file(s) dragged on Windows are over this Mac.", timestamp(), offer.files.len());
                     if let Some(cg) = cg.as_deref_mut() {
                         incoming.settle(cg);
@@ -372,6 +401,9 @@ fn run_session(
                     if flags == WM_LBUTTONDOWN {
                         drag_out.mouse_down();
                     }
+                    if flags == WM_LBUTTONUP {
+                        LET_GO.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // A drag from Windows is settled before this packet is
                     // posted: the release posted below is what drops it.
                     let mut post = true;
@@ -481,10 +513,13 @@ fn run_session(
                 // and PowerToys' own should be off ("Transfer file").
                 let companion = companion::link().filter(|l| l.is_connected() && clipboard.is_some());
                 if package_type == PACKAGE_TYPE_HIDE_MOUSE {
+                    if des_id == cfg.machine_id {
+                        active_here = false;
+                    }
                     // A drop held back here ends now (the user let go here),
                     // before the button state is read: it holds the left
-                    // button down, which the companion would take for a
-                    // drag going back to Windows.
+                    // button down, which would look like a file drag of its
+                    // own going to Windows.
                     if des_id == cfg.machine_id
                         && let Some(cg) = cg.as_deref_mut()
                     {
@@ -493,12 +528,15 @@ fn run_session(
                     if des_id == cfg.machine_id
                         && let (Some(link), Some(cg)) = (companion, cg.as_deref_mut())
                     {
-                        // Read before a drop here is cancelled below.
-                        let held = cg.left_button_held();
-                        if held && !drag.is_dropping() {
+                        // Both read before a drop here is cancelled below: a
+                        // drag from Windows still over this Mac is going back.
+                        let drag_over = drag.is_dropping();
+                        let button_held = cg.left_button_held();
+                        if button_held && !drag_over {
                             offer_to_companion(link, cg, &drag_out);
                         }
-                        link.send(mwb_protocol::companion::INACTIVE, &mwb_protocol::companion::Inactive { button_held: held });
+                        let let_go = LET_GO.load(std::sync::atomic::Ordering::Relaxed);
+                        link.send(mwb_protocol::companion::INACTIVE, &mwb_protocol::companion::Inactive { drag_over, button_held, let_go });
                     }
                 } else if companion.is_some() {
                     println!("{} [drag] Ignoring PowerToys' drag package {package_type}: the companion handles drag-and-drop (turn off \"Transfer file\" in PowerToys).", timestamp());
@@ -564,7 +602,14 @@ fn run_session(
             PACKAGE_TYPE_MACHINE_SWITCHED => {
                 // This Mac just became the active machine: if a drag was
                 // going on on Windows, it's now over here.
-                if unpack_u32_le(&full, 12) == cfg.machine_id
+                let to_us = unpack_u32_le(&full, 12) == cfg.machine_id;
+                active_here |= to_us;
+                // Only the client session forwards input and sees the
+                // release, so only it starts a new activation's LET_GO.
+                if to_us && cg.is_some() {
+                    LET_GO.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if to_us
                     && clipboard.is_some()
                     && let Some(link) = companion::link().filter(|l| l.is_connected())
                 {
@@ -667,6 +712,9 @@ fn run_client(
     cg.reset();
     let result = run_session(&mut stream, Some(&mut *cg), cfg, Some((clip_rx, clip_shared)), handshook);
     CURRENT_STREAM.lock().unwrap().take();
+    // Any drag from Windows over this Mac is cancelled below, so to the
+    // companion it ended here (see LET_GO).
+    LET_GO.store(true, std::sync::atomic::Ordering::Relaxed);
     // A drag from Windows cut off by the connection ending: cancel it, or
     // releasing the button in reset() would drop it wherever the cursor is.
     if drag_source::is_active() {

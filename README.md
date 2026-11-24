@@ -178,9 +178,10 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
   whatever Mac app you let go over.
 - **Mac -> Windows** starts a real Windows drag of the files under the
   cursor, so they drop into whichever Explorer window or app you let go
-  over. Letting go before they've fully arrived holds the drop until they
-  have. If the drag can't start, they're saved to
-  `Desktop\MouseWithoutBorders\` as before.
+  over. Letting go before they've fully arrived holds the drop for up to a
+  second; if they're still arriving then, or the drag can't start, they're
+  saved to `Desktop\MouseWithoutBorders\` as before (the one-second limit is
+  not yet live-tested).
 - **File copy and paste** goes through it too, both ways (live-tested
   2026-11-23: 7 files from Finder to Explorer, 2 from Explorer to Finder):
   files copied in Explorer land on the Mac's clipboard, and
@@ -211,7 +212,10 @@ Setup:
    Windows' own prompt. The security key is read from PowerToys' Mouse
    Without Borders settings, so there's nothing to configure;
    `%APPDATA%\MwbBridgeCompanion\config.json` can override it
-   (`{"security_key": "...", "port": 15102}`). Re-run either to update.
+   (`{"security_key": "...", "port": 15102}`). Re-run either to update,
+   and update the companion whenever you update the bridge: they speak a
+   versioned protocol. Either side still works with the other's previous
+   version, and the companion's log says when the two differ.
 3. The Mac bridge finds the companion by itself on the PC it's connected
    to. Without one it uses PowerToys' own drag-and-drop, as above.
 
