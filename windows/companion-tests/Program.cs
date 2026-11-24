@@ -103,7 +103,13 @@ Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\"
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":{\"value\":[\"WINPC\",\"\",\"\",\"\"]},\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "alan-mac")!.Contains("MachineMatrixString"), "missing from the layout is reported");
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,:,:,:\"}}"), "alan-mac")!.Contains("MachinePool"), "missing from the pool is reported");
 Check(SetupCheck.Problem(Props("{}"), "alan-mac") == null, "settings it can't read don't produce a false alarm");
-Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac \",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1, alan-mac:2,:,:\"}}"), "alan-mac") == null, "spaces PowerToys trims don't cause a false alarm");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1, alan-mac :2,:,:\"}}"), "alan-mac") == null, "spaces PowerToys trims in the pool don't cause a false alarm");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac \",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "alan-mac")!.Contains("MachineMatrixString"), "a layout slot with spaces isn't found by edge crossing");
+string? Pool(string pool) => SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"" + pool + "\"}}"), "alan-mac");
+Check(Pool("WINPC:1,alan-mac:2,,:")!.Contains("four") && Pool("WINPC:1,alan-mac:2,oops,:")!.Contains("four"), "one slot that isn't name:id throws the whole pool away");
+Check(Pool("alan-mac:2,WINPC:1,alan-mac:0,:")!.Contains("valid ID") && Pool("alan-mac:2,WINPC:2,:,:")!.Contains("valid ID"), "a later slot can take the bridge's ID away");
+Check(Pool("alan-mac:0,WINPC:1,alan-mac:2,:") == null, "a later slot can give the bridge its ID");
+Check(Pool("WINPC:1,alan-mac:255,:,:")!.Contains("valid ID"), "255 is all machines, not an ID");
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "alan-mac")!.Contains("MachineMatrixString"), "a layout without four slots is one PowerToys ignores");
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2\"}}"), "alan-mac")!.Contains("four"), "a pool without four slots is one PowerToys ignores");
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:NONE,:,:\"}}"), "alan-mac")!.Contains("valid ID"), "a pool entry without a usable ID is reported");

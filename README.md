@@ -305,8 +305,11 @@ Setup:
    to. Without one it uses PowerToys' own drag-and-drop, as above. When
    the bridge connects, the companion also checks that it's in both of
    Mouse Without Borders' lists (`MachineMatrixString` and `MachinePool`,
-   see "On the Windows side" below) and shows a warning once if it isn't
-   (type-checked and unit-tested only, not yet live-tested).
+   see "On the Windows side" below), read the way PowerToys reads them,
+   and shows a warning once if it isn't: missing, a layout slot with
+   spaces around the name, a pool PowerToys would throw away (one slot
+   that isn't `name:id`), or an ID that a later slot takes away, or that
+   is 0 or 255 (type-checked and unit-tested only, not yet live-tested).
 
 The log is `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log` (also under
 the tray icon's menu: the same two-headed arrow as the Mac's menu bar

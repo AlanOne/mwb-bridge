@@ -21,7 +21,9 @@ static class SetupCheck
             var missing = new List<string>();
             if (!properties.TryGetProperty("MachineMatrixString", out var matrix) || !properties.TryGetProperty("MachinePool", out var pool)) return null;
             var layout = MatrixNames(matrix);
-            if (layout == null || !layout.Any(n => n.Trim().Equals(bridge.Trim(), StringComparison.OrdinalIgnoreCase)))
+            // Edge crossing looks the slot up as stored, untrimmed (only
+            // the pool's names are trimmed), ignoring case.
+            if (layout == null || !layout.Any(n => n.Equals(bridge.Trim(), StringComparison.OrdinalIgnoreCase)))
             {
                 missing.Add("MachineMatrixString (the layout)");
             }
@@ -54,24 +56,46 @@ static class SetupCheck
         return slots?.Length == 4 ? slots : null;
     }
 
+    const string IgnoredPool = "MachinePool (PowerToys needs four comma-separated name:ID slots, it ignores this one)";
+
     /// What's wrong with `bridge`'s place in the pool ("Name:ID,..."), as
-    /// PowerToys loads it: at least four comma-separated slots, only the
-    /// first four read, each exactly "name:id" with the name trimmed, and an
-    /// ID that isn't a positive number makes switching to it do nothing.
+    /// PowerToys loads it (`MachinePool.Initialize`): at least four
+    /// comma-separated slots, of which only the first four are read, each
+    /// exactly "name:id" (else the whole pool is thrown away), names
+    /// trimmed. The slots are applied in order: a name seen again takes the
+    /// later ID, and an ID given to one machine is taken from any other
+    /// that had it (`TryUpdateMachineID`). The ID the bridge ends up with
+    /// has to be a machine's: 0 is none, and 255 means all machines.
     static string? PoolProblem(JsonElement p, string bridge)
     {
         if (p.ValueKind == JsonValueKind.Object && p.TryGetProperty("value", out var v)) p = v;
         if (p.ValueKind != JsonValueKind.String) return "MachinePool";
         var slots = (p.GetString() ?? "").Split(',');
-        if (slots.Length < 4) return "MachinePool (PowerToys needs four comma-separated slots, it ignores this one)";
+        if (slots.Length < 4) return IgnoredPool;
+        var ids = new List<(string Name, uint Id)>();
         foreach (var slot in slots.Take(4))
         {
             var parts = slot.Split(':');
-            if (parts.Length != 2 || !parts[0].Trim().Equals(bridge, StringComparison.OrdinalIgnoreCase)) continue;
-            return uint.TryParse(parts[1].Trim(), out var id) && id != 0
-                ? null
-                : $"MachinePool lists {bridge} without a valid ID (it must match the bridge's machine_id)";
+            if (parts.Length != 2) return IgnoredPool;
+            var name = parts[0].Trim();
+            if (name.Length == 0) continue;
+            var id = uint.TryParse(parts[1].Trim(), out var parsed) ? parsed : 0;
+            if (id != 0)
+            {
+                for (var i = 0; i < ids.Count; i++)
+                {
+                    if (ids[i].Id == id) ids[i] = (ids[i].Name, 0);
+                }
+            }
+            var at = ids.FindIndex(e => e.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (at < 0) ids.Add((name, id));
+            else ids[at] = (ids[at].Name, id);
         }
-        return "MachinePool";
+        var bridgeEntry = ids.FindIndex(e => e.Name.Equals(bridge.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (bridgeEntry < 0) return "MachinePool";
+        var finalId = ids[bridgeEntry].Id;
+        return finalId is 0 or 255
+            ? $"MachinePool leaves {bridge} without a valid ID (it must match the bridge's machine_id, other than 0 and 255, and no other machine may have it)"
+            : null;
     }
 }
