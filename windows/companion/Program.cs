@@ -25,6 +25,7 @@ static class Program
 sealed class TrayContext : ApplicationContext
 {
     readonly NotifyIcon _tray;
+    bool _lightTaskbar;
     readonly ToolStripMenuItem _statusItem = new("Waiting for the bridge") { Enabled = false };
     readonly Control _ui = new();
     ClipboardWatcher? _clipboard;
@@ -37,7 +38,8 @@ sealed class TrayContext : ApplicationContext
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open log", null, (_, _) => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Log.FilePath) { UseShellExecute = true }));
         menu.Items.Add("Quit", null, (_, _) => { _tray!.Visible = false; ExitThread(); });
-        _tray = new NotifyIcon { Icon = AppIcon(), Text = "MWB Bridge Companion", ContextMenuStrip = menu, Visible = true };
+        _tray = new NotifyIcon { Icon = TrayIcon(_lightTaskbar = LightTaskbar()), Text = "MWB Bridge Companion", ContextMenuStrip = menu, Visible = true };
+        Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnPreferenceChanged;
 
         var coordinator = new Coordinator(_ui);
         new Server(config, coordinator, SetStatus).Start();
@@ -51,11 +53,41 @@ sealed class TrayContext : ApplicationContext
         }
     }
 
-    /// The app's own icon at the tray's size, so Windows doesn't scale down a big one.
-    static Icon AppIcon()
+    /// The Mac bridge's arrow, black on a light taskbar and white on a dark
+    /// one (macOS recolors its menu bar icon the same way), at the tray's size.
+    static Icon TrayIcon(bool light)
     {
-        using var stream = typeof(TrayContext).Assembly.GetManifestResourceStream("icon.ico");
+        using var stream = typeof(TrayContext).Assembly.GetManifestResourceStream(light ? "tray-light.ico" : "tray-dark.ico");
         return stream == null ? SystemIcons.Application : new Icon(stream, SystemInformation.SmallIconSize);
+    }
+
+    /// Whether the taskbar uses the light theme. Missing means an older
+    /// Windows, whose taskbar is always dark.
+    static bool LightTaskbar()
+    {
+        using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+        return key?.GetValue("SystemUsesLightTheme") is int light && light != 0;
+    }
+
+    /// Follows a switch between light and dark mode.
+    void OnPreferenceChanged(object? sender, Microsoft.Win32.UserPreferenceChangedEventArgs e)
+    {
+        if (e.Category != Microsoft.Win32.UserPreferenceCategory.General) return;
+        _ui.BeginInvoke(() =>
+        {
+            var light = LightTaskbar();
+            if (light == _lightTaskbar) return;
+            _lightTaskbar = light;
+            var old = _tray.Icon;
+            _tray.Icon = TrayIcon(light);
+            old?.Dispose();
+        });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnPreferenceChanged;
+        base.Dispose(disposing);
     }
 
     void SetStatus(string? bridge)

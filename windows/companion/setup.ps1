@@ -2,9 +2,10 @@
 # `app\` (and optionally a `config.json`): copies the app, lets the bridge in
 # through the firewall (local network only) and starts it now and at every
 # logon, in the logged-on user's desktop session. Run by install.sh (over
-# SSH) and install.ps1 (on the PC). Without admin rights the firewall rule
-# is left to Windows' own prompt and a Startup-folder shortcut replaces the
-# logon task.
+# SSH) and install.ps1 (on the PC). It also removes firewall rules that
+# block the app. Without admin rights the firewall is left to Windows' own
+# prompt (and any block rules are only reported) and a Startup-folder
+# shortcut replaces the logon task.
 param([Parameter(Mandatory)][string]$Staging)
 $ErrorActionPreference = "Stop"
 
@@ -23,13 +24,28 @@ if (Test-Path $config) {
     Move-Item $config (Join-Path $configDir "config.json") -Force
 }
 
+# Windows adds rules that block the app when its "allow access" prompt is
+# dismissed, and a block rule beats any allow rule, so those go first.
+$blocking = @(Get-NetFirewallApplicationFilter -All -ErrorAction SilentlyContinue |
+    Where-Object { $_.Program -and [Environment]::ExpandEnvironmentVariables($_.Program) -ieq $exe } |
+    Get-NetFirewallRule -ErrorAction SilentlyContinue |
+    Where-Object { $_.Direction -eq "Inbound" -and $_.Action -eq "Block" -and $_.Enabled -eq "True" })
+if ($blocking.Count -gt 0) {
+    $names = ($blocking | ForEach-Object { "'$($_.DisplayName)'" } | Sort-Object -Unique) -join ", "
+    try {
+        $blocking | Remove-NetFirewallRule
+        "Removed $($blocking.Count) firewall rule(s) that blocked the companion ($names)."
+    } catch {
+        "The firewall blocks the companion with $($blocking.Count) inbound block rule(s) named $names, so the bridge can't reach it. Re-run this from an admin PowerShell to remove them, or delete them under Windows Defender Firewall > Advanced settings > Inbound Rules."
+    }
+}
 try {
     if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
         New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol TCP -LocalPort 15102 `
             -RemoteAddress LocalSubnet -Action Allow -Profile Any | Out-Null
     }
 } catch {
-    "Couldn't add the firewall rule (needs admin): allow it when Windows asks, or add an inbound rule for TCP 15102."
+    "Couldn't add the firewall rule (needs admin): allow it when Windows asks, or re-run this from an admin PowerShell."
 }
 
 $startup = Join-Path ([Environment]::GetFolderPath("Startup")) "$name.lnk"

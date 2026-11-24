@@ -16,6 +16,7 @@
     <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
-    <EmbeddedResource Include="icon.ico" LogicalName="icon.ico" />
+    <EmbeddedResource Include="tray-light.ico" LogicalName="tray-light.ico" />
+    <EmbeddedResource Include="tray-dark.ico" LogicalName="tray-dark.ico" />
   </ItemGroup>
 </Project>

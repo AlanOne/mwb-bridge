@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
-"""Draws the companion's icon and writes icon.ico next to this script.
+"""Draws the companion's icons and writes them next to this script.
 
-A white document on a blue tile, with an orange two-way arrow across it:
-files crossing between machines. Plain geometry, supersampled for
-antialiasing, so it needs nothing beyond the Python standard library.
-Re-run after changing the drawing: python3 windows/companion/make-icon.py
-(add --preview to also write icon-preview.png for a look at every size).
+The same two-headed arrow as the Mac bridge's menu bar icon
+(daemon/macos/src/tray.rs, bridge_icon), in the same proportions:
+- tray-dark.ico and tray-light.ico: the bare arrow, white for a dark
+  taskbar and black for a light one, picked by the app at runtime the way
+  macOS recolors its template image;
+- icon.ico: the app's own icon, a white arrow on a blue tile.
+Plain geometry, supersampled for antialiasing, so it needs nothing beyond
+the Python standard library. Re-run after changing the drawing:
+python3 windows/companion/make-icon.py (add --preview to also write
+icon-preview.png for a look at every size).
 """
 import struct
 import sys
 import zlib
 from pathlib import Path
 
-SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
+APP_SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
+TRAY_SIZES = [16, 20, 24, 32, 40, 48]
 
 TILE_TOP = (0x3B, 0x82, 0xF6)
 TILE_BOTTOM = (0x1D, 0x4E, 0xD8)
-PAPER = (0xFF, 0xFF, 0xFF)
-FOLD = (0xBF, 0xDB, 0xFE)
-LINES = (0xC7, 0xD2, 0xE0)
-ARROW = (0xF9, 0x73, 0x16)
+WHITE = (0xFF, 0xFF, 0xFF)
+BLACK = (0x00, 0x00, 0x00)
+
+# The Mac draws on a 36-pixel grid: 3 pixels of margin, arrowheads 10 long
+# and 13 tall, a shaft 5 tall.
+MAC = 36.0
+MARGIN = 3 / MAC
+HEAD_LEN = 10 / MAC
+HEAD_HALF = 6.5 / MAC
+SHAFT_HALF = 2.5 / MAC
 
 
 def inside_poly(x, y, pts):
@@ -42,65 +54,56 @@ def inside_round_rect(x, y, x0, y0, x1, y1, r):
     return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
 
 
-def arrow(cy, x0, x1, shaft, head_len, head_half):
-    """A two-headed horizontal arrow as one polygon."""
+def arrow_poly(size, x0, x1, scale):
+    """The two-headed arrow between x0 and x1, centered vertically.
+
+    Small sizes put the shaft's edges and the tips on whole pixels so they
+    stay crisp: an odd shaft is centered on a pixel, an even one between two.
+    """
+    if size > 32:
+        cy, half = 0.5, SHAFT_HALF * scale
+    else:
+        shaft_px = max(1, round(2 * SHAFT_HALF * scale * size))
+        mid = size // 2 if shaft_px % 2 == 0 else size // 2 + 0.5
+        cy, half = mid / size, shaft_px / 2 / size
+        x0, x1 = round(x0 * size) / size, round(x1 * size) / size
+    head_len, head_half = HEAD_LEN * scale, HEAD_HALF * scale
     return [
         (x0, cy),
         (x0 + head_len, cy - head_half),
-        (x0 + head_len, cy - shaft),
-        (x1 - head_len, cy - shaft),
+        (x0 + head_len, cy - half),
+        (x1 - head_len, cy - half),
         (x1 - head_len, cy - head_half),
         (x1, cy),
         (x1 - head_len, cy + head_half),
-        (x1 - head_len, cy + shaft),
-        (x0 + head_len, cy + shaft),
+        (x1 - head_len, cy + half),
+        (x0 + head_len, cy + half),
         (x0 + head_len, cy + head_half),
     ]
 
 
-ARROW_Y = 0.665
+def tray_shapes(color):
+    def shapes(size):
+        arr = arrow_poly(size, MARGIN, 1 - MARGIN, 1.0)
+        return [(color, lambda x, y: inside_poly(x, y, arr))]
+    return shapes
 
 
-def layers(size):
-    """The shapes, back to front, as (color, test(x, y)) in unit coordinates."""
-    small = size <= 24
-    doc = (0.27, 0.14, 0.73, 0.84) if not small else (0.24, 0.12, 0.76, 0.86)
-    fold = 0.15 if not small else 0.17
-    # Small sizes put the edges on whole pixels so they stay crisp.
-    snap = (lambda v: round(v * size) / size) if size <= 32 else (lambda v: v)
-    x0, y0, x1, y1 = (snap(v) for v in doc)
-    fold = snap(fold)
-    doc_pts = [(x0, y0), (x1 - fold, y0), (x1, y0 + fold), (x1, y1), (x0, y1)]
-    fold_pts = [(x1 - fold, y0), (x1 - fold, y0 + fold), (x1, y0 + fold)]
-
-    if small:
-        ax0, ax1, shaft, head_len, head_half, gap = 0.06, 0.94, 0.06, 0.19, 0.19, 0.0
-    else:
-        ax0, ax1, shaft, head_len, head_half, gap = 0.10, 0.90, 0.048, 0.15, 0.13, 0.04
-    ay, shaft, ax0, ax1 = snap(ARROW_Y), max(snap(shaft), 1 / size), snap(ax0), snap(ax1)
-    arr = arrow(ay, ax0, ax1, shaft, head_len, head_half)
-    # The same arrow a little bigger: a tile-colored gap around it on the paper.
-    halo = arrow(ay, ax0 - 1.6 * gap, ax1 + 1.6 * gap, shaft + gap, head_len + 0.5 * gap, head_half + 1.9 * gap)
-
-    out = [
+def app_shapes(size):
+    # The arrow fills less of the tile at big sizes, where there's room for
+    # a margin, and nearly all of it at small ones, where every pixel counts.
+    scale = 0.86 if size <= 24 else 0.74
+    width = (1 - 2 * MARGIN) * scale
+    arr = arrow_poly(size, 0.5 - width / 2, 0.5 + width / 2, scale)
+    return [
         ("tile", lambda x, y: inside_round_rect(x, y, 0.02, 0.02, 0.98, 0.98, 0.22)),
-        (PAPER, lambda x, y: inside_poly(x, y, doc_pts)),
-        (FOLD, lambda x, y: inside_poly(x, y, fold_pts)),
+        (WHITE, lambda x, y: inside_poly(x, y, arr)),
     ]
-    if not small:
-        for ly, lx1 in ((0.33, x1 - fold - 0.04), (0.43, x1 - 0.08), (0.53, x1 - 0.14)):
-            half = 0.02 if size > 32 else 0.5 / size
-            ly = ly if size > 32 else (int(ly * size) + 0.5) / size
-            out.append((LINES, lambda x, y, ly=ly, lx1=snap(lx1), h=half: snap(x0 + 0.07) <= x <= lx1 and ly - h <= y <= ly + h))
-    if gap:
-        out.append(("tile", lambda x, y: inside_poly(x, y, halo) and inside_poly(x, y, doc_pts)))
-    out.append((ARROW, lambda x, y: inside_poly(x, y, arr)))
-    return out
 
 
-def render(size):
+def render(size, shapes_for):
     ss = 8 if size <= 64 else 4
-    shapes = layers(size)
+    shapes = shapes_for(size)
     px = []
     for py in range(size):
         row = []
@@ -117,17 +120,12 @@ def render(size):
                     if color is None:
                         continue
                     if color == "tile":
-                        t = y
-                        color = tuple(a + (b - a) * t for a, b in zip(TILE_TOP, TILE_BOTTOM))
+                        color = tuple(a + (b - a) * y for a, b in zip(TILE_TOP, TILE_BOTTOM))
                     for i in range(3):
                         acc[i] += color[i]
                     acc[3] += 1
-            n = ss * ss
-            a = acc[3] / n
-            if acc[3]:
-                rgb = [round(acc[i] / acc[3]) for i in range(3)]
-            else:
-                rgb = [0, 0, 0]
+            a = acc[3] / (ss * ss)
+            rgb = [round(acc[i] / acc[3]) for i in range(3)] if acc[3] else [0, 0, 0]
             row.append((rgb[0], rgb[1], rgb[2], round(a * 255)))
         px.append(row)
     return px
@@ -172,35 +170,40 @@ def ico(images):
     return out + b"".join(blobs)
 
 
+def preview(strips, path, zoom=1):
+    """Each strip's icons side by side on its background, zoomed by `zoom`."""
+    gap = 8
+    width = max(sum(s * zoom for s, _ in imgs) + gap * (len(imgs) + 1) for _, imgs in strips)
+    height = max(s * zoom for _, imgs in strips for s, _ in imgs) + 2 * gap
+    rows = []
+    for bg, imgs in strips:
+        canvas = [[bg + (255,) for _ in range(width)] for _ in range(height)]
+        x = gap
+        for s, img in imgs:
+            top = height - gap - s * zoom
+            for yy in range(s * zoom):
+                for xx in range(s * zoom):
+                    r, g, b, a = img[yy // zoom][xx // zoom]
+                    f = a / 255
+                    canvas[top + yy][x + xx] = tuple(round(v * f + w * (1 - f)) for v, w in zip((r, g, b), bg)) + (255,)
+            x += s * zoom + gap
+        rows += canvas
+    path.write_bytes(png(rows))
+
+
 def main():
     here = Path(__file__).resolve().parent
-    images = [(s, render(s)) for s in SIZES]
-    (here / "icon.ico").write_bytes(ico(images))
+    app = [(s, render(s, app_shapes)) for s in APP_SIZES]
+    light = [(s, render(s, tray_shapes(BLACK))) for s in TRAY_SIZES]
+    dark = [(s, render(s, tray_shapes(WHITE))) for s in TRAY_SIZES]
+    (here / "icon.ico").write_bytes(ico(app))
+    (here / "tray-light.ico").write_bytes(ico(light))
+    (here / "tray-dark.ico").write_bytes(ico(dark))
     if "--preview" in sys.argv:
-        # Every size side by side, on light and dark strips, at 1:1.
-        gap = 8
-        width = sum(s for s, _ in images) + gap * (len(images) + 1)
-        height = 256 + 2 * gap
-        rows = []
-        for bg in ((0xF3, 0xF3, 0xF3), (0x20, 0x20, 0x20)):
-            canvas = [[bg + (255,) for _ in range(width)] for _ in range(height)]
-            x = gap
-            for s, img in images:
-                top = height - gap - s
-                for yy in range(s):
-                    for xx in range(s):
-                        r, g, b, a = img[yy][xx]
-                        br, bg_, bb, _ = canvas[top + yy][x + xx]
-                        f = a / 255
-                        canvas[top + yy][x + xx] = (
-                            round(r * f + br * (1 - f)),
-                            round(g * f + bg_ * (1 - f)),
-                            round(b * f + bb * (1 - f)),
-                            255,
-                        )
-                x += s + gap
-            rows += canvas
-        (here / "icon-preview.png").write_bytes(png(rows))
+        light_bg, dark_bg = (0xF3, 0xF3, 0xF3), (0x20, 0x20, 0x20)
+        preview([(light_bg, app), (dark_bg, app), (light_bg, light), (dark_bg, dark)], here / "icon-preview.png")
+        small = lambda imgs: [(s, i) for s, i in imgs if s <= 32]
+        preview([(light_bg, small(app)), (light_bg, small(light)), (dark_bg, small(dark))], here / "icon-preview-zoomed.png", zoom=8)
 
 
 if __name__ == "__main__":

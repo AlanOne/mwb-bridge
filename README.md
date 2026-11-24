@@ -207,9 +207,12 @@ Setup:
    the PC lacks a machine-wide .NET 8 desktop runtime), copies it to
    `%LOCALAPPDATA%\MwbBridgeCompanion\app\`, opens TCP port 15102 to the
    local network in the firewall and registers a "MWB Bridge Companion"
-   logon task that starts it (and starts it now). Without admin rights it
-   uses a Startup-folder shortcut instead, and the firewall rule is left to
-   Windows' own prompt. The security key is read from PowerToys' Mouse
+   logon task that starts it (and starts it now). It also removes any
+   firewall rules that block the app, which Windows adds when its "allow
+   access" prompt is dismissed. Without admin rights it uses a
+   Startup-folder shortcut instead, the firewall rule is left to Windows'
+   own prompt, and block rules are only reported: re-run it from an admin
+   PowerShell to clear them. The security key is read from PowerToys' Mouse
    Without Borders settings, so there's nothing to configure;
    `%APPDATA%\MwbBridgeCompanion\config.json` can override it
    (`{"security_key": "...", "port": 15102}`). Re-run either to update,
@@ -220,8 +223,8 @@ Setup:
    to. Without one it uses PowerToys' own drag-and-drop, as above.
 
 The log is `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log` (also under
-the tray icon's menu: a blue tile with a page and an orange two-way
-arrow). How it works, and the protocol between the two, is
+the tray icon's menu: the same two-headed arrow as the Mac's menu bar
+icon, black or white to suit the taskbar). How it works, and the protocol between the two, is
 in `daemon/PROTOCOL.md`'s companion section.
 
 **HTML-only copies**: some Windows copies (seen from a browser) arrive as
@@ -631,7 +634,8 @@ Past that point, everything is automatic.
 - `windows/companion/` — the optional Windows tray app that takes over file
   drag-and-drop and file copy (C#, .NET 8), with `install.ps1` (run on the
   PC), `install.sh` (run on the Mac, over SSH) and `setup.ps1` (run on the
-  PC by both). Its icon, `icon.ico`, is drawn by `make-icon.py`. `windows/companion-tests/` checks its protocol code.
+  PC by both). Its icons (`icon.ico` for the app, `tray-light.ico` and
+  `tray-dark.ico` for the tray) are drawn by `make-icon.py`. `windows/companion-tests/` checks its protocol code.
 - `daemon/PROTOCOL.md` — the full reverse-engineered wire protocol spec,
   plus everything learned about Windows-side state (the Matrix/MachinePool
   UI persistence bug, DNS/IP-mapping quirks, keyboard-layout translation).
