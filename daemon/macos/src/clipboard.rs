@@ -18,6 +18,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -315,16 +316,13 @@ fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usi
 }
 
 /// Writes a full-size clipboard image for Windows to fetch, under a new
-/// name each time: an earlier one may still be being sent. Older ones are
-/// deleted (one being sent is already open, which unlinking doesn't stop).
+/// name each time: an earlier one may still be about to be sent (a push
+/// that finds it superseded stops on its own, see CLIPBOARD_GENERATION).
+/// Ones older than an hour are deleted, long after any push of them.
 fn write_outbound_image(png: &[u8]) -> std::io::Result<PathBuf> {
     let dir = cache_dir().join("outbound-images");
     std::fs::create_dir_all(&dir)?;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    crate::drag_in::prune_old_drags(&dir, Duration::from_secs(3600));
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let path = dir.join(format!("{stamp}.png"));
     std::fs::write(&path, png)?;
@@ -692,13 +690,18 @@ pub(crate) fn safe_file_name(windows_path: &str) -> String {
 
 /// Sends one item as the 1024-byte header plus body, over a clipboard-
 /// server connection whose handshake is done.
-fn send_item(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], (path, name): &Item) -> std::io::Result<()> {
+/// With `current` set, it stops (an error, the connection then dropped)
+/// once the clipboard moves past that generation.
+fn send_item(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], (path, name): &Item, current: Option<u64>) -> std::io::Result<()> {
     use std::io::Write;
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len() as usize;
+    let mut body = WhileCurrent { inner: std::io::BufReader::new(&mut file), generation: current };
+    // Not even the header for content that's already stale.
+    body.read(&mut [])?;
     let header = build_file_header(size, name);
     stream.write_all(&cipher.encrypt(chain, &header))?;
-    write_padded_body(stream, cipher, chain, &mut std::io::BufReader::new(&mut file), size)?;
+    write_padded_body(stream, cipher, chain, &mut body, size)?;
     println!("[big-send] Sent {name:?} ({size} bytes) to Windows.");
     Ok(())
 }
@@ -725,7 +728,7 @@ fn serve_pending(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option
         stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
         return Ok(());
     };
-    send_item(&mut stream, &cipher, &mut write_chain, &item)
+    send_item(&mut stream, &cipher, &mut write_chain, &item, None)
 }
 
 /// Answers Windows' ClipboardAsk: connects to *its* clipboard-server port
@@ -738,29 +741,93 @@ fn serve_pending(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<Option
 /// put it on the clipboard). Several dragged files go one per connection:
 /// Windows takes one file per transfer, but accepts further pushes.
 pub fn push_to_windows(cfg: &Config, peer_addr: Option<SocketAddr>, post_action: u32, shared: &ClipboardShared) -> std::io::Result<()> {
-    let Some(outbound) = shared.pending_outbound.lock().unwrap().clone() else {
+    let (outbound, pending_generation) = {
+        let pending = shared.pending_outbound.lock().unwrap();
+        (pending.clone(), PENDING_GENERATION.load(Ordering::SeqCst))
+    };
+    let Some(outbound) = outbound else {
         // Connecting with nothing to send would leave Windows saving an
         // empty file, so just don't answer.
         println!("[big-send] Windows asked for big-path data, but nothing is pending.");
         return Ok(());
     };
-    push_items(cfg, windows_clipboard_addr(cfg, peer_addr)?, post_action, &outbound_items(&outbound));
+    // For the clipboard, only while nothing newer has been copied (see
+    // CLIPBOARD_GENERATION); a drag's file goes regardless.
+    let current = if post_action == POST_ACTION_OTHER {
+        if pending_generation != CLIPBOARD_GENERATION.load(Ordering::SeqCst) {
+            println!("[big-send] Windows asked for clipboard data that a newer copy has replaced, not sending it.");
+            return Ok(());
+        }
+        Some(pending_generation)
+    } else {
+        None
+    };
+    push_items(cfg, windows_clipboard_addr(cfg, peer_addr)?, post_action, &outbound_items(&outbound), current);
     Ok(())
+}
+
+// Every copy sent to Windows moves CLIPBOARD_GENERATION on.
+// PENDING_GENERATION is the generation the pending big-path content was
+// copied in (u64::MAX for a drag's files, which never go to the
+// clipboard). Windows applies whichever transfer finishes, so a clipboard
+// push that's still asked for or under way when something newer was
+// copied would put the old content back over the new: it isn't sent, or
+// is cut off before its last byte, which Windows discards.
+static CLIPBOARD_GENERATION: AtomicU64 = AtomicU64::new(0);
+static PENDING_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Something new was copied here and is being sent to Windows, so any
+/// older clipboard content still waiting to be pushed is stale.
+pub fn copied() {
+    CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Copied content that goes the big path: pending until Windows asks.
+pub fn set_pending_copy(shared: &ClipboardShared, outbound: Outbound) {
+    let mut pending = shared.pending_outbound.lock().unwrap();
+    *pending = Some(outbound);
+    PENDING_GENERATION.store(CLIPBOARD_GENERATION.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// A drag's files, pending until Windows asks for them on the drop.
+pub fn set_pending_drag(shared: &ClipboardShared, outbound: Outbound) {
+    let mut pending = shared.pending_outbound.lock().unwrap();
+    *pending = Some(outbound);
+    PENDING_GENERATION.store(u64::MAX, Ordering::SeqCst);
+}
+
+/// Reads `inner`, failing once the clipboard has moved past `generation`.
+struct WhileCurrent<R> {
+    inner: R,
+    generation: Option<u64>,
+}
+
+impl<R: Read> Read for WhileCurrent<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(generation) = self.generation
+            && CLIPBOARD_GENERATION.load(Ordering::SeqCst) != generation
+        {
+            return Err(std::io::Error::other("a newer copy replaced it"));
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Pushes each item over its own connection to `addr`, strictly one after
 /// another: Windows handles one transfer at a time and refuses a new one
 /// that waits more than 3s for the last (Clipboard.cs's
 /// ExecuteClipboardReceive). A failed item is logged and skipped.
-fn push_items(cfg: &Config, addr: SocketAddr, post_action: u32, items: &[Item]) {
+/// `current`: the clipboard generation these items belong to, if they're
+/// clipboard content (see CLIPBOARD_GENERATION).
+fn push_items(cfg: &Config, addr: SocketAddr, post_action: u32, items: &[Item], current: Option<u64>) {
     for (i, item) in items.iter().enumerate() {
-        if let Err(e) = push_item(cfg, addr, post_action, item) {
+        if let Err(e) = push_item(cfg, addr, post_action, item, current) {
             eprintln!("[big-send] Sending {:?} ({} of {}) failed: {e}", item.1, i + 1, items.len());
         }
     }
 }
 
-fn push_item(cfg: &Config, addr: SocketAddr, post_action: u32, item: &Item) -> std::io::Result<()> {
+fn push_item(cfg: &Config, addr: SocketAddr, post_action: u32, item: &Item, current: Option<u64>) -> std::io::Result<()> {
     use std::io::Write;
     let mut stream = connect_clipboard(addr)?;
     let EncryptedStream { cipher, mut write_chain, mut read_chain } = open_encrypted_stream(&mut stream, &cfg.security_key)?;
@@ -772,7 +839,7 @@ fn push_item(cfg: &Config, addr: SocketAddr, post_action: u32, item: &Item) -> s
     stream.read_exact(&mut peer_hs_ct)?;
     let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
 
-    send_item(&mut stream, &cipher, &mut write_chain, item)?;
+    send_item(&mut stream, &cipher, &mut write_chain, item, current)?;
     // Windows keeps reading past the file's size until we close our side,
     // then saves the file and closes its side: wait for that, so the next
     // transfer doesn't arrive while this one is still being saved.
@@ -883,7 +950,7 @@ mod push_tests {
             "security_key": key, "windows_ip": "unused", "machine_name": "mac", "machine_id": 3,
         }))
         .unwrap();
-        push_items(&cfg, addr, POST_ACTION_DESKTOP, &outbound_items(&Outbound::Files(vec![a, b])));
+        push_items(&cfg, addr, POST_ACTION_DESKTOP, &outbound_items(&Outbound::Files(vec![a, b])), None);
 
         let received = windows.join().unwrap();
         assert_eq!(received, vec![
@@ -891,6 +958,24 @@ mod push_tests {
             ("/two.bin".to_string(), vec![7u8; 64], POST_ACTION_DESKTOP),
         ]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn a_clipboard_push_stops_once_something_newer_is_copied() {
+        let generation = CLIPBOARD_GENERATION.load(Ordering::SeqCst);
+        let mut body = WhileCurrent { inner: &[1u8, 2, 3][..], generation: Some(generation) };
+        let mut buf = [0u8; 1];
+        assert_eq!(body.read(&mut buf).unwrap(), 1);
+        copied();
+        assert!(body.read(&mut buf).is_err());
+        // A drag's file (no generation) goes regardless.
+        let mut drag = WhileCurrent { inner: &[1u8][..], generation: None };
+        assert_eq!(drag.read(&mut buf).unwrap(), 1);
     }
 }
 

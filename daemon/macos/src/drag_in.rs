@@ -544,7 +544,7 @@ pub fn new_drag_dir(root: &Path) -> PathBuf {
     root.join(stamp.to_string())
 }
 
-/// Deletes drag folders under `root` older than `max_age`. Apps may read a
+/// Deletes drag folders (or files) under `root` older than `max_age`. Apps may read a
 /// dropped file a while after the drop, so they're kept for a day rather
 /// than deleted as soon as the drop is done.
 pub fn prune_old_drags(root: &Path, max_age: Duration) {
@@ -557,7 +557,8 @@ pub fn prune_old_drags(root: &Path, max_age: Duration) {
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age >= max_age);
         if old {
-            let _ = std::fs::remove_dir_all(entry.path());
+            let path = entry.path();
+            let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
         }
     }
 }

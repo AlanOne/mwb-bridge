@@ -251,6 +251,10 @@ fn run_session(
             while let Ok(ev) = clip_rx.try_recv() {
                 latest = Some(ev); // coalesce rapid successive changes to the last one
             }
+            if latest.is_some() {
+                // Whatever an older copy still has waiting is stale now.
+                clipboard::copied();
+            }
             match latest {
                 Some(ClipboardEvent::Text(text)) => {
                     let packages = build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text);
@@ -280,7 +284,7 @@ fn run_session(
                         if files.len() > 1 {
                             println!("{} [file-copy] {} files copied, only the first can be pasted on Windows.", timestamp(), files.len());
                         }
-                        *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Files(vec![first.clone()]));
+                        clipboard::set_pending_copy(shared, Outbound::Files(vec![first.clone()]));
                         clipboard::announce_big(stream, &cipher, &mut write_chain, magic_number, cfg.machine_id, clipboard::peer_machine_id(shared))?;
                         println!("{} [file-copy] Copied {}, announced to Windows.", timestamp(), first.display());
                     }
@@ -292,7 +296,7 @@ fn run_session(
                         stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
                         println!("[client] Sent a downscaled clipboard image ({len} bytes) to peer, the full-size one follows.");
                     }
-                    *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Image(path));
+                    clipboard::set_pending_copy(shared, Outbound::Image(path));
                     clipboard::announce_big(
                         stream,
                         &cipher,
@@ -680,7 +684,7 @@ fn offer_outgoing_drag(
         return Ok(());
     }
     let names: Vec<String> = files.iter().map(|f| f.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
-    *clipboard::pending_outbound(shared).lock().unwrap() = Some(Outbound::Files(files));
+    clipboard::set_pending_drag(shared, Outbound::Files(files));
     for (package_type, des) in [(PACKAGE_TYPE_CLIPBOARD_DRAG_DROP, ID_ALL), (PACKAGE_TYPE_CLIPBOARD_DRAG_DROP_OPERATION, to)] {
         let mut pkg = build_drag_drop_package(package_type, *next_id, my_id, des);
         *next_id = next_id.wrapping_add(1);
