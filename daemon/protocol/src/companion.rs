@@ -230,7 +230,11 @@ pub fn expand_offer_paths(paths: &[std::path::PathBuf]) -> (Vec<(std::path::Path
         let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
         entries.sort();
         for path in entries {
-            let name = format!("{prefix}/{}", path.file_name().unwrap_or_default().to_string_lossy());
+            if out.len() >= MAX_OFFER_FILES {
+                skipped.push(path);
+                return;
+            }
+            let name = format!("{prefix}/{}", offer_part(&path));
             let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
             match std::fs::metadata(&path) {
                 Ok(m) if m.is_file() => out.push((path, name)),
@@ -242,7 +246,7 @@ pub fn expand_offer_paths(paths: &[std::path::PathBuf]) -> (Vec<(std::path::Path
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     for path in paths {
-        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let name = offer_part(path);
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() => out.push((path.clone(), name)),
             Ok(m) if m.is_dir() => walk(path, &name, &mut out, &mut skipped),
@@ -250,6 +254,17 @@ pub fn expand_offer_paths(paths: &[std::path::PathBuf]) -> (Vec<(std::path::Path
         }
     }
     (out, skipped)
+}
+
+/// How many files one offer may carry: past that, a dragged folder (the
+/// whole disk, say) is cut short and the rest reported as skipped.
+pub const MAX_OFFER_FILES: usize = 50_000;
+
+/// A path's last part as it goes into an offered name. A Mac file name can
+/// contain a backslash, which receivers read as a separator (older senders
+/// use it), so it's sent as `_`.
+fn offer_part(path: &std::path::Path) -> String {
+    path.file_name().unwrap_or_default().to_string_lossy().replace('\\', "_")
 }
 
 /// An offered name's path parts, for a receiver to rebuild it under its
@@ -280,8 +295,19 @@ pub fn top_level_count(offer: &Offer) -> usize {
 /// header, its bytes, an end, then `DONE`.
 pub fn send_files<S: Write>(writer: &mut FrameWriter<S>, files: &[(std::path::PathBuf, String)]) -> std::io::Result<()> {
     for (index, (path, name)) in files.iter().enumerate() {
-        let mut file = std::fs::File::open(path)?;
-        let size = file.metadata()?.len();
+        // A file that went away (or can't be read) since the offer goes
+        // empty, so the others still arrive at their indexes.
+        let (mut file, size): (Box<dyn Read>, u64) = match std::fs::File::open(path) {
+            Ok(f) => {
+                let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+                // No more than the header says, should it grow meanwhile.
+                (Box::new(f.take(size)), size)
+            }
+            Err(e) => {
+                eprintln!("[companion] Couldn't read {}, sending it empty: {e}", path.display());
+                (Box::new(std::io::empty()), 0)
+            }
+        };
         writer.write_json(FILE_HEADER, &FileHeader { index: index as u32, name: name.clone(), size })?;
         let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
@@ -362,10 +388,12 @@ mod tests {
         std::fs::write(root.join("photos/b.jpg"), b"b").unwrap();
         std::fs::write(root.join("photos/2026/a.jpg"), b"a").unwrap();
         std::fs::write(root.join("notes.txt"), b"n").unwrap();
+        // A backslash is just a character in a Mac file name.
+        std::fs::write(root.join("photos/Q3\\c.pdf"), b"c").unwrap();
         std::os::unix::fs::symlink(root.join("photos"), root.join("photos/loop")).unwrap();
         let (files, skipped) = expand_offer_paths(&[root.join("photos"), root.join("notes.txt"), root.join("missing")]);
         let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
-        assert_eq!(names, vec!["photos/2026/a.jpg", "photos/b.jpg", "notes.txt"]);
+        assert_eq!(names, vec!["photos/2026/a.jpg", "photos/Q3_c.pdf", "photos/b.jpg", "notes.txt"]);
         assert_eq!(files[0].0, root.join("photos/2026/a.jpg"));
         assert_eq!(skipped, vec![root.join("photos/loop"), root.join("missing")]);
         std::fs::remove_dir_all(&root).unwrap();

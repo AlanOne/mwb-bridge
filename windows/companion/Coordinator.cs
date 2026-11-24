@@ -101,21 +101,35 @@ sealed class Coordinator
         // Once per catch: the drag can leave and re-enter the catcher, and a
         // second offer would start a second drag on the Mac.
         if (!_catching || _offered) return;
-        // Folders go as every file inside them (see Names.Expand).
-        var files = Names.Expand(dropped, skipped => Log.Write($"[to-mac] Skipping {skipped}: it couldn't be read."));
-        if (files.Length == 0)
+        // Taken now, so a re-entry while the folders are walked doesn't
+        // offer twice; given back if the offer couldn't be sent.
+        _offered = true;
+        var session = _catchSession;
+        // Folders go as every file inside them (see Names.Expand), which can
+        // take a while: not on this thread, which OLE's DragEnter is on.
+        Task.Run(() =>
         {
-            Log.Write("[to-mac] Nothing to send in that drag (only empty folders?).");
-            _offered = true;
-            return;
-        }
-        var id = Interlocked.Increment(ref _nextId);
-        _toMac[id] = files;
-        var offer = new OfferMsg(id, files.Select(f => new FileInfoMsg(f.Name, (ulong)new FileInfo(f.Path).Length)).ToList());
-        Log.Write($"[to-mac] Offering {files.Length} file(s) to the bridge as drag {id}: {string.Join(", ", offer.Files.Select(f => f.Name))}");
-        // Not sent (no bridge right now): tried again if the drag re-enters.
-        _offered = SendToBridge?.Invoke(Frames.OfferToMac, offer) == true;
-        if (!_offered) Log.Write($"[to-mac] Couldn't send drag {id} to the bridge.");
+            var files = Names.Expand(dropped, skipped => Log.Write($"[to-mac] Skipping {skipped}."));
+            if (files.Length == 0)
+            {
+                Log.Write("[to-mac] Nothing to send in that drag (only empty folders?).");
+                return;
+            }
+            var sent = Offer(Frames.OfferToMac, files, "drag", out var id);
+            // Not sent (no bridge right now): tried again if the drag re-enters.
+            if (!sent) Post(() => { if (session == _catchSession) _offered = false; });
+            if (!sent) Log.Write($"[to-mac] Couldn't send drag {id} to the bridge.");
+        });
+    }
+
+    /// Offers `files` to the bridge as a new id (kept for its "get").
+    bool Offer(uint frame, (string Path, string Name, ulong Size)[] files, string what, out ulong id)
+    {
+        id = (ulong)Interlocked.Increment(ref _nextId);
+        _toMac[id] = files.Select(f => (f.Path, f.Name)).ToArray();
+        var offer = new OfferMsg(id, files.Select(f => new FileInfoMsg(f.Name, f.Size)).ToList());
+        Log.Write($"[to-mac] Offering {files.Length} file(s) to the bridge as {what} {id}: {string.Join(", ", offer.Files.Take(20).Select(f => f.Name))}{(files.Length > 20 ? ", ..." : "")}");
+        return SendToBridge?.Invoke(frame, offer) == true;
     }
 
     /// Control came back to Windows (`version`: the bridge's protocol
@@ -232,16 +246,17 @@ sealed class Coordinator
         // copy twice in a row.
         if (files.SequenceEqual(_lastSetOnClipboard)) return;
         if (files.SequenceEqual(_lastOffered) && DateTime.Now - _lastOfferedAt < TimeSpan.FromSeconds(2)) return;
-        // Folders go as every file inside them (see Names.Expand).
-        var sendable = Names.Expand(files, skipped => Log.Write($"[copy] Skipping {skipped}: it couldn't be read."));
-        if (sendable.Length == 0) return;
         _lastOffered = files;
         _lastOfferedAt = DateTime.Now;
-        var id = Interlocked.Increment(ref _nextId);
-        _toMac[id] = sendable;
-        var offer = new OfferMsg(id, sendable.Select(f => new FileInfoMsg(f.Name, (ulong)new FileInfo(f.Path).Length)).ToList());
-        var sent = SendToBridge?.Invoke(Frames.ClipboardToMac, offer) == true;
-        Log.Write($"[copy] {sendable.Length} file(s) copied here {(sent ? "offered to the bridge" : "not sent: no bridge connected")} ({id}): {string.Join(", ", offer.Files.Select(f => f.Name))}");
+        // Folders go as every file inside them (see Names.Expand), which can
+        // take a while: not on the UI thread.
+        Task.Run(() =>
+        {
+            var sendable = Names.Expand(files, skipped => Log.Write($"[copy] Skipping {skipped}."));
+            if (sendable.Length == 0) return;
+            var sent = Offer(Frames.ClipboardToMac, sendable, "copy", out var id);
+            if (!sent) Log.Write($"[copy] Couldn't offer copy {id}: no bridge connected.");
+        });
     }
 
     public IncomingDrop Register(OfferMsg offer)
@@ -522,9 +537,22 @@ sealed class IncomingDrop
     {
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MouseWithoutBorders");
         Directory.CreateDirectory(dir);
-        foreach (var p in TopLevel) CopyAll(p, Path.Combine(dir, Path.GetFileName(p)));
+        foreach (var p in TopLevel) CopyAll(p, SaveName(dir, Path.GetFileName(p), Directory.Exists(p)));
         Log.Write($"[to-windows] Drag {Id}: saved to {dir}.");
         Process.Start(new ProcessStartInfo(dir) { UseShellExecute = true });
+    }
+
+    /// Where to save `name` in `dir`: a file replaces a file of the same name,
+    /// as before, but a folder never merges into one already there (and
+    /// never lands on a file, or a file on a folder): it gets " (2)" and so on.
+    static string SaveName(string dir, string name, bool isFolder)
+    {
+        var path = Path.Combine(dir, name);
+        bool Free(string p) => isFolder ? !Directory.Exists(p) && !File.Exists(p) : !Directory.Exists(p);
+        var stem = isFolder ? name : Path.GetFileNameWithoutExtension(name);
+        var ext = isFolder ? "" : Path.GetExtension(name);
+        for (var n = 2; !Free(path); n++) path = Path.Combine(dir, $"{stem} ({n}){ext}");
+        return path;
     }
 
     /// Copies a file, or a folder with everything in it.

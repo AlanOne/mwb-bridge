@@ -254,7 +254,8 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
 - **Folders** go through it too, both ways, dragged or copied (type-checked
   and unit-tested only, not yet live-tested): each folder arrives whole,
   with its subfolders, and the drop or paste hands on the folder itself.
-  Empty folders inside aren't carried. Without the companion, folders
+  Empty folders aren't carried (a dragged empty folder sends nothing), and
+  one drag or copy carries at most 50,000 files. Without the companion, folders
   still aren't supported (zip them), as with PowerToys itself.
 
 Setup:

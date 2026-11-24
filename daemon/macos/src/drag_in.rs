@@ -517,11 +517,29 @@ pub fn release_abandoned_press(cg: &mut CgInput) {
 
 fn save_to(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let dest = dir.join(path.file_name().unwrap_or_default());
+    let dest = save_name(dir, &path.file_name().unwrap_or_default().to_string_lossy(), path.is_dir());
     // Copy rather than move: the cache and the Desktop can be on different
     // volumes, and the copy left behind is cleaned up with old drags.
     copy_all(path, &dest)?;
     Ok(dest)
+}
+
+/// Where to save `name` in `dir`: a file replaces a file of the same name,
+/// as before, but a folder never merges into one already there (and never
+/// lands on a file, or a file on a folder): it gets " (2)" and so on.
+fn save_name(dir: &Path, name: &str, is_folder: bool) -> PathBuf {
+    let free = |p: &Path| if is_folder { !p.exists() } else { !p.is_dir() };
+    let first = dir.join(name);
+    if free(&first) {
+        return first;
+    }
+    let (stem, ext) = if is_folder {
+        (name.to_string(), String::new())
+    } else {
+        let p = Path::new(name);
+        (p.file_stem().unwrap_or_default().to_string_lossy().into_owned(), p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default())
+    };
+    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| free(p)).unwrap()
 }
 
 /// Copies a file, or a folder with everything in it, to `dest`.

@@ -212,7 +212,12 @@ sealed class FrameConnection : IDisposable
         var buf = new byte[Frames.ChunkSize];
         for (var i = 0; i < files.Count; i++)
         {
-            using var file = File.OpenRead(files[i].Path);
+            FileStream? opened = null;
+            try { opened = File.OpenRead(files[i].Path); }
+            catch (Exception e) { Log.Write($"Couldn't read {files[i].Path}, sending it empty: {e.Message}"); }
+            // A file that went away since the offer goes empty, so the rest
+            // still arrive at their indexes.
+            using var file = opened ?? new FileStream(Path.GetTempFileName(), FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1, FileOptions.DeleteOnClose);
             WriteJson(Frames.FileHeader, new FileHeaderMsg((uint)i, files[i].Name, (ulong)file.Length));
             int n;
             while ((n = file.Read(buf, 0, buf.Length)) > 0)

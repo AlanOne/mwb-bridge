@@ -166,12 +166,28 @@ sealed class Server
                         break;
                     case Frames.OfferToWindows:
                         // Registered here, not on the UI thread, so the
-                        // files' data connection can't arrive before it.
-                        var drop = _coordinator.Register(FrameConnection.Parse<OfferMsg>(body));
-                        _coordinator.Post(() => _coordinator.OnOfferToWindows(drop));
+                        // files' data connection can't arrive before it. A
+                        // drop that can't be laid out on disk fails alone,
+                        // not the whole connection.
+                        try
+                        {
+                            var drop = _coordinator.Register(FrameConnection.Parse<OfferMsg>(body));
+                            _coordinator.Post(() => _coordinator.OnOfferToWindows(drop));
+                        }
+                        catch (Exception e) when (e is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+                        {
+                            Log.Write($"[to-windows] Couldn't take a drag from the bridge: {e.Message}");
+                        }
                         break;
                     case Frames.ClipboardToWindows:
-                        _coordinator.RegisterCopy(FrameConnection.Parse<OfferMsg>(body));
+                        try
+                        {
+                            _coordinator.RegisterCopy(FrameConnection.Parse<OfferMsg>(body));
+                        }
+                        catch (Exception e) when (e is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+                        {
+                            Log.Write($"[copy] Couldn't take files copied on the bridge: {e.Message}");
+                        }
                         break;
                     case Frames.Cancel:
                         var cancel = FrameConnection.Parse<CancelMsg>(body);

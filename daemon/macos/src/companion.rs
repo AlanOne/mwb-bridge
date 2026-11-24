@@ -207,32 +207,42 @@ impl Link {
     /// them. Returns false only when the offer couldn't be sent (the caller
     /// then falls back to PowerToys); with nothing sendable in `paths` (only
     /// empty folders, say) there's nothing to do, which counts as handled.
+    /// Walking folders can take a while, so it happens on a thread of its
+    /// own, not the caller's (the input thread). Returns false only when the
+    /// companion isn't connected (the caller then falls back to PowerToys);
+    /// if the link drops while the folders are walked, the offer is lost.
     pub fn offer_files(self: &Arc<Self>, frame: u32, paths: Vec<PathBuf>, what: &'static str) -> bool {
-        let (files, skipped) = proto::expand_offer_paths(&paths);
-        for path in &skipped {
-            println!("[companion] Not sending {}: it couldn't be read, or is a link to a folder.", path.display());
-        }
-        if files.is_empty() {
-            println!("[companion] Nothing to send in that {what} (only empty folders?).");
-            return true;
-        }
-        let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let offer = Offer {
-            id,
-            files: files
-                .iter()
-                .map(|(p, name)| proto::FileInfo { name: name.clone(), size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) })
-                .collect(),
-        };
-        if !self.send(frame, &offer) {
+        if !self.is_connected() {
             return false;
         }
-        let names: Vec<&str> = offer.files.iter().map(|f| f.name.as_str()).collect();
-        println!("[companion] Sending {what} {id} to Windows: {}", names.join(", "));
         let link = self.clone();
-        std::thread::spawn(move || match link.put_files(id, &files) {
-            Ok(()) => println!("[companion] Sent {what} {id}'s {} file(s).", files.len()),
-            Err(e) => eprintln!("[companion] Sending {what} {id} failed: {e}"),
+        std::thread::spawn(move || {
+            let (files, skipped) = proto::expand_offer_paths(&paths);
+            for path in &skipped {
+                println!("[companion] Not sending {}: it couldn't be read, or is a link to a folder inside one.", path.display());
+            }
+            if files.is_empty() {
+                println!("[companion] Nothing to send in that {what} (only empty folders?).");
+                return;
+            }
+            let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let offer = Offer {
+                id,
+                files: files
+                    .iter()
+                    .map(|(p, name)| proto::FileInfo { name: name.clone(), size: std::fs::metadata(p).map(|m| m.len()).unwrap_or(0) })
+                    .collect(),
+            };
+            if !link.send(frame, &offer) {
+                eprintln!("[companion] Couldn't offer {what} {id}: the companion link dropped.");
+                return;
+            }
+            let names: Vec<&str> = offer.files.iter().take(20).map(|f| f.name.as_str()).collect();
+            println!("[companion] Sending {what} {id} to Windows: {}{}", names.join(", "), if offer.files.len() > 20 { ", ..." } else { "" });
+            match link.put_files(id, &files) {
+                Ok(()) => println!("[companion] Sent {what} {id}'s {} file(s).", files.len()),
+                Err(e) => eprintln!("[companion] Sending {what} {id} failed: {e}"),
+            }
         });
         true
     }
@@ -284,53 +294,89 @@ fn data_connection(addr: SocketAddr, cfg: &Config, op: &str, id: u64) -> std::io
 }
 
 /// Creates the offer's files, empty, in `dir`, rebuilding folders from
-/// their relative names (`folder/sub/a.txt`), each part made safe. Top-level
-/// names are made unique (two dragged files or folders of the same name):
-/// each loose file is an item of its own, and all files under one offered
-/// folder name land in the same rebuilt folder. Returns
-/// every file in offer order, and the top-level items, each passed to
-/// `on_created` once everything exists.
+/// their relative names (`folder/sub/a.txt`), each part made safe. Every
+/// offered folder keeps one place, and any name that would land on
+/// something already there (a file where a folder goes, or a name APFS sees
+/// as the same, which by default ignores case) gets " (2)" and so on. Each
+/// loose file is a top-level item of its own. Returns every file in offer
+/// order, and the top-level items, each passed to `on_created` once
+/// everything exists. On failure, everything made in `dir` is removed.
 fn create_placeholders(offer: &Offer, dir: &Path, mut on_created: impl FnMut(&Path)) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     std::fs::create_dir_all(dir)?;
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut top: Vec<PathBuf> = Vec::new();
-    // Offered folder name -> where it was rebuilt.
-    let mut tops: Vec<(String, PathBuf)> = Vec::new();
+    let laid_out = lay_out(offer, dir).and_then(|(files, top)| {
+        for path in &files {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::File::create(path)?;
+        }
+        Ok((files, top))
+    });
+    match laid_out {
+        Ok((files, top)) => {
+            for path in &top {
+                on_created(path);
+            }
+            Ok((files, top))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(dir);
+            Err(e)
+        }
+    }
+}
+
+/// Where each of the offer's files goes under `dir`, and the top-level
+/// items (see `create_placeholders`).
+fn lay_out(offer: &Offer, dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    // Lowercased, as APFS compares names by default.
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Offered folder path (as sent) -> where it was rebuilt.
+    let mut folders: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    let mut files = Vec::new();
+    let mut top = Vec::new();
     for file in &offer.files {
         let parts = proto::name_parts(&file.name);
-        let (first, rest) = parts.split_first().expect("name_parts is never empty");
-        let path = if rest.is_empty() {
-            // A loose file: always an item of its own.
-            let path = unique_path(dir, &crate::clipboard::safe_file_name(first), &top);
-            top.push(path.clone());
-            path
-        } else {
-            let base = match tops.iter().find(|(k, _)| k == first) {
-                Some((_, base)) => base.clone(),
+        let mut parent = dir.to_path_buf();
+        let mut raw_prefix = String::new();
+        for (i, part) in parts[..parts.len() - 1].iter().enumerate() {
+            raw_prefix.push('/');
+            raw_prefix.push_str(part);
+            let folder = match folders.get(&raw_prefix) {
+                Some(folder) => folder.clone(),
                 None => {
-                    let base = unique_path(dir, &crate::clipboard::safe_file_name(first), &top);
-                    tops.push((first.to_string(), base.clone()));
-                    top.push(base.clone());
-                    base
+                    let folder = claim(&parent, &crate::clipboard::safe_file_name(part), &mut taken);
+                    folders.insert(raw_prefix.clone(), folder.clone());
+                    if i == 0 {
+                        top.push(folder.clone());
+                    }
+                    folder
                 }
             };
-            let mut path = base;
-            for part in rest {
-                path.push(crate::clipboard::safe_file_name(part));
-            }
-            // Two offered files with the same path in one folder: keep both.
-            unique_path(path.parent().unwrap_or(dir), &path.file_name().unwrap_or_default().to_string_lossy(), &files)
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            parent = folder;
         }
-        std::fs::File::create(&path)?;
+        let path = claim(&parent, &crate::clipboard::safe_file_name(parts[parts.len() - 1]), &mut taken);
+        if parts.len() == 1 {
+            top.push(path.clone());
+        }
         files.push(path);
     }
-    for path in &top {
-        on_created(path);
-    }
     Ok((files, top))
+}
+
+/// `parent/name`, or `parent/stem (2).ext` and so on, whichever nothing in
+/// `taken` has yet; then it has.
+fn claim(parent: &Path, name: &str, taken: &mut std::collections::HashSet<String>) -> PathBuf {
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut path = parent.join(name);
+    let mut n = 2;
+    while !taken.insert(path.to_string_lossy().to_lowercase()) {
+        path = parent.join(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    path
 }
 
 /// Fills the files at `paths` from `reader`.
@@ -338,19 +384,6 @@ fn receive_into(reader: &mut proto::FrameReader<TcpStream>, paths: Vec<PathBuf>)
     proto::receive_files(reader, |h| {
         paths.get(h.index as usize).cloned().ok_or_else(|| std::io::Error::other(format!("file {} isn't in the offer", h.index)))
     })
-}
-
-/// `dir/name`, or `dir/stem (2).ext` and so on when an earlier file of the
-/// same drag already took that name (same name, different folders).
-fn unique_path(dir: &Path, name: &str, taken: &[PathBuf]) -> PathBuf {
-    let first = dir.join(name);
-    if !taken.contains(&first) {
-        return first;
-    }
-    let p = Path::new(name);
-    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|c| !taken.contains(c)).unwrap()
 }
 
 #[cfg(test)]
@@ -410,7 +443,7 @@ mod tests {
     fn folders_are_rebuilt_and_only_top_level_items_are_handed_on() {
         let dst = std::env::temp_dir().join(format!("mwb-companion-folders-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
-        let names = ["photos/2026/a.jpg", "photos/b.jpg", "photos", "../evil.txt", "photos/2026/a.jpg"];
+        let names = ["photos/2026/a.jpg", "photos/b.jpg", "photos", "../evil.txt", "photos/2026/a.jpg", "Photos/c.jpg", "docs/readme", "docs/readme/notes.txt"];
         let offer = Offer { id: 1, files: names.iter().map(|n| FileInfo { name: n.to_string(), size: 0 }).collect() };
         let mut created = Vec::new();
         let (files, top) = create_placeholders(&offer, &dst, |p| created.push(p.to_path_buf())).unwrap();
@@ -420,8 +453,13 @@ mod tests {
             dst.join("photos (2)"),
             dst.join("evil.txt"),
             dst.join("photos/2026/a (2).jpg"),
+            // Another folder only by case: its own place on a case-blind disk.
+            dst.join("Photos (3)/c.jpg"),
+            // A file where a folder of the same name also goes.
+            dst.join("docs/readme"),
+            dst.join("docs/readme (2)/notes.txt"),
         ]);
-        assert_eq!(top, vec![dst.join("photos"), dst.join("photos (2)"), dst.join("evil.txt")]);
+        assert_eq!(top, vec![dst.join("photos"), dst.join("photos (2)"), dst.join("evil.txt"), dst.join("Photos (3)"), dst.join("docs")]);
         assert_eq!(created, top);
         assert_eq!(top.len(), mwb_protocol::companion::top_level_count(&offer));
         assert!(files.iter().all(|f| f.is_file()));

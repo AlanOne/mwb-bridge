@@ -744,13 +744,22 @@ One long-lived control connection carries `ACTIVE` (2), `INACTIVE` (3,
 and `OFFER_TO_MAC` (5) from the companion; an offer is `{"id", "files":
 [{"name", "size"}]}`. Since version 3 a name can be a relative path
 (`photos/2026/a.jpg`, always `/`): a dragged or copied folder is offered as
-every file in it, named by its path from the folder down (links to folders
-aren't followed, empty folders carry nothing). The receiver rebuilds the
-folders under its own drop folder, each path part made safe and `.`/`..`
-dropped, gives top-level items unique names (each loose file is one item;
-all files under one folder name share one rebuilt folder), and hands only
-the top-level items to the drop or the clipboard. An older receiver
-flattens such names. File bytes go over a short data connection per drag
+every file in it, named by its path from the folder down (a `\` in a
+name is sent as `_`, since receivers also read it as a separator). Links to
+folders inside a dragged folder aren't followed (the dragged folder itself
+is, if it's a link); links to files are. Empty folders carry nothing, so a
+dragged empty folder sends nothing at all. An offer stops at 50,000 files.
+Walking happens off the UI and input threads, and a file that vanishes
+before it's sent goes empty, keeping the others at their indexes. The
+receiver rebuilds the folders under its own drop folder, each path part
+made safe (`.`/`..` dropped; on Windows, device names like `CON` get a `_`
+in front), every offered folder in one place, and any name that would land
+on something already there, a file where a folder goes or a name the disk
+sees as the same (other case on APFS and NTFS, a trailing dot on Windows),
+gets " (2)". Only the top-level items go to the drop or the clipboard.
+An older receiver loses the folders: an old companion turns the slashes
+into `_` (`photos_2026_a.jpg`), an old Mac bridge keeps only the last part
+(`a.jpg`, with same-named files numbered). File bytes go over a short data connection per drag
 (`op` "get" when the companion sends, "put" when the bridge does): per file
 `FILE_HEADER` (10, `{"index", "name", "size"}`), `FILE_CHUNK`s (11, up to
 1MB) and `FILE_END` (12), then `DONE` (13). The bridge opens every
