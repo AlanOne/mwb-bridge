@@ -372,8 +372,14 @@ the Linux build's `config.json`: `security_key`, `windows_ip`,
 `machine_name`, `machine_id`, `scroll_speed`; `xkb_layout`/`xkb_variant`
 are ignored here — the Mac's own selected input source handles character
 mapping instead, same division of responsibility XKB has on Linux). A
-template is written on first run if none exists; edit it via the menu bar
-icon's "Edit Config..." item, then "Restart App".
+template is written on first run if none exists. The menu bar icon's
+"Settings..." window edits the main fields (Windows PC, security key, this
+Mac's name and ID, scroll speed), keeps everything else in the file as it
+was, and restarts the app to apply them; "Edit Config..." opens the file
+for the rest, then "Restart App". The menu also shows the connection's
+link (wired or Wi-Fi, with the round-trip time TCP measures) and has
+"Reconnect Now" (all three type-checked and unit-tested only, not yet
+live-tested).
 
 **More than one Windows PC** (say one at home and one at the office): list
 the others in `other_windows_pcs`, each with its own PowerToys key. The Mac

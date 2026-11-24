@@ -17,6 +17,7 @@ mod drag_source;
 mod keycode_macos;
 mod power;
 mod route;
+mod settings;
 mod windows_keys;
 
 use std::io::{Read, Write};
@@ -754,6 +755,37 @@ fn run_client(
     }
     cg.reset();
     result
+}
+
+/// Drops the connection to Windows so it reconnects straight away (the
+/// menu bar's "Reconnect Now").
+pub fn reconnect_now() {
+    if let Some(stream) = CURRENT_STREAM.lock().unwrap().take() {
+        println!("[client] {} Reconnecting, as asked from the menu bar.", timestamp());
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+/// How the connection to Windows runs, for the menu bar: the interface
+/// (wired or Wi-Fi) and the round-trip time TCP measures. None while not
+/// connected.
+pub fn link_line() -> Option<String> {
+    use std::os::fd::AsRawFd;
+    let guard = CURRENT_STREAM.lock().unwrap();
+    let stream = guard.as_ref()?;
+    let interface = stream.local_addr().ok().and_then(route::interface_of_local);
+    let kind = match &interface {
+        Some(i) if route::is_wifi(i) => format!("Wi-Fi ({i})"),
+        Some(i) => format!("wired ({i})"),
+        None => "unknown link".to_string(),
+    };
+    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: a live socket, and a buffer of the size passed.
+    let ok = unsafe {
+        libc::getsockopt(stream.as_raw_fd(), libc::IPPROTO_TCP, libc::TCP_CONNECTION_INFO, &mut info as *mut _ as *mut libc::c_void, &mut len)
+    } == 0;
+    Some(if ok { format!("Link: {kind}, {} ms", info.tcpi_srtt) } else { format!("Link: {kind}") })
 }
 
 /// Drops the connection to Windows whenever the Mac wakes from sleep, so it

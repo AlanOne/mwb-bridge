@@ -103,7 +103,7 @@ fn save_windows_keys(enabled: bool) {
     }
 }
 
-fn restart_app() {
+pub fn restart_app() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe).spawn();
     }
@@ -128,13 +128,19 @@ pub fn run() {
     let windows_keys_on = config::load_config().map(|c| c.windows_keys).unwrap_or(true);
     windows_keys::ENABLED.store(windows_keys_on, Ordering::Relaxed);
     let windows_keys_item = CheckMenuItem::new("Windows-Style Keys", true, windows_keys_on, None);
+    let link_item = MenuItem::new(crate::link_line().unwrap_or_default(), false, None);
+    let reconnect_item = MenuItem::new("Reconnect Now", true, None);
+    let settings_item = MenuItem::new("Settings...", true, None);
     let edit_config_item = MenuItem::new("Edit Config...", true, None);
     let restart_item = MenuItem::new("Restart App", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&status_item).unwrap();
+    menu.append(&link_item).unwrap();
+    menu.append(&reconnect_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&windows_keys_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
+    menu.append(&settings_item).unwrap();
     menu.append(&edit_config_item).unwrap();
     menu.append(&restart_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
@@ -151,6 +157,8 @@ pub fn run() {
     let menu_channel = MenuEvent::receiver();
     let windows_keys_id = windows_keys_item.id().clone();
     let edit_config_id = edit_config_item.id().clone();
+    let settings_id = settings_item.id().clone();
+    let reconnect_id = reconnect_item.id().clone();
     let restart_id = restart_item.id().clone();
     let quit_id = quit_item.id().clone();
 
@@ -159,6 +167,7 @@ pub fn run() {
 
         if let Event::NewEvents(_) = event {
             status_item.set_text(status_line());
+            link_item.set_text(crate::link_line().unwrap_or_default());
         }
 
         if let Ok(event) = menu_channel.try_recv() {
@@ -168,6 +177,12 @@ pub fn run() {
                 save_windows_keys(on);
             } else if event.id == edit_config_id {
                 open_config();
+            } else if event.id == settings_id {
+                if let Some(mtm) = objc2::MainThreadMarker::new() {
+                    crate::settings::show(mtm);
+                }
+            } else if event.id == reconnect_id {
+                crate::reconnect_now();
             } else if event.id == restart_id {
                 restart_app();
             } else if event.id == quit_id {
