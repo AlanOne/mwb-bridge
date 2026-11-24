@@ -253,20 +253,14 @@ fn run_session(
             }
             match latest {
                 Some(ClipboardEvent::Text(text)) => {
-                    for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
-                        finalize_send_buf(&mut pkg, magic_number);
-                        let ct = cipher.encrypt(&mut write_chain, &pkg);
-                        stream.write_all(&ct)?;
-                    }
+                    let packages = build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text);
+                    stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
                     println!("[client] Sent clipboard text ({} chars) to peer.", text.chars().count());
                 }
                 Some(ClipboardEvent::Image(png_bytes)) => {
                     let len = png_bytes.len();
-                    for mut pkg in build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png_bytes) {
-                        finalize_send_buf(&mut pkg, magic_number);
-                        let ct = cipher.encrypt(&mut write_chain, &pkg);
-                        stream.write_all(&ct)?;
-                    }
+                    let packages = build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png_bytes);
+                    stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
                 }
                 Some(ClipboardEvent::Files(paths)) if companion::link().is_some_and(|l| l.is_connected()) && {
@@ -392,6 +386,19 @@ fn run_session(
                 let flags = unpack_u32_le(&full, 28);
                 if let Some(cg) = cg.as_deref_mut() {
                     lag.arrived(stream);
+                    // After a stall, absolute moves queue up: injecting each
+                    // of them only replays the stall, so skip to the latest.
+                    // Not one near a screen edge, though: that's where the
+                    // cursor enters, which is how relative mode learns which
+                    // side Windows is on.
+                    if flags == WM_MOUSEMOVE
+                        && mwb_protocol::net::is_absolute_move(&full)
+                        && !MouseState::near_edge(x, y)
+                        && mwb_protocol::net::next_is_absolute_move(stream, &cipher, &read_chain, magic_number)
+                    {
+                        mouse_state.note_skipped();
+                        continue;
+                    }
                     // Anything but a move while a release is held back
                     // (a click, the wheel) would end the macOS drag behind
                     // its back, so the held drop is settled first.
@@ -419,8 +426,9 @@ fn run_session(
                     }
                     // While a release is held back, the drag mustn't move
                     // away from where it was let go (other input settles it,
-                    // above).
-                    if incoming.holding_release() {
+                    // above). While a drag is being started, the cursor
+                    // stays on its panel until the press is on it.
+                    if incoming.holding_release() || (flags == WM_MOUSEMOVE && incoming.starting()) {
                         post = false;
                     }
                     let started = std::time::Instant::now();
@@ -699,10 +707,12 @@ fn run_client(
     clip_rx: &Receiver<ClipboardEvent>,
     clip_shared: &ClipboardShared,
     handshook: &mut bool,
+    connected: &mut Option<Instant>,
 ) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
     let mut stream = route::connect_preferring_wired(&cfg.windows_ip)?;
+    *connected = Some(Instant::now());
     set_socket_timeouts(&stream);
     *CURRENT_STREAM.lock().unwrap() = stream.try_clone().ok();
     // Input is only sent one packet at a time; don't let Nagle batch the
@@ -715,6 +725,7 @@ fn run_client(
     // Any drag from Windows over this Mac is cancelled below, so to the
     // companion it ended here (see LET_GO).
     LET_GO.store(true, std::sync::atomic::Ordering::Relaxed);
+    drag_in::release_abandoned_press(cg);
     // A drag from Windows cut off by the connection ending: cancel it, or
     // releasing the button in reset() would drop it wherever the cursor is.
     if drag_source::is_active() {
@@ -870,17 +881,38 @@ fn network_thread(cfg: Config) {
     // runs entirely on its own background thread.
     let mut cg = CgInput::new();
     let mut i = 0;
+    let mut delay = RECONNECT_FIRST;
     loop {
         let pc = &pcs[i];
         *active.lock().unwrap() = pc.clone();
         let mut handshook = false;
-        if let Err(e) = run_client(pc, &mut cg, &clip_rx, &clip_shared, &mut handshook) {
-            eprintln!("{} Connection ended: {e}. Reconnecting in 3s...", timestamp());
+        let mut connected = None;
+        let result = run_client(pc, &mut cg, &clip_rx, &clip_shared, &mut handshook, &mut connected);
+        // A connection that worked for a while (cut by sleep, a cable change
+        // or Windows restarting its side) is retried at once; failing
+        // attempts back off, and so does one Windows keeps dropping. Timed
+        // from when it connected: trying addresses that time out first
+        // isn't a connection that worked.
+        let worked = handshook && connected.is_some_and(|at: Instant| at.elapsed() >= RECONNECT_WORKED);
+        delay = next_delay(delay, worked);
+        if let Err(e) = result {
+            eprintln!("{} Connection ended: {e}. Reconnecting in {} ms...", timestamp(), delay.as_millis());
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }
         i = next_pc(i, pcs.len(), handshook);
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(delay);
     }
+}
+
+// How long to wait before reconnecting: RECONNECT_FIRST after a connection
+// that got through the handshake and lasted RECONNECT_WORKED, then doubling up to RECONNECT_MAX while
+// attempts keep failing.
+const RECONNECT_FIRST: Duration = Duration::from_millis(250);
+const RECONNECT_MAX: Duration = Duration::from_secs(4);
+const RECONNECT_WORKED: Duration = Duration::from_secs(5);
+
+fn next_delay(previous: Duration, worked: bool) -> Duration {
+    if worked { RECONNECT_FIRST } else { (previous * 2).min(RECONNECT_MAX) }
 }
 
 /// Which Windows PC to try after PC `i` of `count`: the same one again if
@@ -955,6 +987,17 @@ mod tests {
         // Unreachable, slow to time out, or the wrong key: all the same.
         assert_eq!(next_pc(0, 2, false), 1);
         assert_eq!(next_pc(1, 2, false), 0);
+    }
+
+    #[test]
+    fn reconnects_back_off_until_a_connection_works() {
+        use super::{next_delay, RECONNECT_FIRST, RECONNECT_MAX};
+        use std::time::Duration;
+        let mut delay = RECONNECT_FIRST;
+        let waits: Vec<u128> = (0..6).map(|_| { delay = next_delay(delay, false); delay.as_millis() }).collect();
+        assert_eq!(waits, vec![500, 1000, 2000, 4000, 4000, 4000]);
+        assert_eq!(next_delay(RECONNECT_MAX, true), RECONNECT_FIRST);
+        assert_eq!(next_delay(Duration::from_millis(250), true), Duration::from_millis(250));
     }
 
     #[test]

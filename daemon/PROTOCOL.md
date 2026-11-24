@@ -57,6 +57,16 @@ Windows may write its header before or after reading ours, so always write
 ours (header + priming) first, then read theirs — `open_encrypted_stream`.
 Applies to both the message server (15101) and the clipboard server (15100).
 
+**Derivations are cached.** One PBKDF2 derivation takes about 30ms
+(measured in a release build on the Mac), and each connection needs two.
+The bridges (and the companion, on its own link) keep one salt per security
+key for the life of the process and draw only a fresh IV per connection,
+which is all CBC needs; nothing on the Windows side checks the salt for
+reuse. The peer's keys are cached by salt, which pays off on the companion
+link, where both ends reuse their salt: after the first connection, neither
+side derives anything. Windows' MWB draws a new salt per connection, so
+its half is still derived each time. `Get24BitHash` is cached per key too.
+
 The magic number (`Get24BitHash` below) is unchanged: still 50,000 SHA-512
 rounds over the key string.
 
@@ -365,11 +375,12 @@ here since nothing this size fits the small path anyway.
 
 ### Both directions, and how the reverse one avoids echo loops
 
-Outbound (Omarchy -> Windows) is detection by polling, not a push
-notification: `wl-clipboard`'s CLI tools have no simple blocking "notify on
-change" primitive, so `run_clipboard_watcher` (`daemon.rs`) just polls
-`wl-paste --no-newline --type text/plain` every 500ms and forwards genuinely
-new content into an `mpsc` channel. That channel is drained (keeping only the
+Outbound (Omarchy -> Windows): `run_clipboard_watcher` (`daemon.rs`) looks
+at the clipboard each time `wl-paste --watch` reports a change (its command,
+`sh -c 'cat >/dev/null; echo'`, has to drain the contents `--watch` pipes to
+it, or the copying app's write fails), falling back to polling every 500ms
+while that can't run, and forwards genuinely new content into an `mpsc`
+channel. That channel is drained (keeping only the
 latest value, coalescing rapid successive changes) once per iteration of the
 **client**-role connection's receive loop, right before it blocks on the next
 read — not from a separate writer thread, since a second thread encrypting

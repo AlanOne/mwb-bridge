@@ -265,8 +265,31 @@ pub fn classify_app_path(path: &str) -> AppKind {
     }
 }
 
-/// The app that currently has keyboard focus.
+// The focused app, looked up at most this often: each lookup is an
+// Accessibility round trip (up to AX_TIMEOUT_SECONDS) on the input thread,
+// and it's asked for on most modifier presses and shortcut keys. Clicks and
+// the app switcher forget it at once, since those are how focus moves.
+const FOCUSED_APP_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+static FOCUSED_APP: std::sync::Mutex<Option<(std::time::Instant, AppKind)>> = std::sync::Mutex::new(None);
+
+/// The app that currently has keyboard focus (see FOCUSED_APP_TTL).
 pub fn focused_app() -> AppKind {
+    if let Some((at, app)) = *FOCUSED_APP.lock().unwrap()
+        && at.elapsed() < FOCUSED_APP_TTL
+    {
+        return app;
+    }
+    let app = look_up_focused_app();
+    *FOCUSED_APP.lock().unwrap() = Some((std::time::Instant::now(), app));
+    app
+}
+
+/// Forgets the cached focused app: focus may just have moved.
+pub fn forget_focused_app() {
+    *FOCUSED_APP.lock().unwrap() = None;
+}
+
+fn look_up_focused_app() -> AppKind {
     let Some(app) = copy_attribute(&system_wide(), "AXFocusedApplication") else {
         return AppKind::Other;
     };

@@ -150,6 +150,49 @@ pub fn derive_key(security_key: &str, salt: &[u8]) -> [u8; 32] {
     key
 }
 
+// A derivation takes about 30ms, and every connection needs two (one per
+// direction), so both are cached. This side keeps one salt per security
+// key for the life of the process; only the IV is new per connection, which
+// is all CBC needs. The peer's derivations are cached by salt, which pays
+// off with a peer that reuses its salt the same way (the companion does;
+// Windows' MWB draws a new one per connection, so those never repeat).
+type KeyCache = std::sync::Mutex<std::collections::HashMap<(String, [u8; SALT_SIZE]), [u8; 32]>>;
+type OwnSalts = std::sync::Mutex<Vec<(String, [u8; SALT_SIZE], [u8; 32])>>;
+static OWN_SALTS: OwnSalts = std::sync::Mutex::new(Vec::new());
+static PEER_KEYS: std::sync::OnceLock<KeyCache> = std::sync::OnceLock::new();
+const PEER_KEYS_KEPT: usize = 32;
+
+/// This side's salt for `security_key`, and the key derived from it.
+fn own_salt_and_key(security_key: &str) -> ([u8; SALT_SIZE], [u8; 32]) {
+    use rand::RngExt;
+    let mut own = OWN_SALTS.lock().unwrap();
+    if let Some((_, salt, key)) = own.iter().find(|(k, _, _)| k == security_key) {
+        return (*salt, *key);
+    }
+    let mut salt = [0u8; SALT_SIZE];
+    rand::rng().fill(&mut salt);
+    let key = derive_key(security_key, &salt);
+    own.push((security_key.to_string(), salt, key));
+    (salt, key)
+}
+
+/// The key for the peer's `salt`, derived once per salt.
+fn peer_key(security_key: &str, salt: &[u8; SALT_SIZE]) -> [u8; 32] {
+    let cache = PEER_KEYS.get_or_init(Default::default);
+    let id = (security_key.to_string(), *salt);
+    if let Some(key) = cache.lock().unwrap().get(&id) {
+        return *key;
+    }
+    // Derived without holding the lock, so other connections don't wait.
+    let key = derive_key(security_key, salt);
+    let mut cache = cache.lock().unwrap();
+    if cache.len() >= PEER_KEYS_KEPT {
+        cache.clear();
+    }
+    cache.insert(id, key);
+    key
+}
+
 /// An encrypted connection's cipher plus each direction's CBC chaining value.
 pub struct EncryptedStream {
     pub cipher: CbcState,
@@ -164,10 +207,11 @@ pub struct EncryptedStream {
 /// whichever order the peer does them in.
 pub fn open_encrypted_stream<S: std::io::Read + Write>(stream: &mut S, security_key: &str) -> std::io::Result<EncryptedStream> {
     use rand::RngExt;
+    let (salt, encrypt_key) = own_salt_and_key(security_key);
     let mut header = [0u8; SALT_SIZE + 16];
-    rand::rng().fill(&mut header);
+    header[..SALT_SIZE].copy_from_slice(&salt);
+    rand::rng().fill(&mut header[SALT_SIZE..]);
     stream.write_all(&header)?;
-    let encrypt_key = derive_key(security_key, &header[..SALT_SIZE]);
     let mut write_chain: [u8; 16] = header[SALT_SIZE..].try_into().unwrap();
 
     let mut cipher = CbcState::new(&encrypt_key);
@@ -177,7 +221,7 @@ pub fn open_encrypted_stream<S: std::io::Read + Write>(stream: &mut S, security_
 
     let mut peer_header = [0u8; SALT_SIZE + 16];
     stream.read_exact(&mut peer_header)?;
-    cipher.set_decrypt_key(&derive_key(security_key, &peer_header[..SALT_SIZE]));
+    cipher.set_decrypt_key(&peer_key(security_key, peer_header[..SALT_SIZE].try_into().unwrap()));
     let mut read_chain: [u8; 16] = peer_header[SALT_SIZE..].try_into().unwrap();
 
     let mut peer_priming = [0u8; 16];
@@ -191,6 +235,17 @@ pub fn open_encrypted_stream<S: std::io::Read + Write>(stream: &mut S, security_
 /// the final digest into a u32. Verified byte-for-byte against a real
 /// PowerToys debug dump's logged magicNumber value.
 pub fn get_24bit_hash(key: &str) -> u32 {
+    // 50,000 SHA-512 rounds, for a value that never changes per key.
+    static HASHES: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+    if let Some((_, hash)) = HASHES.lock().unwrap().iter().find(|(k, _)| k == key) {
+        return *hash;
+    }
+    let hash = compute_24bit_hash(key);
+    HASHES.lock().unwrap().push((key.to_string(), hash));
+    hash
+}
+
+fn compute_24bit_hash(key: &str) -> u32 {
     let mut bytes = [0u8; PACKAGE_SIZE];
     for (i, ch) in key.chars().take(PACKAGE_SIZE).enumerate() {
         bytes[i] = ch as u8;
@@ -483,6 +538,27 @@ pub fn push_padding_len(size: usize) -> usize {
 
 pub const CLIPBOARD_FILE_HEADER_SIZE: usize = 1024;
 
+/// Sends a `size`-byte body read from `body`, plus the 1..=32 zero bytes
+/// real MWB always adds (`push_padding_len`: Windows stops reading once it
+/// has the size, and a body ending exactly there would leave it waiting).
+/// Streams it a megabyte at a time, so a big file never sits in memory
+/// whole and starts going out at once. Fails if `body` runs out early.
+pub fn write_padded_body(stream: &mut impl Write, cipher: &CbcState, chain: &mut [u8; 16], body: &mut impl std::io::Read, size: usize) -> std::io::Result<()> {
+    const CHUNK: usize = 1 << 20; // a multiple of 32, like every total
+    let total = size + push_padding_len(size);
+    let mut buf = vec![0u8; CHUNK.min(total)];
+    let mut sent = 0;
+    while sent < total {
+        let n = (total - sent).min(buf.len());
+        let real = size.saturating_sub(sent).min(n);
+        body.read_exact(&mut buf[..real])?;
+        buf[real..n].fill(0);
+        stream.write_all(&cipher.encrypt(chain, &buf[..n]))?;
+        sent += n;
+    }
+    Ok(())
+}
+
 /// Reads a pulled body of `size` bytes from Windows' clipboard-server
 /// connection, decrypting as it goes, and writes those bytes to `out`.
 ///
@@ -583,6 +659,18 @@ pub fn finalize_send_buf(buf: &mut [u8], magic_number: u32) {
         checksum = checksum.wrapping_add(b);
     }
     buf[1] = checksum;
+}
+
+/// Finalizes and encrypts `packages` into one buffer, so a whole clipboard
+/// transfer goes out in one write rather than thousands of 64-byte ones
+/// (a 900KB image is about 19,000 packages).
+pub fn encrypt_packages(cipher: &CbcState, chain: &mut [u8; 16], magic_number: u32, packages: Vec<[u8; PACKAGE_SIZE_EX]>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(packages.len() * PACKAGE_SIZE_EX);
+    for mut package in packages {
+        finalize_send_buf(&mut package, magic_number);
+        out.extend_from_slice(&cipher.encrypt(chain, &package));
+    }
+    out
 }
 
 /// SocketStuff.ProcessReceivedDataEx's validation: checks the magic/checksum
@@ -724,6 +812,25 @@ mod transfer_tests {
     }
 
     #[test]
+    fn a_streamed_body_round_trips_with_its_padding() {
+        for size in [0usize, 1, 32, 1000, (1 << 20) + 5] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let cipher = CbcState::new(&[9u8; 32]);
+            let mut chain = [1u8; 16];
+            let mut wire = Vec::new();
+            write_padded_body(&mut wire, &cipher, &mut chain, &mut data.as_slice(), size).unwrap();
+            assert_eq!(wire.len(), size + push_padding_len(size), "size {size}");
+            let mut chain = [1u8; 16];
+            let plain = cipher.decrypt(&mut chain, &wire);
+            assert_eq!(&plain[..size], &data[..]);
+            assert!(plain[size..].iter().all(|&b| b == 0));
+        }
+        // A body shorter than promised is an error, not a short send.
+        let cipher = CbcState::new(&[9u8; 32]);
+        assert!(write_padded_body(&mut Vec::new(), &cipher, &mut [0u8; 16], &mut [1u8; 10].as_slice(), 20).is_err());
+    }
+
+    #[test]
     fn the_tail_is_read_off_before_closing() {
         let cipher = CbcState::new(&[9u8; 32]);
         let mut sent = vec![3u8; 64];
@@ -762,5 +869,52 @@ mod encryption_tests {
         a.read_exact(&mut ct).unwrap();
         assert_eq!(s.cipher.decrypt(&mut s.read_chain, &ct), msg);
         peer.join().unwrap();
+    }
+
+    /// A peer that has sent its salt, IV and priming block, and records
+    /// what we write.
+    struct Recorder {
+        incoming: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+    impl std::io::Read for Recorder {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.incoming.read(buf)
+        }
+    }
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn connections_reuse_this_sides_salt_but_never_the_iv() {
+        let headers: Vec<Vec<u8>> = (0..2)
+            .map(|_| {
+                let mut peer = Recorder { incoming: std::io::Cursor::new(vec![7u8; SALT_SIZE + 32]), written: Vec::new() };
+                open_encrypted_stream(&mut peer, "ReusedSaltKey").unwrap();
+                peer.written[..SALT_SIZE + 16].to_vec()
+            })
+            .collect();
+        assert_eq!(headers[0][..SALT_SIZE], headers[1][..SALT_SIZE]);
+        assert_ne!(headers[0][SALT_SIZE..], headers[1][SALT_SIZE..]);
+        // Another key gets its own salt.
+        let mut peer = Recorder { incoming: std::io::Cursor::new(vec![7u8; SALT_SIZE + 32]), written: Vec::new() };
+        open_encrypted_stream(&mut peer, "AnotherKey").unwrap();
+        assert_ne!(peer.written[..SALT_SIZE], headers[0][..SALT_SIZE]);
+    }
+
+    #[test]
+    fn cached_keys_match_fresh_derivations() {
+        let salt = [3u8; SALT_SIZE];
+        assert_eq!(peer_key("CacheKey", &salt), derive_key("CacheKey", &salt));
+        assert_eq!(peer_key("CacheKey", &salt), derive_key("CacheKey", &salt));
+        assert_eq!(get_24bit_hash("CacheKey"), compute_24bit_hash("CacheKey"));
+        assert_eq!(get_24bit_hash("CacheKey"), compute_24bit_hash("CacheKey"));
     }
 }

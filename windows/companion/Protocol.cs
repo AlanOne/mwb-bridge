@@ -81,25 +81,70 @@ sealed class FrameConnection : IDisposable
     public static FrameConnection Open(TcpClient client, string securityKey)
     {
         var stream = client.GetStream();
-        var header = RandomNumberGenerator.GetBytes(SaltSize + 16);
+        var (salt, ownKey) = OwnSalt(securityKey);
+        var header = new byte[SaltSize + 16];
+        salt.CopyTo(header, 0);
+        RandomNumberGenerator.Fill(header.AsSpan(SaltSize));
         stream.Write(header);
-        var encrypt = Transform(securityKey, header, encrypting: true);
+        var encrypt = Transform(ownKey, header[SaltSize..], encrypting: true);
         var priming = RandomNumberGenerator.GetBytes(16);
         stream.Write(Apply(encrypt, priming));
 
         var peerHeader = ReadExactly(stream, SaltSize + 16);
-        var decrypt = Transform(securityKey, peerHeader, encrypting: false);
+        var decrypt = Transform(PeerKey(securityKey, peerHeader[..SaltSize]), peerHeader[SaltSize..], encrypting: false);
         Apply(decrypt, ReadExactly(stream, 16));
         return new FrameConnection(stream, encrypt, decrypt);
     }
 
-    static ICryptoTransform Transform(string securityKey, byte[] saltAndIv, bool encrypting)
+    // A derivation takes tens of milliseconds and each connection needs one
+    // per direction, so both are cached, as the bridge does: this side keeps
+    // one salt per security key for the life of the process (only the IV is
+    // new per connection, which is all CBC needs), and the peer's keys are
+    // kept by salt (the bridge reuses its salt the same way).
+    static readonly object KeysLock = new();
+    static readonly Dictionary<string, (byte[] Salt, byte[] Key)> OwnSalts = new();
+    static readonly Dictionary<string, byte[]> PeerKeys = new();
+    const int PeerKeysKept = 32;
+
+    internal static (byte[] Salt, byte[] Key) OwnSalt(string securityKey)
     {
-        var key = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(securityKey), saltAndIv[..SaltSize], Iterations, HashAlgorithmName.SHA512, 32);
+        lock (KeysLock)
+        {
+            if (!OwnSalts.TryGetValue(securityKey, out var own))
+            {
+                var salt = RandomNumberGenerator.GetBytes(SaltSize);
+                own = (salt, Derive(securityKey, salt));
+                OwnSalts[securityKey] = own;
+            }
+            return own;
+        }
+    }
+
+    internal static byte[] PeerKey(string securityKey, byte[] salt)
+    {
+        var id = securityKey + "\0" + Convert.ToHexString(salt);
+        lock (KeysLock)
+        {
+            if (PeerKeys.TryGetValue(id, out var cached)) return cached;
+        }
+        // Derived outside the lock, so other connections don't wait on it.
+        var key = Derive(securityKey, salt);
+        lock (KeysLock)
+        {
+            if (PeerKeys.Count >= PeerKeysKept) PeerKeys.Clear();
+            PeerKeys[id] = key;
+        }
+        return key;
+    }
+
+    internal static byte[] Derive(string securityKey, byte[] salt) =>
+        Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(securityKey), salt, Iterations, HashAlgorithmName.SHA512, 32);
+
+    static ICryptoTransform Transform(byte[] key, byte[] iv, bool encrypting)
+    {
         using var aes = Aes.Create();
         aes.Mode = CipherMode.CBC;
         aes.Padding = PaddingMode.None;
-        var iv = saltAndIv[SaltSize..];
         // TransformBlock keeps the CBC chain between calls.
         return encrypting ? aes.CreateEncryptor(key, iv) : aes.CreateDecryptor(key, iv);
     }

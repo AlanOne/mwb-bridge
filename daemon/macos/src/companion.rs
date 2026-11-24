@@ -236,9 +236,20 @@ impl Link {
     /// Fetches an offer's files into `dir`. Every file is created (empty)
     /// up front and passed to `on_created`, so a drag of them all can start
     /// while the bytes are still arriving.
+    /// The files are created (empty) before connecting, so a drag of them
+    /// can start while the connection is still being set up.
+    /// If fetching fails, the files are deleted again (a drag already using
+    /// them is cancelled on release, since its fetch failed).
     pub fn fetch_files(&self, offer: &Offer, dir: &Path, on_created: impl FnMut(&Path)) -> std::io::Result<Vec<PathBuf>> {
-        let (_writer, mut reader) = self.data_connection("get", offer.id)?;
-        receive_offer(&mut reader, offer, dir, on_created)
+        let paths = create_placeholders(offer, dir, on_created)?;
+        let result = self.data_connection("get", offer.id).and_then(|(_writer, mut reader)| receive_into(&mut reader, paths.clone()));
+        if result.is_err() {
+            for path in &paths {
+                let _ = std::fs::remove_file(path);
+            }
+            let _ = std::fs::remove_dir(dir); // only if empty
+        }
+        result
     }
 
     /// Sends `files` as drag `id`'s bytes.
@@ -262,9 +273,8 @@ fn data_connection(addr: SocketAddr, cfg: &Config, op: &str, id: u64) -> std::io
     Ok((writer, reader))
 }
 
-/// Creates the offer's files in `dir` (names made safe and unique), then
-/// fills them from `reader`.
-fn receive_offer(reader: &mut proto::FrameReader<TcpStream>, offer: &Offer, dir: &Path, mut on_created: impl FnMut(&Path)) -> std::io::Result<Vec<PathBuf>> {
+/// Creates the offer's files, empty, in `dir` (names made safe and unique).
+fn create_placeholders(offer: &Offer, dir: &Path, mut on_created: impl FnMut(&Path)) -> std::io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(dir)?;
     let mut paths: Vec<PathBuf> = Vec::new();
     for file in &offer.files {
@@ -273,6 +283,11 @@ fn receive_offer(reader: &mut proto::FrameReader<TcpStream>, offer: &Offer, dir:
         on_created(&path);
         paths.push(path);
     }
+    Ok(paths)
+}
+
+/// Fills the files at `paths` from `reader`.
+fn receive_into(reader: &mut proto::FrameReader<TcpStream>, paths: Vec<PathBuf>) -> std::io::Result<Vec<PathBuf>> {
     proto::receive_files(reader, |h| {
         paths.get(h.index as usize).cloned().ok_or_else(|| std::io::Error::other(format!("file {} isn't in the offer", h.index)))
     })
@@ -333,7 +348,8 @@ mod tests {
         let (_w, mut r) = data_connection(addr, &config(), "get", 9).unwrap();
         let mut created = Vec::new();
         let dst = dir.join("dst");
-        let paths = receive_offer(&mut r, &offer, &dst, |p| created.push((p.to_path_buf(), std::fs::metadata(p).unwrap().len()))).unwrap();
+        let placeholders = create_placeholders(&offer, &dst, |p| created.push((p.to_path_buf(), std::fs::metadata(p).unwrap().len()))).unwrap();
+        let paths = receive_into(&mut r, placeholders).unwrap();
         companion.join().unwrap();
 
         assert_eq!(paths, vec![dst.join("one.txt"), dst.join("one (2).txt")]);

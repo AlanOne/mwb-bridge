@@ -322,14 +322,27 @@ fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usi
 /// kind's "last seen" is forgotten while another kind is on the clipboard,
 /// so copying the same text again after an image still sends it.
 pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShared) {
+    let mut last_change = pasteboard_change_count();
     let mut last_seen_image = read_local_clipboard_image_rgba();
     let mut last_seen_text = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
     let mut last_seen_files = read_local_clipboard_files();
     loop {
         std::thread::sleep(Duration::from_millis(500));
+        // Nothing is read until the pasteboard has changed: reading an
+        // image means fetching it as TIFF and converting it to RGBA, every
+        // half second for as long as one sits on the clipboard otherwise. A
+        // change only counts as handled once a read has found files, text
+        // or an image in it: an app may clear the pasteboard and fill it a
+        // moment later under the same count, and a read can fail, so until
+        // then it's looked at again each time.
+        let change = pasteboard_change_count();
+        if change == last_change {
+            continue;
+        }
 
         let files = read_local_clipboard_files();
         if !files.is_empty() {
+            last_change = change;
             if is_new_file_copy(&files, &last_seen_files, &shared.last_applied_files.lock().unwrap()) {
                 let _ = clip_tx.send(ClipboardEvent::Files(files.clone()));
             }
@@ -353,6 +366,7 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
             last_seen_image = None;
         }
         if let Some((width, height, ref raw)) = current_image {
+            last_change = change;
             last_seen_text = None;
             if last_seen_image != current_image {
                 let is_echo = shared.last_applied_image_rgba.lock().unwrap().as_ref() == current_image.as_ref();
@@ -379,6 +393,7 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
         }
 
         let Some(current) = text else { continue };
+        last_change = change;
         if last_seen_text.as_deref() == Some(current.as_str()) {
             continue;
         }
@@ -388,6 +403,12 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
         }
         let _ = clip_tx.send(ClipboardEvent::Text(current));
     }
+}
+
+/// The general pasteboard's change count, which goes up with every new
+/// copy (ours included).
+fn pasteboard_change_count() -> isize {
+    objc2_app_kit::NSPasteboard::generalPasteboard().changeCount()
 }
 
 /// The files on the local clipboard (a Finder copy), if any.
@@ -445,21 +466,6 @@ fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
         SocketAddr::V4(v4) => SocketAddr::new((*v4.ip()).into(), port),
         SocketAddr::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(*v6.ip(), port, v6.flowinfo(), v6.scope_id())),
     }
-}
-
-/// Sends a file's bytes plus the zero tail real MWB always adds (see
-/// `push_padding_len`): the receiver stops reading once it has the file's
-/// size, and a body ending exactly there would leave it waiting instead.
-fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    const CHUNK: usize = 1 << 20;
-    let padded_len = data.len() + push_padding_len(data.len());
-    let mut padded = vec![0u8; padded_len];
-    padded[..data.len()].copy_from_slice(data);
-    for chunk in padded.chunks(CHUNK) {
-        stream.write_all(&cipher.encrypt(chain, chunk))?;
-    }
-    Ok(())
 }
 
 /// Opens a connection to Windows' clipboard-server socket (port 15100), at
@@ -547,24 +553,34 @@ fn open_pull(cfg: &Config, peer_addr: Option<SocketAddr>, post_action: u32) -> s
 pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &ClipboardShared) -> std::io::Result<()> {
     let Some(mut pull) = open_pull(cfg, peer_addr, POST_ACTION_OTHER)? else { return Ok(()) };
     let (size, name) = (pull.size, pull.name.clone());
-    let mut body = Vec::with_capacity(size);
-    pull.read_body_into(&mut body)?;
 
-    if name == BIG_PATH_IMAGE_NAME {
-        apply_incoming_clipboard_image(&body, shared);
-        println!("[image-pull] Received a big clipboard image ({size} bytes) from Windows.");
+    if name == BIG_PATH_IMAGE_NAME || name == BIG_PATH_TEXT_NAME {
+        let mut body = Vec::with_capacity(size);
+        pull.read_body_into(&mut body)?;
+        if name == BIG_PATH_IMAGE_NAME {
+            apply_incoming_clipboard_image(&body, shared);
+            println!("[image-pull] Received a big clipboard image ({size} bytes) from Windows.");
+        } else {
+            apply_incoming_clipboard_text(&body, shared);
+            println!("[text-pull] Received big clipboard text ({size} bytes compressed) from Windows.");
+        }
         return Ok(());
     }
-    if name == BIG_PATH_TEXT_NAME {
-        apply_incoming_clipboard_text(&body, shared);
-        println!("[text-pull] Received big clipboard text ({size} bytes compressed) from Windows.");
-        return Ok(());
-    }
 
+    // A file goes straight to disk as it arrives, not through memory.
     let dir = received_files_dir();
     std::fs::create_dir_all(&dir)?;
     let dest = dir.join(safe_file_name(&name));
-    std::fs::write(&dest, &body)?; // fully flushed before the clipboard is touched below
+    let written = std::fs::File::create(&dest).and_then(|file| {
+        let mut out = std::io::BufWriter::new(file);
+        pull.read_body_into(&mut out)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    // Fully written before the clipboard is touched below.
     match Clipboard::new().and_then(|mut cb| cb.set().file_list(&[&dest])) {
         Ok(()) => {
             *shared.last_applied_files.lock().unwrap() = vec![dest.clone()];
@@ -632,8 +648,12 @@ pub fn fetch_dragged_file(cfg: &Config, peer_addr: Option<SocketAddr>, dir: &std
     let dest = dir.join(safe_file_name(&pull.name));
     let mut file = std::fs::File::create(&dest)?;
     on_created(&dest);
-    pull.read_body_into(&mut file)?;
-    file.sync_all()?;
+    let result = pull.read_body_into(&mut file).and_then(|()| file.sync_all());
+    if let Err(e) = result {
+        // Not left half-written (a drag of it is cancelled on release).
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
     Ok(dest)
 }
 
@@ -654,11 +674,12 @@ pub(crate) fn safe_file_name(windows_path: &str) -> String {
 /// server connection whose handshake is done.
 fn send_item(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], (path, name): &Item) -> std::io::Result<()> {
     use std::io::Write;
-    let data = std::fs::read(path)?;
-    let header = build_file_header(data.len(), name);
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len() as usize;
+    let header = build_file_header(size, name);
     stream.write_all(&cipher.encrypt(chain, &header))?;
-    write_padded_body(stream, cipher, chain, &data)?;
-    println!("[big-send] Sent {name:?} ({} bytes) to Windows.", data.len());
+    write_padded_body(stream, cipher, chain, &mut std::io::BufReader::new(&mut file), size)?;
+    println!("[big-send] Sent {name:?} ({size} bytes) to Windows.");
     Ok(())
 }
 

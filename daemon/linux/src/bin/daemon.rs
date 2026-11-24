@@ -348,25 +348,61 @@ fn lock_local_machine() {
     }
 }
 
-/// Sends a file's bytes plus the 1..=32 zero bytes real MWB always adds
-/// (`push_padding_len`): Windows stops reading once it has the file's size,
-/// and a body ending exactly there would leave it waiting instead.
-fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], data: &[u8]) -> std::io::Result<()> {
-    const CHUNK: usize = 1 << 20;
-    let padded_len = data.len() + push_padding_len(data.len());
-    let mut padded = vec![0u8; padded_len];
-    padded[..data.len()].copy_from_slice(data);
-    for chunk in padded.chunks(CHUNK) {
-        stream.write_all(&cipher.encrypt(chain, chunk))?;
-    }
-    Ok(())
+/// Waits for the clipboard to change: `wl-paste --watch` runs a command on
+/// every change, so a line from that command is the signal, instead of
+/// spawning up to three `wl-paste` processes every half second to look.
+/// Falls back to polling every half second while it can't run, and tries
+/// to start it again now and then.
+struct ClipboardChanges {
+    watch: Option<(std::process::Child, std::io::Lines<std::io::BufReader<std::process::ChildStdout>>)>,
+    last_try: std::time::Instant,
 }
 
-/// Omarchy -> Windows clipboard sync: polls the Linux clipboard (there's no
-/// simple blocking "notify me on change" primitive over `wl-clipboard`'s CLI
-/// tools, so polling is the simple option) and forwards genuinely new local
+impl ClipboardChanges {
+    const POLL: Duration = Duration::from_millis(500);
+    const RETRY: Duration = Duration::from_secs(30);
+
+    fn start() -> Self {
+        Self { watch: Self::spawn(), last_try: std::time::Instant::now() }
+    }
+
+    fn spawn() -> Option<(std::process::Child, std::io::Lines<std::io::BufReader<std::process::ChildStdout>>)> {
+        use std::io::BufRead;
+        // `--watch` writes the new contents to the command's stdin, so the
+        // command has to read it all (or the copying app's write fails) and
+        // only then print the line that's the signal.
+        let mut child = Command::new("wl-paste")
+            .args(["--watch", "sh", "-c", "cat >/dev/null; echo"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let lines = std::io::BufReader::new(child.stdout.take()?).lines();
+        Some((child, lines))
+    }
+
+    fn wait(&mut self) {
+        if self.watch.is_none() && self.last_try.elapsed() >= Self::RETRY {
+            self.last_try = std::time::Instant::now();
+            self.watch = Self::spawn();
+        }
+        if let Some((child, lines)) = self.watch.as_mut() {
+            if let Some(Ok(_)) = lines.next() {
+                return;
+            }
+            eprintln!("(clipboard: `wl-paste --watch` stopped, polling instead)");
+            let _ = child.kill();
+            let _ = child.wait();
+            self.watch = None;
+        }
+        std::thread::sleep(Self::POLL);
+    }
+}
+
+/// Omarchy -> Windows clipboard sync: looks at the Linux clipboard each
+/// time it changes (see `ClipboardChanges`) and forwards genuinely new local
 /// content into `clip_tx` for whichever connection is currently live to pick
-/// up and send. Checks for a file first each tick (prioritizing file
+/// up and send. Checks for a file first each time (prioritizing file
 /// semantics if a copy happens to offer both `text/uri-list` and
 /// `text/plain`), then text, then an image. Seeds its baseline from
 /// whatever's already on the clipboard at startup without sending it — only
@@ -376,8 +412,9 @@ fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShare
     let mut last_seen_file = read_local_clipboard_uri_list().as_deref().and_then(parse_first_file_uri);
     let mut last_seen_image = read_local_clipboard_image();
     let mut last_seen_text = read_local_clipboard_text();
+    let mut changes = ClipboardChanges::start();
     loop {
-        std::thread::sleep(Duration::from_millis(500));
+        changes.wait();
 
         if let Some(path) = read_local_clipboard_uri_list().as_deref().and_then(parse_first_file_uri) {
             if last_seen_file.as_ref() != Some(&path) {
@@ -562,20 +599,14 @@ fn run_session(
             }
             match latest {
                 Some(ClipboardEvent::Text(text)) => {
-                    for mut pkg in build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text) {
-                        finalize_send_buf(&mut pkg, magic_number);
-                        let ct = cipher.encrypt(&mut write_chain, &pkg);
-                        stream.write_all(&ct)?;
-                    }
+                    let packages = build_clipboard_text_packages(&mut next_clip_id, cfg.machine_id, &text);
+                    stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
                     println!("[{role}] Sent clipboard text ({} chars) to peer.", text.chars().count());
                 }
                 Some(ClipboardEvent::Image(png_bytes)) => {
                     let len = png_bytes.len();
-                    for mut pkg in build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png_bytes) {
-                        finalize_send_buf(&mut pkg, magic_number);
-                        let ct = cipher.encrypt(&mut write_chain, &pkg);
-                        stream.write_all(&ct)?;
-                    }
+                    let packages = build_clipboard_image_packages(&mut next_clip_id, cfg.machine_id, &png_bytes);
+                    stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
                     println!("[{role}] Sent clipboard image ({len} bytes) to peer.");
                 }
                 Some(ClipboardEvent::File(path)) => {
@@ -663,6 +694,18 @@ fn run_session(
                 let y = unpack_u32_le(&full, 20);
                 let wheel = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
+                // After a stall, absolute moves queue up: injecting each of
+                // them only replays the stall, so skip to the latest. Not one
+                // near a screen edge, where relative mode learns which side
+                // Windows is on. A skipped move still counts as input.
+                if flags == mwb_protocol::input_handling::WM_MOUSEMOVE
+                    && mwb_protocol::net::is_absolute_move(&full)
+                    && !MouseState::near_edge(x, y)
+                    && mwb_protocol::net::next_is_absolute_move(&stream, &cipher, &read_chain, magic_number)
+                {
+                    mouse_state.note_skipped();
+                    continue;
+                }
                 if let Some(w) = wl.as_deref_mut() {
                     // Relative mode: the cursor was pushed off the edge facing
                     // Windows or a configured neighbour, so ask Windows to switch.
@@ -821,25 +864,34 @@ fn pull_file_from_windows(cfg: &Config, peer_addr: Option<std::net::SocketAddr>,
         return Ok(());
     }
 
-    let mut body = Vec::with_capacity(size);
-    read_pulled_body(&mut stream, &cipher, &mut read_chain, size, &mut body)?;
-
-    if name == BIG_PATH_IMAGE_NAME {
-        apply_incoming_clipboard_image(&body, &shared.last_applied_image);
-        println!("[file-pull] Received a big clipboard image ({size} bytes) from Windows.");
+    if name == BIG_PATH_IMAGE_NAME || name == BIG_PATH_TEXT_NAME {
+        let mut body = Vec::with_capacity(size);
+        read_pulled_body(&mut stream, &cipher, &mut read_chain, size, &mut body)?;
+        if name == BIG_PATH_IMAGE_NAME {
+            apply_incoming_clipboard_image(&body, &shared.last_applied_image);
+            println!("[file-pull] Received a big clipboard image ({size} bytes) from Windows.");
+        } else {
+            apply_incoming_clipboard_text(&body, &shared.last_applied_text);
+            println!("[file-pull] Received big clipboard text ({size} bytes compressed) from Windows.");
+        }
         return Ok(());
     }
-    if name == BIG_PATH_TEXT_NAME {
-        apply_incoming_clipboard_text(&body, &shared.last_applied_text);
-        println!("[file-pull] Received big clipboard text ({size} bytes compressed) from Windows.");
-        return Ok(());
-    }
 
+    // A file goes straight to disk as it arrives, not through memory.
     let safe_name = windows_basename(&name);
     let dir = clipboard_files_dir();
     std::fs::create_dir_all(&dir)?;
-    let dest = dir.join(&safe_name);
-    std::fs::write(&dest, &body)?; // fully flushed before the clipboard is touched below
+    let dest = dir.join(safe_name);
+    let written = std::fs::File::create(&dest).and_then(|file| {
+        let mut out = std::io::BufWriter::new(file);
+        read_pulled_body(&mut stream, &cipher, &mut read_chain, size, &mut out)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
+    // Fully written before the clipboard is touched below.
 
     apply_incoming_clipboard_file(&dest, &shared.last_applied_file_uri);
     println!("[file-pull] Received {safe_name:?} ({size} bytes) from Windows -> {}", dest.display());
@@ -882,11 +934,13 @@ fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<O
         }
         PendingOutbound::Image(path) => (path.clone(), BIG_PATH_IMAGE_NAME.to_string()),
     };
-    let data = std::fs::read(&path)?;
-    let header = build_file_header(data.len(), &name);
+    // Streamed from disk, so a big file never sits in memory whole.
+    let mut file = std::fs::File::open(&path)?;
+    let size = file.metadata()?.len() as usize;
+    let header = build_file_header(size, &name);
     stream.write_all(&cipher.encrypt(&mut write_chain, &header))?;
-    write_padded_body(&mut stream, &cipher, &mut write_chain, &data)?;
-    println!("[file-serve] Sent {name:?} ({} bytes) to peer.", data.len());
+    write_padded_body(&mut stream, &cipher, &mut write_chain, &mut std::io::BufReader::new(&mut file), size)?;
+    println!("[file-serve] Sent {name:?} ({size} bytes) to peer.");
     Ok(())
 }
 
@@ -935,11 +989,16 @@ fn run_client(
     clipboard_rx: &Receiver<ClipboardEvent>,
     shared: &ClipboardShared,
     current_stream: &Arc<Mutex<Option<TcpStream>>>,
+    connected: &mut Option<std::time::Instant>,
 ) -> std::io::Result<()> {
     println!("Connecting to {}...", cfg.windows_ip);
     config::write_status(false, "", "Connecting...");
     let stream = TcpStream::connect(&cfg.windows_ip)?;
+    *connected = Some(std::time::Instant::now());
     set_socket_timeouts(&stream);
+    // Input replies go one package at a time; don't let Nagle hold one back
+    // behind a pending ACK.
+    let _ = stream.set_nodelay(true);
     if let Ok(clone) = stream.try_clone() {
         *current_stream.lock().unwrap() = Some(clone);
     }
@@ -1086,11 +1145,27 @@ fn main() {
         std::thread::spawn(move || run_resume_watcher(current_stream));
     }
 
+    let mut delay = RECONNECT_FIRST;
     loop {
-        if let Err(e) = run_client(&cfg, &mut wl, &clip_rx, &clipboard_shared, &current_stream) {
-            eprintln!("Connection ended: {e}. Reconnecting in 3s...");
+        let mut connected = None;
+        let result = run_client(&cfg, &mut wl, &clip_rx, &clipboard_shared, &current_stream, &mut connected);
+        // A connection that worked for a while (cut by suspend or Windows
+        // restarting its side) is retried at once; failing attempts back off.
+        // Timed from when it connected: a connect that hangs for minutes
+        // on an unreachable PC isn't a connection that worked.
+        let worked = connected.is_some_and(|at: std::time::Instant| at.elapsed() >= RECONNECT_WORKED);
+        delay = if worked { RECONNECT_FIRST } else { (delay * 2).min(RECONNECT_MAX) };
+        if let Err(e) = result {
+            eprintln!("Connection ended: {e}. Reconnecting in {} ms...", delay.as_millis());
             config::write_status(false, "", &format!("Disconnected: {e}. Reconnecting..."));
         }
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(delay);
     }
 }
+
+// How long to wait before reconnecting: RECONNECT_FIRST after a connection
+// that lasted RECONNECT_WORKED, then doubling up to RECONNECT_MAX while
+// attempts keep failing.
+const RECONNECT_FIRST: Duration = Duration::from_millis(250);
+const RECONNECT_MAX: Duration = Duration::from_secs(4);
+const RECONNECT_WORKED: Duration = Duration::from_secs(5);

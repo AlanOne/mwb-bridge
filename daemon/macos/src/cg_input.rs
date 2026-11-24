@@ -289,6 +289,7 @@ impl CgInput {
         // Alt let go: close the Command+Tab switcher on the app it's showing.
         if !pressed && is_alt && self.app_switch_open {
             self.app_switch_open = false;
+            windows_keys::forget_focused_app();
             self.post_key(windows_keys::VK_COMMAND, false, self.flags, CGEventTapLocation::Session, false);
         }
         let Some(keycode) = keycode else {
@@ -594,6 +595,8 @@ impl InputSink for CgInput {
     ///   and its matching up event, mirroring real click semantics.
     fn button(&mut self, button_code: u32, pressed: bool) {
         use mwb_protocol::input_handling::{BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
+        // A click can move focus to another app.
+        windows_keys::forget_focused_app();
         let (down_type, up_type, button_field) = match button_code {
             BTN_LEFT => (CGEventType::LeftMouseDown, CGEventType::LeftMouseUp, None),
             BTN_RIGHT => (CGEventType::RightMouseDown, CGEventType::RightMouseUp, None),

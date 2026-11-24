@@ -163,8 +163,13 @@ fn build_keymap_fd(layout: &str, variant: &str) -> (std::os::fd::OwnedFd, u32) {
     (memfd.into_file().into(), size)
 }
 
+const ROUNDTRIP_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub struct WaylandInput {
     event_queue: EventQueue<AppState>,
+    last_roundtrip: std::time::Instant,
+    // The last flush sent everything (see `flush`).
+    flushed: bool,
     state: AppState,
     pointer: ZwlrVirtualPointerV1,
     keyboard: ZwpVirtualKeyboardV1,
@@ -247,6 +252,8 @@ impl WaylandInput {
         }
         Self {
             event_queue,
+            last_roundtrip: std::time::Instant::now(),
+            flushed: true,
             state,
             pointer,
             keyboard,
@@ -257,8 +264,34 @@ impl WaylandInput {
         }
     }
 
+    /// Sends the events posted so far. A full roundtrip (waiting for the
+    /// compositor to answer) after every event made each one wait on the
+    /// compositor's loop; it's now done at most every ROUNDTRIP_EVERY, just
+    /// to take in what the compositor sends back.
     fn flush(&mut self) {
-        self.event_queue.roundtrip(&mut self.state).unwrap();
+        use wayland_client::backend::WaylandError;
+        let would_block = |e: &WaylandError| matches!(e, WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock);
+        // Only when the last flush got everything out: each roundtrip queues
+        // a sync request, and piling those into a socket the compositor
+        // isn't reading would overflow the buffer.
+        if self.flushed && self.last_roundtrip.elapsed() >= ROUNDTRIP_EVERY {
+            let result = self.event_queue.roundtrip(&mut self.state);
+            // Counted from when the answer came, so a slow compositor gets
+            // its full quiet period rather than a roundtrip per event.
+            self.last_roundtrip = std::time::Instant::now();
+            match result {
+                Ok(_) => return,
+                // The compositor is behind on reading: flush below.
+                Err(wayland_client::DispatchError::Backend(e)) if would_block(&e) => {}
+                Err(e) => panic!("Wayland connection failed: {e}"),
+            }
+        }
+        match self.event_queue.flush() {
+            Ok(()) => self.flushed = true,
+            // What's left stays queued and goes with the next flush.
+            Err(e) if would_block(&e) => self.flushed = false,
+            Err(e) => panic!("Wayland connection failed: {e}"),
+        }
     }
 
     /// Absolute pointer move. `x`/`y` range 0..=x_extent/y_extent — pass MWB's

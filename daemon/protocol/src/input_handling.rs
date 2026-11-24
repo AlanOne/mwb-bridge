@@ -136,6 +136,22 @@ impl MouseState {
         }
     }
 
+    /// A mouse package arrived but is skipped (coalesced away): it still
+    /// counts as input, so the next one isn't taken for the first after a
+    /// pause (see `learn_entry`).
+    pub fn note_skipped(&mut self) {
+        self.last_packet = Some(Instant::now());
+    }
+
+    /// Whether an absolute move to (`x`, `y`), raw from the package, is
+    /// close enough to a screen edge that it may teach which side Windows is
+    /// on (see `learn_entry`). Such a move is never skipped when moves are
+    /// coalesced.
+    pub fn near_edge(x: u32, y: u32) -> bool {
+        let (x, y) = ((x as i32).clamp(0, 65535) as u32, (y as i32).clamp(0, 65535) as u32);
+        x <= ENTRY_EDGE_MARGIN || x >= 65535 - ENTRY_EDGE_MARGIN || y <= ENTRY_EDGE_MARGIN || y >= 65535 - ENTRY_EDGE_MARGIN
+    }
+
     /// An absolute move arriving as the entry point of a switch (any absolute
     /// move once relative mode is in use, or the first move after a pause),
     /// close enough to an edge to say which side Windows is on.

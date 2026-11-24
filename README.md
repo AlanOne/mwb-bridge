@@ -19,8 +19,8 @@ as an auto-starting, auto-reconnecting systemd user service. See **Known
 bugs** below for current rough edges.
 
 **Needs PowerToys v0.102 or newer.** v0.102 changed how each connection is
-encrypted (a random salt and IV per connection instead of fixed ones), and
-both daemons only speak the new scheme. With an older PowerToys the
+encrypted (a salt and IV sent at the start of each connection instead of
+fixed ones), and both daemons only speak the new scheme. With an older PowerToys the
 connection opens but nothing decrypts. See `daemon/PROTOCOL.md` for the
 details.
 
@@ -87,6 +87,34 @@ double-click-to-zoom and held-key auto-repeat), clipboard sync (plain text,
 HTML-only copies, and images, both directions), Windows -> Mac file
 copy/paste, and lock-both-machines all working end-to-end, packaged as a
 proper autostarting `.app`, all live-tested against a real Windows PC.**
+
+**Performance** (type-checked and unit-tested only, Linux type-checked
+only, not yet live-tested):
+- **After a network stall**, queued mouse moves are skipped to the latest
+  one instead of replayed one by one, so the cursor catches up at once
+  (both builds share the check; absolute moves only, since relative ones
+  all count).
+- **Starting a drag from Windows** no longer blocks input while the Mac
+  puts up its drag panel: the steps run from later input and the input
+  loop's ticks, and the cursor just waits on the panel for the few
+  milliseconds that takes.
+- **Windows-style keys** look up the focused app at most every half
+  second (and again after any click or app switch), instead of an
+  Accessibility query on most modifier presses.
+- **The clipboard watcher** only reads the clipboard when it has changed,
+  instead of converting an image on the clipboard to pixels every half
+  second. On Linux, `wl-paste --watch` replaces spawning up to three
+  `wl-paste` processes every half second.
+- **Big transfers** are streamed a megabyte at a time both ways, so a
+  100MB file no longer takes 200MB of memory, and clipboard text and
+  images go out in one write instead of one per 64-byte package.
+- **Reconnecting** starts after 250ms instead of 3s, backing off to 4s
+  while attempts fail. Each connection also skips most of its key
+  derivation (about 30ms each, see `daemon/PROTOCOL.md`), and files
+  dragged from Windows through the companion are created before the
+  connection opens, so the drag can start sooner.
+- **Linux** sends each input event without waiting for the compositor to
+  answer, and turns off Nagle on its connection to Windows.
 
 **After sleep** the bridge reconnects as soon as the Mac wakes. A
 connection that lived through a sleep is usually dead without either side
@@ -389,8 +417,9 @@ cargo run -p mwb_mac_bridge
 
 Plain text and images both sync both ways automatically — copy on Windows
 and it's applied to this machine's clipboard (via `wl-copy`), copy here and
-it's sent to Windows (detected by polling `wl-paste` every 500ms; both need
-`wl-clipboard` installed, which is standard on Omarchy). A screenshot or
+it's sent to Windows (detected with `wl-paste --watch`, or by polling
+`wl-paste` every 500ms if that can't run; both need `wl-clipboard`
+installed, which is standard on Omarchy). A screenshot or
 "copy image" (no file involved) works the same way as text — a small image
 sends inline, a larger one (screenshots routinely exceed the small-path
 size limit) is announced and pulled over the same connection file transfer

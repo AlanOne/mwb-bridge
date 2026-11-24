@@ -45,6 +45,37 @@ pub fn wait_for_package(stream: &impl AsRawFd, tick: Duration, last_data: &mut I
     Ok(false)
 }
 
+/// Whether a decrypted package is a mouse move to an absolute position
+/// (not a relative one, whose deltas all count).
+pub fn is_absolute_move(package: &[u8]) -> bool {
+    use crate::input_handling::{MOVE_MOUSE_RELATIVE, WM_MOUSEMOVE};
+    use crate::mwb_protocol::{PACKAGE_TYPE_MOUSE, unpack_u32_le};
+    if package.len() < crate::mwb_protocol::PACKAGE_SIZE || package[0] != PACKAGE_TYPE_MOUSE || unpack_u32_le(package, 28) != WM_MOUSEMOVE {
+        return false;
+    }
+    let (x, y) = (unpack_u32_le(package, 16) as i32, unpack_u32_le(package, 20) as i32);
+    !(x.abs() >= MOVE_MOUSE_RELATIVE && y.abs() >= MOVE_MOUSE_RELATIVE)
+}
+
+/// Whether the next package is already waiting on `stream` and is an
+/// absolute mouse move, so an absolute move just read can be skipped in
+/// favor of it: after a stall, injecting every queued position only
+/// replays the stall. Looks without consuming anything, decrypting with a
+/// copy of the read chain.
+pub fn next_is_absolute_move(stream: &TcpStream, cipher: &crate::mwb_protocol::CbcState, read_chain: &[u8; 16], magic_number: u32) -> bool {
+    use crate::mwb_protocol::{PACKAGE_SIZE, validate_and_clean_recv_buf};
+    if !wait_readable(stream, Duration::ZERO).unwrap_or(false) {
+        return false;
+    }
+    let mut ct = [0u8; PACKAGE_SIZE];
+    if !matches!(stream.peek(&mut ct), Ok(PACKAGE_SIZE)) {
+        return false;
+    }
+    let mut chain = *read_chain;
+    let mut pt = cipher.decrypt(&mut chain, &ct);
+    validate_and_clean_recv_buf(&mut pt, magic_number) && is_absolute_move(&pt)
+}
+
 /// Keepalive for a connection to Windows' message server: a peer that
 /// vanished (sleep, cable, a crash) is noticed in about half a minute.
 pub fn keep_session_alive(stream: &TcpStream) -> std::io::Result<()> {
@@ -121,5 +152,46 @@ mod tests {
         };
         assert_eq!(r, 0);
         assert_ne!(value, 0);
+    }
+
+    #[test]
+    fn a_queued_absolute_move_is_seen_without_being_consumed() {
+        use crate::mwb_protocol::*;
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let cipher = CbcState::new(&[4u8; 32]);
+        let (mut write_chain, read_chain) = ([2u8; 16], [2u8; 16]);
+        let magic = 0x1234_0000;
+        let package = |x: u32, y: u32, flags: u32| {
+            let mut p = [0u8; PACKAGE_SIZE];
+            p[0] = PACKAGE_TYPE_MOUSE;
+            pack_u32_le(&mut p, 16, x);
+            pack_u32_le(&mut p, 20, y);
+            pack_u32_le(&mut p, 28, flags);
+            finalize_send_buf(&mut p, magic);
+            p
+        };
+        // Nothing queued yet.
+        assert!(!next_is_absolute_move(&client, &cipher, &read_chain, magic));
+        server.write_all(&cipher.encrypt(&mut write_chain, &package(100, 200, 0x200))).unwrap();
+        assert!(wait_readable(&client, Duration::from_secs(2)).unwrap());
+        assert!(next_is_absolute_move(&client, &cipher, &read_chain, magic));
+        // Still there to read, and the chain wasn't moved.
+        let mut ct = [0u8; PACKAGE_SIZE];
+        client.read_exact(&mut ct).unwrap();
+        let mut chain = read_chain;
+        assert!(is_absolute_move(&cipher.decrypt(&mut chain, &ct)));
+        // A click, or a relative move, isn't one.
+        let mut next_chain = chain;
+        server.write_all(&cipher.encrypt(&mut write_chain, &package(100, 200, 0x201))).unwrap();
+        assert!(wait_readable(&client, Duration::from_secs(2)).unwrap());
+        assert!(!next_is_absolute_move(&client, &cipher, &next_chain, magic));
+        client.read_exact(&mut ct).unwrap();
+        cipher.decrypt(&mut next_chain, &ct);
+        server.write_all(&cipher.encrypt(&mut write_chain, &package(100_005, (-100_010i32) as u32, 0x200))).unwrap();
+        assert!(wait_readable(&client, Duration::from_secs(2)).unwrap());
+        assert!(!next_is_absolute_move(&client, &cipher, &next_chain, magic));
     }
 }

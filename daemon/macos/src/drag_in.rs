@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use mwb_protocol::config::Config;
 use mwb_protocol::input_handling::{InputSink, BTN_LEFT};
@@ -154,6 +154,52 @@ struct Incoming {
     dragging: bool,
     // Starting one failed, so don't try again for this drag.
     gave_up: bool,
+    // A macOS drag being started, step by step (see `Start`).
+    starting: Option<Start>,
+}
+
+/// Starting a macOS drag takes a few steps that each wait on the main
+/// thread or the window server. They're advanced from later input and the
+/// input loop's ticks rather than waited for, so input never stalls; mouse
+/// moves aren't posted meanwhile, so the press lands on the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// The panel is queued to go under the cursor.
+    Placing { generation: u64, since: Instant },
+    /// It's on screen; the press follows once it has had time to show.
+    Placed { generation: u64, since: Instant },
+    /// The press is posted; waiting for the panel to start the drag.
+    Pressed { generation: u64, since: Instant },
+}
+
+// How long the main thread gets to put the panel on screen, the panel to
+// reach the screen before the press, and the press to start the drag.
+const PLACE_TIMEOUT: Duration = Duration::from_secs(1);
+const SHOW_DELAY: Duration = Duration::from_millis(40);
+const START_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// What a starting drag does next, given how far it got and for how long.
+#[derive(Debug, PartialEq, Eq)]
+enum StartStep {
+    Wait,
+    /// The panel is up and has had time to show: press on it.
+    Press,
+    /// The drag is running.
+    Started,
+    /// Give up: the files are saved instead when dropped.
+    GiveUp,
+}
+
+fn start_step(start: Start, placed: bool, started: bool) -> StartStep {
+    match start {
+        Start::Placing { since, .. } if !placed && since.elapsed() >= PLACE_TIMEOUT => StartStep::GiveUp,
+        Start::Placing { .. } => StartStep::Wait,
+        Start::Placed { since, .. } if since.elapsed() >= SHOW_DELAY => StartStep::Press,
+        Start::Placed { .. } => StartStep::Wait,
+        Start::Pressed { .. } if started => StartStep::Started,
+        Start::Pressed { since, .. } if since.elapsed() >= START_TIMEOUT => StartStep::GiveUp,
+        Start::Pressed { .. } => StartStep::Wait,
+    }
 }
 
 // How long a release let go before the files have arrived is held back
@@ -191,7 +237,7 @@ impl IncomingDrag {
         prune_old_drags(&root, KEEP_DRAGS);
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
-        self.current = Some(Incoming { fetch: fetch.clone(), expected: 1, dragging: false, gave_up: false });
+        self.current = Some(Incoming { fetch: fetch.clone(), expected: 1, dragging: false, gave_up: false, starting: None });
         let cfg = cfg.clone();
         std::thread::spawn(move || {
             let result = crate::clipboard::fetch_dragged_file(&cfg, peer_addr, &dir, |path| fetch.created(path));
@@ -211,7 +257,7 @@ impl IncomingDrag {
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
         let expected = offer.files.len();
-        self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false });
+        self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false, starting: None });
         let link = link.clone();
         std::thread::spawn(move || {
             let result = link.fetch_files(&offer, &dir, |path| fetch.created(path));
@@ -222,10 +268,25 @@ impl IncomingDrag {
         });
     }
 
-    /// A mouse move is about to be posted: once the file exists on disk,
-    /// start a macOS drag of it under the cursor.
+    /// A mouse move is about to be posted: once the files exist on disk,
+    /// start a macOS drag of them under the cursor (see `Start`).
     pub fn on_move(&mut self, cg: &mut CgInput) {
         let Some(incoming) = self.current.as_mut() else { return };
+        // The macOS drag ended on its own (it failed, or began and ended at
+        // once) while the button is still held: let go, so this and later
+        // moves aren't drags of whatever is under the cursor. The release
+        // then saves the files to the drop folder.
+        if incoming.dragging && !crate::drag_source::is_active() {
+            eprintln!("[drop] The drag on this Mac ended by itself, the files will be saved instead when dropped.");
+            cg.button(BTN_LEFT, false);
+            incoming.dragging = false;
+            incoming.gave_up = true;
+            return;
+        }
+        if incoming.starting.is_some() {
+            self.advance_start(cg);
+            return;
+        }
         if incoming.dragging || incoming.gave_up || cg.left_button_held() {
             return;
         }
@@ -234,23 +295,67 @@ impl IncomingDrag {
             return;
         }
         let main_height = core_graphics::display::CGDisplay::main().bounds().size.height;
-        if !crate::drag_source::place_under_cursor(&paths, cg.cursor(), main_height) {
-            eprintln!("[drop] Couldn't show the drag panel, the files will be saved instead when dropped.");
-            incoming.gave_up = true;
+        let generation = crate::drag_source::place_under_cursor(&paths, cg.cursor(), main_height);
+        incoming.starting = Some(Start::Placing { generation, since: Instant::now() });
+    }
+
+    /// Whether a drag is being started: mouse moves mustn't be posted
+    /// meanwhile, or the press would miss the panel.
+    pub fn starting(&self) -> bool {
+        self.current.as_ref().is_some_and(|i| i.starting.is_some())
+    }
+
+    /// Takes a starting drag one step further, if it's ready for one.
+    fn advance_start(&mut self, cg: &mut CgInput) {
+        let Some(incoming) = self.current.as_mut() else { return };
+        let Some(start) = incoming.starting else { return };
+        let generation = match start {
+            Start::Placing { generation, .. } | Start::Placed { generation, .. } | Start::Pressed { generation, .. } => generation,
+        };
+        let placed = crate::drag_source::placed(generation);
+        if let Start::Placing { .. } = start
+            && placed
+        {
+            incoming.starting = Some(Start::Placed { generation, since: Instant::now() });
             return;
         }
-        // Let the panel reach the screen before pressing on it.
-        std::thread::sleep(Duration::from_millis(40));
-        cg.button(BTN_LEFT, true);
-        if crate::drag_source::wait_started(Duration::from_millis(300)) {
-            incoming.dragging = true;
-            let names: Vec<String> = paths.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
-            println!("[drop] Dragging {} on this Mac; let go over any app to drop it there.", names.join(", "));
-        } else {
-            eprintln!("[drop] The drag didn't start, the files will be saved instead when dropped.");
-            cg.button(BTN_LEFT, false);
-            crate::drag_source::remove_panel();
-            incoming.gave_up = true;
+        match start_step(start, placed, crate::drag_source::started(generation)) {
+            StartStep::Wait => {}
+            StartStep::Press => {
+                cg.button(BTN_LEFT, true);
+                incoming.starting = Some(Start::Pressed { generation, since: Instant::now() });
+            }
+            StartStep::Started => {
+                incoming.starting = None;
+                incoming.dragging = true;
+                let names: Vec<String> = incoming.fetch.paths().iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned()).collect();
+                println!("[drop] Dragging {} on this Mac; let go over any app to drop it there.", names.join(", "));
+            }
+            StartStep::GiveUp => {
+                if Self::abandon_start(incoming, cg) {
+                    incoming.dragging = true;
+                } else {
+                    eprintln!("[drop] The drag didn't start, the files will be saved instead when dropped.");
+                    incoming.gave_up = true;
+                }
+            }
+        }
+    }
+
+    /// Stops a drag being started, unless it started after all (true: the
+    /// caller has a running drag). Otherwise lets go of the press if one
+    /// was posted, and the panel goes (see `drag_source::abandon`).
+    fn abandon_start(incoming: &mut Incoming, cg: &mut CgInput) -> bool {
+        match incoming.starting.take() {
+            Some(Start::Pressed { generation, .. }) => {
+                if crate::drag_source::abandon(generation, true) {
+                    return true;
+                }
+                cg.button(BTN_LEFT, false);
+                false
+            }
+            Some(Start::Placing { generation, .. } | Start::Placed { generation, .. }) => crate::drag_source::abandon(generation, false),
+            None => false,
         }
     }
 
@@ -259,7 +364,24 @@ impl IncomingDrag {
     /// Returns true when the release must not be posted yet: the files are
     /// still arriving, and `tick` posts it once they have.
     pub fn dropped(&mut self, cg: &mut CgInput) -> bool {
-        let Some(incoming) = self.current.take() else { return false };
+        let Some(mut incoming) = self.current.take() else { return false };
+        // Let go while the drag was being started: nothing new is pressed
+        // now. If the press is already posted, the release about to be
+        // posted ends it on the panel (which then goes), unless the panel
+        // started the drag meanwhile, which then drops as usual.
+        match incoming.starting.take() {
+            Some(Start::Pressed { generation, .. }) => incoming.dragging = crate::drag_source::abandon(generation, true),
+            Some(Start::Placing { generation, .. } | Start::Placed { generation, .. }) => {
+                crate::drag_source::abandon(generation, false);
+            }
+            None => {}
+        }
+        // A drag that ended by itself before this release (see `on_move`)
+        // can't drop anything: the release just lets go, and the files are
+        // saved instead.
+        if incoming.dragging && !crate::drag_source::is_active() {
+            incoming.dragging = false;
+        }
         if !incoming.dragging {
             incoming.fetch.then(After::SaveToDropFolder);
             return false;
@@ -292,6 +414,7 @@ impl IncomingDrag {
     /// Called regularly by the input loop: finishes a held-back release
     /// once the files are in, or once it has waited long enough.
     pub fn tick(&mut self, cg: &mut CgInput) {
+        self.advance_start(cg);
         let Some((_, since)) = self.held_release.as_ref() else { return };
         let waited = since.elapsed();
         self.finish_held(cg, waited);
@@ -332,9 +455,16 @@ impl IncomingDrag {
 
     /// The drag left without a drop here.
     pub fn cancelled(&mut self, cg: &mut CgInput) {
-        let Some(incoming) = self.current.take() else { return };
-        if incoming.dragging {
+        let Some(mut incoming) = self.current.take() else { return };
+        if Self::abandon_start(&mut incoming, cg) {
+            incoming.dragging = true;
+        }
+        if incoming.dragging && crate::drag_source::is_active() {
             cg.cancel_drag();
+        } else if incoming.dragging {
+            // It ended by itself: no drag to cancel (Escape would go to the
+            // app in front), only the press to let go of.
+            cg.button(BTN_LEFT, false);
         }
         incoming.fetch.then(After::Discard);
     }
@@ -348,6 +478,40 @@ impl Drop for IncomingDrag {
         if let Some((fetch, _)) = self.held_release.take() {
             fetch.then(After::SaveToDropFolder);
         }
+        // A drag being started is abandoned, so the panel doesn't sit under
+        // the cursor catching clicks and a press still on its way doesn't
+        // start a drag. A press already posted is let go by the caller with
+        // `release_abandoned_press`, plainly: CgInput::reset would post
+        // Escape first, which goes to whatever app has focus. One that did
+        // start a drag is cancelled by the caller as any running drag is.
+        // A drag that ended by itself with the press still held (see
+        // `on_move`): let go plainly too.
+        if self.current.as_ref().is_some_and(|i| i.dragging) && !crate::drag_source::is_active() {
+            ABANDONED_PRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        match self.current.as_mut().and_then(|i| i.starting.take()) {
+            Some(Start::Pressed { generation, .. }) => {
+                if !crate::drag_source::abandon(generation, true) {
+                    ABANDONED_PRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Some(Start::Placing { generation, .. } | Start::Placed { generation, .. }) => {
+                crate::drag_source::abandon(generation, false);
+            }
+            None => {}
+        }
+    }
+}
+
+// A press posted for a drag start that the session ended in the middle of.
+static ABANDONED_PRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lets go of a press left by a drag start the session ended in the middle
+/// of (see `IncomingDrag`'s Drop). Call after the session, before
+/// `CgInput::reset`.
+pub fn release_abandoned_press(cg: &mut CgInput) {
+    if ABANDONED_PRESS.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        cg.button(BTN_LEFT, false);
     }
 }
 
