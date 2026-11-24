@@ -348,34 +348,12 @@ fn lock_local_machine() {
     }
 }
 
-/// Reads `size` real bytes from a clipboard-server connection's raw file
-/// stream, decrypting as it goes. Real MWB pads the actual transmitted
-/// byte count up to a multiple of `PACKAGE_SIZE` (32) with zero-fill after
-/// the real content (`SocketStuff.SendFileEx`) — read that full padded
-/// length (always a clean multiple of the AES block size) and truncate the
-/// decrypted result back down to `size` real bytes.
-fn read_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], size: usize) -> std::io::Result<Vec<u8>> {
-    const CHUNK: usize = 1 << 20; // matches real MWB's own NETWORK_STREAM_BUF_SIZE
-    let padded_len = size.div_ceil(32) * 32;
-    let mut decrypted = Vec::with_capacity(padded_len);
-    let mut remaining = padded_len;
-    while remaining > 0 {
-        let this_chunk = remaining.min(CHUNK);
-        let mut ct = vec![0u8; this_chunk];
-        stream.read_exact(&mut ct)?;
-        decrypted.extend_from_slice(&cipher.decrypt(chain, &ct));
-        remaining -= this_chunk;
-    }
-    decrypted.truncate(size);
-    Ok(decrypted)
-}
-
-/// The write-side counterpart of `read_padded_body`: zero-pads `data` up to
-/// a multiple of 32 bytes before encrypting and writing, matching what real
-/// MWB's own sender does (and what our own receive side above expects).
+/// Sends a file's bytes plus the 1..=32 zero bytes real MWB always adds
+/// (`push_padding_len`): Windows stops reading once it has the file's size,
+/// and a body ending exactly there would leave it waiting instead.
 fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], data: &[u8]) -> std::io::Result<()> {
     const CHUNK: usize = 1 << 20;
-    let padded_len = data.len().div_ceil(32) * 32;
+    let padded_len = data.len() + push_padding_len(data.len());
     let mut padded = vec![0u8; padded_len];
     padded[..data.len()].copy_from_slice(data);
     for chunk in padded.chunks(CHUNK) {
@@ -390,7 +368,7 @@ fn write_padded_body(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8;
 /// content into `clip_tx` for whichever connection is currently live to pick
 /// up and send. Checks for a file first each tick (prioritizing file
 /// semantics if a copy happens to offer both `text/uri-list` and
-/// `text/plain`), falling back to plain text. Seeds its baseline from
+/// `text/plain`), then text, then an image. Seeds its baseline from
 /// whatever's already on the clipboard at startup without sending it — only
 /// actual *changes* get synced, so old clipboard content from before the
 /// daemon started doesn't get pushed to Windows unexpectedly.
@@ -410,10 +388,22 @@ fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShare
                     let _ = clip_tx.send(ClipboardEvent::File(path));
                 }
             }
+            (last_seen_text, last_seen_image) = (None, None);
             continue; // a file is present — don't also fall through to image/text
         }
 
-        if let Some(bytes) = read_local_clipboard_image() {
+        // Text first, as real MWB does, unless it's only a URL next to an
+        // image (see `text_wins_over_image`). Each kind's "last seen" is
+        // forgotten while another kind is on the clipboard, so copying the
+        // same text again after an image still sends it.
+        let text = read_local_clipboard_text();
+        let text_wins = text.as_deref().is_some_and(text_wins_over_image);
+        let image = if text_wins { None } else { read_local_clipboard_image() };
+        if image.is_none() {
+            last_seen_image = None;
+        }
+        if let Some(bytes) = image {
+            last_seen_text = None;
             if last_seen_image.as_ref() != Some(&bytes) {
                 last_seen_image = Some(bytes.clone());
                 let is_echo = shared.last_applied_image.lock().unwrap().as_deref() == Some(bytes.as_slice());
@@ -438,7 +428,7 @@ fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShare
             continue; // an image is present — don't also fall through to text
         }
 
-        let Some(current) = read_local_clipboard_text() else { continue };
+        let Some(current) = text else { continue };
         if last_seen_text.as_deref() == Some(current.as_str()) {
             continue;
         }
@@ -831,11 +821,17 @@ fn pull_file_from_windows(cfg: &Config, peer_addr: Option<std::net::SocketAddr>,
         return Ok(());
     }
 
-    let body = read_padded_body(&mut stream, &cipher, &mut read_chain, size)?;
+    let mut body = Vec::with_capacity(size);
+    read_pulled_body(&mut stream, &cipher, &mut read_chain, size, &mut body)?;
 
     if name == BIG_PATH_IMAGE_NAME {
         apply_incoming_clipboard_image(&body, &shared.last_applied_image);
         println!("[file-pull] Received a big clipboard image ({size} bytes) from Windows.");
+        return Ok(());
+    }
+    if name == BIG_PATH_TEXT_NAME {
+        apply_incoming_clipboard_text(&body, &shared.last_applied_text);
+        println!("[file-pull] Received big clipboard text ({size} bytes compressed) from Windows.");
         return Ok(());
     }
 
@@ -879,7 +875,9 @@ fn serve_file_to_peer(mut stream: TcpStream, cfg: &Config, pending: &Arc<Mutex<O
 
     let (path, name) = match &outbound {
         PendingOutbound::File(path) => {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+            // Behind a `/`, so a name starting with "image" or "text"
+            // isn't taken for clipboard data (see `file_header_name`).
+            let name = file_header_name(&path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string()));
             (path.clone(), name)
         }
         PendingOutbound::Image(path) => (path.clone(), BIG_PATH_IMAGE_NAME.to_string()),

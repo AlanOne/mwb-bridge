@@ -93,6 +93,36 @@ pub const MAX_SMALL_PATH_SIZE: usize = 1024 * 1024;
 // file — confirmed from source, not a filename to be sanitized/basenamed.
 pub const BIG_PATH_IMAGE_NAME: &str = "image";
 
+// The same for clipboard text too big for the small path: Windows sends
+// `{size}*text` and a body in the small path's own format (raw-DEFLATE
+// UTF-16 with TXT/RTF/HTM fragments, plus trailing zeros, since it sends
+// its MemoryStream's whole buffer). SocketStuff.SendClipboardData.
+pub const BIG_PATH_TEXT_NAME: &str = "text";
+
+/// The header name for a file sent to Windows. Windows keeps only the
+/// `Path.GetFileName` part, but before that treats any name starting with
+/// "image" or "text" (in any case) as clipboard data (Clipboard.cs's
+/// ReceiveAndProcessClipboardDataCore), so `image001.png` sent bare never
+/// arrives as a file. Real MWB sends the full path, which never starts that
+/// way; a leading `/` does the same and is gone after `GetFileName`.
+pub fn file_header_name(file_name: &str) -> String {
+    format!("/{file_name}")
+}
+
+/// Whether a copy holding both text and an image goes as the text. Real MWB
+/// checks text first (FormHelper.cs), so a spreadsheet's cells arrive as
+/// text rather than a picture of them. The exception is a lone URL next to
+/// an image, which is how browsers copy an image: the image is the point.
+pub fn text_wins_over_image(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let lone_url = !t.contains(char::is_whitespace)
+        && ["http://", "https://", "file://"].iter().any(|p| t.len() > p.len() && t.get(..p.len()).is_some_and(|head| head.eq_ignore_ascii_case(p)));
+    !lone_url
+}
+
 // Small-path clipboard chunking (Clipboard.cs's DATA_SIZE): a ClipboardText/
 // ClipboardImage "big" (64-byte) package repurposes bytes 16-63 — normally
 // Machine1-4 + MachineName — as one contiguous 48-byte raw-data region.
@@ -453,6 +483,69 @@ pub fn push_padding_len(size: usize) -> usize {
 
 pub const CLIPBOARD_FILE_HEADER_SIZE: usize = 1024;
 
+/// Reads a pulled body of `size` bytes from Windows' clipboard-server
+/// connection, decrypting as it goes, and writes those bytes to `out`.
+///
+/// Windows pads a file with 1..=32 zero bytes (`push_padding_len`), but
+/// clipboard text and images with `size % 32` (SocketStuff.SendData), and
+/// its CryptoStream never sends a final partial block. So read up to the
+/// next multiple of 32, accept the connection closing early once `size`
+/// bytes are in, and afterwards read off what's left (a file's 32-byte tail
+/// when its size is a multiple of 32) so closing doesn't reset the
+/// connection under Windows.
+pub fn read_pulled_body(
+    stream: &mut std::net::TcpStream,
+    cipher: &CbcState,
+    chain: &mut [u8; 16],
+    size: usize,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    const CHUNK: usize = 1 << 20;
+    let padded = size.div_ceil(PACKAGE_SIZE) * PACKAGE_SIZE;
+    let mut buf = vec![0u8; padded.clamp(PACKAGE_SIZE, CHUNK)];
+    let (mut pending, mut read, mut written) = (0usize, 0usize, 0usize);
+    while read < padded {
+        let want = (padded - read).min(buf.len() - pending);
+        let n = match stream.read(&mut buf[pending..pending + want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        read += n;
+        pending += n;
+        let whole = pending / 16 * 16;
+        if whole > 0 {
+            let plain = cipher.decrypt(chain, &buf[..whole]);
+            let real = (size - written).min(plain.len());
+            out.write_all(&plain[..real])?;
+            written += real;
+            buf.copy_within(whole..pending, 0);
+            pending -= whole;
+        }
+    }
+    if written < size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("the connection closed after {written} of {size} bytes"),
+        ));
+    }
+    // Windows sends the tail together with the body and closes right
+    // after, so this is quick; the limits only guard against a peer that
+    // keeps the connection open.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+    let mut sink = [0u8; 4096];
+    let mut left = 64 * 1024usize;
+    while left > 0 {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => left = left.saturating_sub(n),
+        }
+    }
+    Ok(())
+}
+
 /// Builds the 1024-byte "{size}*{name}" header sent (through the same
 /// continuing encrypted stream, right before the file's raw bytes) on the
 /// clipboard-server connection. UTF-16LE-encoded, **null**-padded to fill
@@ -544,6 +637,103 @@ mod package_tests {
         assert_eq!(push_padding_len(31), 1);
         assert_eq!(push_padding_len(32), 32);
         assert_eq!(push_padding_len(0), 32);
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn a_file_name_never_looks_like_clipboard_data() {
+        for name in ["image001.png", "Text notes.txt", "TEXT", "plain.txt"] {
+            let header = file_header_name(name);
+            assert!(!header.to_lowercase().starts_with("image") && !header.to_lowercase().starts_with("text"), "{header}");
+            // Windows' Path.GetFileName splits on both separators.
+            assert_eq!(header.rsplit(['/', '\\']).next().unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn text_wins_unless_it_is_a_lone_url() {
+        assert!(text_wins_over_image("A1\tB1\nA2\tB2"));
+        assert!(text_wins_over_image("see https://example.com"));
+        assert!(!text_wins_over_image("https://example.com/cat.png"));
+        assert!(!text_wins_over_image("  HTTP://example.com\n"));
+        assert!(!text_wins_over_image(""));
+        assert!(!text_wins_over_image("   "));
+        assert!(text_wins_over_image("https://"));
+        assert!(text_wins_over_image("čšžčšžčš and more"));
+    }
+
+    /// Sends `body` the way Windows does: encrypted in whole blocks only (a
+    /// final partial block is never sent), then closes.
+    fn windows_sends(cipher: CbcState, chain: [u8; 16], body: Vec<u8>) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut chain = chain;
+            let whole = body.len() / 16 * 16;
+            s.write_all(&cipher.encrypt(&mut chain, &body[..whole])).unwrap();
+        });
+        (TcpStream::connect(addr).unwrap(), sender)
+    }
+
+    fn pull(sent: Vec<u8>, size: usize) -> std::io::Result<Vec<u8>> {
+        let cipher = CbcState::new(&[9u8; 32]);
+        let (mut stream, sender) = windows_sends(CbcState::new(&[9u8; 32]), [1u8; 16], sent);
+        let mut chain = [1u8; 16];
+        let mut out = Vec::new();
+        let result = read_pulled_body(&mut stream, &cipher, &mut chain, size, &mut out);
+        sender.join().unwrap();
+        result.map(|()| out)
+    }
+
+    #[test]
+    fn a_file_with_its_padding_tail_is_read_whole() {
+        for size in [1usize, 31, 32, 33, 64, 100] {
+            let data: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let mut sent = data.clone();
+            sent.resize(size + push_padding_len(size), 0);
+            assert_eq!(pull(sent, size).unwrap(), data, "size {size}");
+        }
+    }
+
+    #[test]
+    fn clipboard_data_padded_by_size_mod_32_is_read_whole() {
+        // SendData pads by size % 32, and only whole blocks reach the wire:
+        // for 8..=15 extra bytes the body is all there but short of 32.
+        for size in [64usize, 72, 79] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 7) as u8).collect();
+            let mut sent = data.clone();
+            sent.resize(size + size % 32, 0);
+            assert_eq!(pull(sent, size).unwrap(), data, "size {size}");
+        }
+    }
+
+    #[test]
+    fn a_body_cut_short_is_an_error() {
+        let size = 70; // 70 % 32 = 6: the last 6 bytes never leave Windows
+        let mut sent = vec![5u8; size];
+        sent.resize(size + size % 32, 0);
+        let err = pull(sent, size).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn the_tail_is_read_off_before_closing() {
+        let cipher = CbcState::new(&[9u8; 32]);
+        let mut sent = vec![3u8; 64];
+        sent.resize(64 + push_padding_len(64), 0);
+        let (mut stream, sender) = windows_sends(CbcState::new(&[9u8; 32]), [1u8; 16], sent);
+        let mut chain = [1u8; 16];
+        read_pulled_body(&mut stream, &cipher, &mut chain, 64, &mut Vec::new()).unwrap();
+        sender.join().unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(stream.read_to_end(&mut rest).unwrap(), 0);
     }
 }
 

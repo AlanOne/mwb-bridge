@@ -132,6 +132,19 @@ out to be Windows asking the Mac to push instead (`ClipboardAsk`, see
   a busy 2560x1440 screenshot arrives around 1046x588). Sending them at
   full size over the big path should now work too, but hasn't been tried.
 
+**Without the companion** (PowerToys' own file path), three fixes, all
+type-checked and unit-tested only (Linux type-checked only):
+- **File names starting with "image" or "text"** (`image001.png`, `Text
+  notes.txt`) now arrive. Windows took any name starting that way for
+  clipboard data and dropped the file, so the bridges now send the name
+  behind a `/`, as real MWB sends a full path.
+- **Text over 1MB copied on Windows** now arrives as text. It used to be
+  saved as a file called `text`.
+- **A copy holding both text and an image** (spreadsheet cells, for
+  example) now goes to Windows as the text, as real MWB does, instead of a
+  picture of it. A copy holding an image and only its web address (how
+  browsers copy an image) still goes as the image.
+
 **Windows -> Mac files** are saved to
 `~/Library/Caches/mwb-mac-bridge/received-files/` and put on the clipboard
 as a file, so pasting in Finder copies them out. One file per copy, 100MB

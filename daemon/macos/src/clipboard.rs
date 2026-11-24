@@ -56,13 +56,14 @@ pub enum Outbound {
 type Item = (PathBuf, String);
 
 /// What `outbound` sends, one item per transfer. A file goes by its base
-/// name, the only part of the header's name Windows keeps anyway.
+/// name, the only part of the header's name Windows keeps, behind a `/`
+/// (see `file_header_name`).
 fn outbound_items(outbound: &Outbound) -> Vec<Item> {
     match outbound {
         Outbound::Image(path) => vec![(path.clone(), BIG_PATH_IMAGE_NAME.to_string())],
         Outbound::Files(paths) => paths
             .iter()
-            .map(|p| (p.clone(), p.file_name().map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned())))
+            .map(|p| (p.clone(), file_header_name(&p.file_name().map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned()))))
             .collect(),
     }
 }
@@ -316,8 +317,10 @@ fn shrink_png_to_fit(width: usize, height: usize, rgba: &[u8], full_png_len: usi
 /// macOS -> Windows clipboard sync: polls the local clipboard (no simple
 /// blocking "notify me on change" primitive here either, same as
 /// `wl-clipboard`'s CLI tools on Linux) and forwards genuinely new content
-/// into `clip_tx`. Same file > image > text priority as the Linux build,
-/// except files are only detected (and skipped), not sent.
+/// into `clip_tx`. Files come first, then text, then an image, the order
+/// real MWB uses (see `text_wins_over_image` for the one exception). Each
+/// kind's "last seen" is forgotten while another kind is on the clipboard,
+/// so copying the same text again after an image still sends it.
 pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardShared) {
     let mut last_seen_image = read_local_clipboard_image_rgba();
     let mut last_seen_text = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
@@ -331,6 +334,7 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
                 let _ = clip_tx.send(ClipboardEvent::Files(files.clone()));
             }
             last_seen_files = files;
+            (last_seen_text, last_seen_image) = (None, None);
             // A Finder file copy also puts the file's *icon* on the
             // pasteboard as TIFF (and its name as plain text): sending
             // either would clobber Windows' clipboard with a picture of a
@@ -339,8 +343,17 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
         }
         last_seen_files = files;
 
-        let current_image = read_local_clipboard_image_rgba();
+        // Text first, as real MWB does, unless it's only a URL next to an
+        // image (see `text_wins_over_image`). Reading the text is cheap; the
+        // image is only read when it could be what's sent.
+        let text = Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok());
+        let text_wins = text.as_deref().is_some_and(text_wins_over_image);
+        let current_image = if text_wins { None } else { read_local_clipboard_image_rgba() };
+        if text_wins || current_image.is_none() {
+            last_seen_image = None;
+        }
         if let Some((width, height, ref raw)) = current_image {
+            last_seen_text = None;
             if last_seen_image != current_image {
                 let is_echo = shared.last_applied_image_rgba.lock().unwrap().as_ref() == current_image.as_ref();
                 last_seen_image = current_image.clone();
@@ -365,8 +378,7 @@ pub fn run_clipboard_watcher(clip_tx: Sender<ClipboardEvent>, shared: ClipboardS
             continue; // an image is present — don't also fall through to text
         }
 
-        let Ok(mut cb) = Clipboard::new() else { continue };
-        let Ok(current) = cb.get_text() else { continue };
+        let Some(current) = text else { continue };
         if last_seen_text.as_deref() == Some(current.as_str()) {
             continue;
         }
@@ -435,25 +447,6 @@ fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     }
 }
 
-/// Reads a `size`-byte body (sent padded to a multiple of 32 bytes) and
-/// writes its `size` real bytes to `out` as they arrive.
-fn read_body_into(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], size: usize, out: &mut impl std::io::Write) -> std::io::Result<()> {
-    const CHUNK: usize = 1 << 20;
-    let mut remaining_padded = size.div_ceil(32) * 32;
-    let mut remaining_real = size;
-    while remaining_padded > 0 {
-        let this_chunk = remaining_padded.min(CHUNK);
-        let mut ct = vec![0u8; this_chunk];
-        stream.read_exact(&mut ct)?;
-        let pt = cipher.decrypt(chain, &ct);
-        let real = remaining_real.min(pt.len());
-        out.write_all(&pt[..real])?;
-        remaining_real -= real;
-        remaining_padded -= this_chunk;
-    }
-    Ok(())
-}
-
 /// Sends a file's bytes plus the zero tail real MWB always adds (see
 /// `push_padding_len`): the receiver stops reading once it has the file's
 /// size, and a body ending exactly there would leave it waiting instead.
@@ -506,13 +499,14 @@ struct Pull {
 
 impl Pull {
     fn read_body_into(&mut self, out: &mut impl std::io::Write) -> std::io::Result<()> {
-        read_body_into(&mut self.stream, &self.cipher, &mut self.read_chain, self.size, out)
+        read_pulled_body(&mut self.stream, &self.cipher, &mut self.read_chain, self.size, out)
     }
 }
 
 /// Connects to Windows' separate clipboard-server socket (port 15100) and
 /// reads the header of whatever it has for us: a big-path image (name
-/// `"image"`) or a copied or dragged file (name = its full Windows path).
+/// `"image"`), big-path text (name `"text"`) or a copied or dragged file
+/// (name = its full Windows path).
 /// `post_action` tells Windows why we're asking (`POST_ACTION_*`). `None`
 /// when Windows sends no real payload (its errors come as a size-0 header).
 fn open_pull(cfg: &Config, peer_addr: Option<SocketAddr>, post_action: u32) -> std::io::Result<Option<Pull>> {
@@ -559,6 +553,11 @@ pub fn pull_from_windows(cfg: &Config, peer_addr: Option<SocketAddr>, shared: &C
     if name == BIG_PATH_IMAGE_NAME {
         apply_incoming_clipboard_image(&body, shared);
         println!("[image-pull] Received a big clipboard image ({size} bytes) from Windows.");
+        return Ok(());
+    }
+    if name == BIG_PATH_TEXT_NAME {
+        apply_incoming_clipboard_text(&body, shared);
+        println!("[text-pull] Received big clipboard text ({size} bytes compressed) from Windows.");
         return Ok(());
     }
 
@@ -814,7 +813,7 @@ mod push_tests {
                 let header: [u8; CLIPBOARD_FILE_HEADER_SIZE] = cipher.decrypt(&mut read_chain, &header).try_into().unwrap();
                 let (size, name) = parse_file_header(&header).unwrap();
                 let mut body = Vec::new();
-                read_body_into(&mut s, &cipher, &mut read_chain, size, &mut body).unwrap();
+                read_pulled_body(&mut s, &cipher, &mut read_chain, size, &mut body).unwrap();
                 // Windows reads on past the size until the sender closes.
                 let mut rest = Vec::new();
                 s.read_to_end(&mut rest).unwrap();
@@ -828,7 +827,9 @@ mod push_tests {
     fn several_files_are_pushed_one_connection_each_in_order() {
         let dir = std::env::temp_dir().join(format!("mwb-push-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let (a, b) = (dir.join("one.txt"), dir.join("two.bin"));
+        // A name starting with "image" would be taken for clipboard data
+        // if it went bare (B12).
+        let (a, b) = (dir.join("image001.txt"), dir.join("two.bin"));
         std::fs::write(&a, b"first file").unwrap();
         std::fs::write(&b, vec![7u8; 64]).unwrap(); // a multiple of 32: needs the full padding tail
 
@@ -845,8 +846,8 @@ mod push_tests {
 
         let received = windows.join().unwrap();
         assert_eq!(received, vec![
-            ("one.txt".to_string(), b"first file".to_vec(), POST_ACTION_DESKTOP),
-            ("two.bin".to_string(), vec![7u8; 64], POST_ACTION_DESKTOP),
+            ("/image001.txt".to_string(), b"first file".to_vec(), POST_ACTION_DESKTOP),
+            ("/two.bin".to_string(), vec![7u8; 64], POST_ACTION_DESKTOP),
         ]);
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -508,6 +508,40 @@ component, confirmed live (a received file landed named literally the
 full Windows path). Split on both `/` and `\` manually instead
 (`windows_basename` in `daemon.rs`) rather than relying on `Path`.
 
+**Names Windows takes for clipboard data.** Windows' receiver
+(`Clipboard.cs`'s `ReceiveAndProcessClipboardDataCore`) treats any header
+name *starting with* `image` or `text` (any case) as clipboard data, before
+it keeps only `Path.GetFileName` of a real file's name. So a file sent
+under its bare name `image001.png` or `Text notes.txt` arrives as nothing.
+Real MWB never hits this because it sends a full path. The bridges send
+`/` plus the base name (`file_header_name`): `GetFileName` splits on `/`
+as well as `\`, so only the base name is left.
+
+**Big text from Windows.** Text that deflates to 1MB or more goes the big
+path with the literal name `text` (`SocketStuff.SendClipboardData`: header
+`{len}*text`), and its body is the small path's own payload: raw-DEFLATE
+UTF-16LE with `TXT`/`RTF`/`HTM` fragments. Since Windows sends its
+`MemoryStream`'s whole buffer (`GetBuffer`), the deflate data is followed
+by zeros, which inflating ignores. The bridges apply it as clipboard text
+(`BIG_PATH_TEXT_NAME`), not as a file named `text`.
+
+**How Windows ends a body.** A file is followed by 1..=32 zero bytes
+(`SendFileEx`: `32 - size % 32`, a full 32 when the size is already a
+multiple), but clipboard text and images by `size % 32` zero bytes
+(`SendData`). And everything goes through a `CryptoStream` that is never
+flushed with its final block before the socket closes, so a last partial
+16-byte block never leaves Windows. In practice clipboard bodies are whole
+`MemoryStream` buffers, whose length is a multiple of 256, so neither
+quirk loses data, but the reader (`read_pulled_body`) doesn't count on
+that: it reads up to the next multiple of 32, accepts the connection
+closing early once the body's size is in, and then reads off whatever
+tail is left, so closing doesn't reset the connection under Windows.
+
+**Text before images.** When a copy holds both, real MWB sends the text
+(`FormHelper.cs` checks `ContainsText` before `ContainsImage`). The
+bridges do the same, except that a lone URL next to an image (how browsers
+copy an image) sends the image (`text_wins_over_image`).
+
 **Reuse the live message-server connection's peer IP for the file-pull
 connection** rather than re-resolving the configured hostname
 independently — a fresh DNS/mDNS resolution can non-deterministically

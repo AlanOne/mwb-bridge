@@ -177,6 +177,13 @@ and the companion link's missing MAC and freshness.
 - Check the image-over-text clipboard order against real MWB.
 - Tests: extend the `fake_windows` test. Live: drag `image001.png` with the companion off; copy more than 1MB of text on Windows.
 
+**Done 2026-11-24** (type-checked and unit-tested; Linux type-checked only; nothing live-tested):
+- B12: file names go to Windows as `/` plus the base name (`file_header_name`), on both bridges.
+- B13: a pulled `text` header is applied as clipboard text on both bridges.
+- Padding: one shared reader, `read_pulled_body`, replaces both bridges' own. It reads up to the next multiple of 32, accepts an early close once the body is in (Windows' `SendData` pads by `size % 32` and never sends a final partial AES block), and reads off the tail before closing. Linux now pads what it sends with `push_padding_len`, like the Mac.
+- Order: checked against `FormHelper.cs`, which prefers text. Both bridges now send text over an image, except a lone URL next to an image (browsers' image copies). Each kind's "last seen" is now forgotten while another kind is on the clipboard, so re-copying the same text after an image sends it again (a bug in the old order too).
+- Tests: the `fake_windows` push test now sends `image001.txt` and checks the `/` names; new protocol tests cover both padding styles, a short body, draining the tail, the name rule and the text-or-image rule.
+
 ### Phase 4: performance
 - `changeCount` polling, streaming bodies, batched small-path sends, mouse-move coalescing, the focused-app cache, faster reconnect, cached key derivation, placeholders before connecting.
 - Linux: flush instead of roundtrip, `TCP_NODELAY`, `wl-paste --watch`.
