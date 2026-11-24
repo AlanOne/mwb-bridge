@@ -666,8 +666,10 @@ an IP Mapping entry in PowerToys' own settings UI or a hosts-file entry
 (`C:\Windows\System32\drivers\etc\hosts`) — neither was needed on the
 network this was built on, but your router/DNS setup may differ.
 
-**Letting Windows add the bridge itself** (both builds, off by default,
-type-checked and unit-tested only, not yet live-tested): with
+**Letting Windows add the bridge itself** (both builds, off by default;
+live-tested on the Mac 2026-11-24 with the Mac already in the pool, where
+it's announced and nothing changes; a PC learning a new machine this way
+not yet live-tested, Linux type-checked only): with
 `"self_register": true` in the config (on the Mac, "Edit Config..." in the
 menu bar, then "Restart App"; on Linux, edit config.json and restart the
 service), the bridge announces itself after
