@@ -356,9 +356,15 @@ fn lock_local_machine() {
 /// tracked cursor and a held drag. A locked session (hyprlock running) is
 /// left alone, so its screen can still go dark. The previous inhibitor is
 /// replaced, after the new one has started, so there's no gap.
-fn keep_idle_off(current: &mut Option<std::process::Child>) {
+fn keep_idle_off(current: &mut IdleInhibitor) {
+    let current = &mut current.0;
     let locked = Command::new("pgrep").args(["-x", "hyprlock"]).stdout(Stdio::null()).status().is_ok_and(|s| s.success());
     if locked {
+        // One still held from before the lock would keep it lit.
+        if let Some(mut old) = current.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
         return;
     }
     let started = Command::new("systemd-inhibit")
@@ -380,6 +386,21 @@ fn keep_idle_off(current: &mut Option<std::process::Child>) {
         && child.try_wait().ok().flatten().is_some()
     {
         *current = None;
+    }
+}
+
+/// The `systemd-inhibit` that `keep_idle_off` holds, if any: ended (and
+/// reaped) when the session ends, so it neither outlives the connection
+/// nor stays behind as a zombie.
+#[derive(Default)]
+struct IdleInhibitor(Option<std::process::Child>);
+
+impl Drop for IdleInhibitor {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -624,7 +645,7 @@ fn run_session(
     let mut next_clip_id: u32 = initial_package_id();
     let mut authenticated = false;
     // The idle inhibitor `keep_idle_off` holds, if any.
-    let mut idle_inhibitor: Option<std::process::Child> = None;
+    let mut idle_inhibitor = IdleInhibitor::default();
     let mut ignored_before_handshake = false;
     let mut last_data = std::time::Instant::now();
 
