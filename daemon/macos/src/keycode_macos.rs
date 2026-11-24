@@ -21,6 +21,22 @@
 // against the well-known table; treat non-letter/digit/modifier/arrow keys
 // as needing the same live-verification pass the Linux build's punctuation
 // mapping got if something looks wrong.
+/// The media keys, which on a Mac aren't key codes but "system-defined"
+/// events carrying an `NX_KEYTYPE_*` value: volume, mute, play/pause and
+/// next/previous track (as an Apple keyboard's F7-F12 send them). Stop has
+/// no Mac counterpart.
+pub fn evdev_to_media_key(evdev: u32) -> Option<i64> {
+    Some(match evdev {
+        115 => 0,  // KEY_VOLUMEUP -> NX_KEYTYPE_SOUND_UP
+        114 => 1,  // KEY_VOLUMEDOWN -> NX_KEYTYPE_SOUND_DOWN
+        113 => 7,  // KEY_MUTE -> NX_KEYTYPE_MUTE
+        164 => 16, // KEY_PLAYPAUSE -> NX_KEYTYPE_PLAY
+        163 => 19, // KEY_NEXTSONG -> NX_KEYTYPE_FAST (next track)
+        165 => 20, // KEY_PREVIOUSSONG -> NX_KEYTYPE_REWIND (previous track)
+        _ => return None,
+    })
+}
+
 pub fn evdev_to_cgkeycode(evdev: u32) -> Option<u16> {
     Some(match evdev {
         14 => 0x33, // KEY_BACKSPACE -> kVK_Delete
@@ -137,6 +153,15 @@ pub fn evdev_to_cgkeycode(evdev: u32) -> Option<u16> {
         40 => 0x27, // ' "
         53 => 0x2C, // / ?  (not currently produced by vk_to_evdev for this
                      // user's layout, kept for robustness)
+
+        // F13-F20 (the Mac has no F21-F24). A PC keyboard's Print Screen,
+        // Scroll Lock and Pause sit where an Apple extended keyboard has
+        // F13, F14 and F15, and macOS treats them that way.
+        183 => 0x69, 184 => 0x6B, 185 => 0x71, 186 => 0x6A,
+        187 => 0x40, 188 => 0x4F, 189 => 0x50, 190 => 0x5A,
+        99 => 0x69,  // KEY_SYSRQ (Print Screen) -> F13
+        70 => 0x6B,  // KEY_SCROLLLOCK -> F14
+        119 => 0x71, // KEY_PAUSE -> F15
 
         _ => return None,
     })

@@ -103,6 +103,36 @@ pub fn vk_to_evdev(vk: u32) -> Option<u32> {
         // Slovenian). Previously unmapped, so it typed nothing.
         0xE2 => 86,
 
+        // Keys with no letter on them: Print Screen, Scroll Lock, Pause,
+        // the menu (Apps) key, the media keys, and F13-F24.
+        0x2C => 99,  // VK_SNAPSHOT -> KEY_SYSRQ (Print Screen)
+        0x91 => 70,  // VK_SCROLL -> KEY_SCROLLLOCK
+        0x13 => 119, // VK_PAUSE -> KEY_PAUSE
+        0x5D => 127, // VK_APPS -> KEY_COMPOSE (the menu key)
+        0xAD => 113, // VK_VOLUME_MUTE -> KEY_MUTE
+        0xAE => 114, // VK_VOLUME_DOWN -> KEY_VOLUMEDOWN
+        0xAF => 115, // VK_VOLUME_UP -> KEY_VOLUMEUP
+        0xB0 => 163, // VK_MEDIA_NEXT_TRACK -> KEY_NEXTSONG
+        0xB1 => 165, // VK_MEDIA_PREV_TRACK -> KEY_PREVIOUSSONG
+        0xB2 => 166, // VK_MEDIA_STOP -> KEY_STOPCD
+        0xB3 => 164, // VK_MEDIA_PLAY_PAUSE -> KEY_PLAYPAUSE
+        0x7C..=0x87 => 183 + (vk - 0x7C), // VK_F13..VK_F24 -> KEY_F13..KEY_F24
+
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vk_to_evdev;
+
+    #[test]
+    fn media_and_extra_keys_have_codes() {
+        assert_eq!(vk_to_evdev(0xAF), Some(115)); // volume up
+        assert_eq!(vk_to_evdev(0xB3), Some(164)); // play/pause
+        assert_eq!(vk_to_evdev(0x2C), Some(99)); // Print Screen
+        assert_eq!(vk_to_evdev(0x7C), Some(183)); // F13
+        assert_eq!(vk_to_evdev(0x87), Some(194)); // F24
+        assert_eq!(vk_to_evdev(0x88), None);
+    }
 }

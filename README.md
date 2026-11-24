@@ -412,8 +412,17 @@ so Ctrl+C/V/Z/... work as on Windows, except in terminals, where Ctrl stays a
 real Ctrl and Ctrl+Shift+C/V copy/paste. Also Home/End and Ctrl+Home/End in
 text fields, Ctrl+arrows/Backspace/Delete by word, Alt+Tab, Alt+F4, a lone
 Win tap for Spotlight, Win+E for a Finder window, Win+Shift+S to snip to the
-clipboard, and Finder's Enter/Backspace/Delete/F2. Rules live in
-`daemon/macos/src/windows_keys.rs`.
+clipboard, Print Screen for the whole screen to the clipboard, and Finder's
+Enter/Backspace/Delete/F2. Rules live in `daemon/macos/src/windows_keys.rs`.
+
+**Media and extra keys** (both builds, type-checked and unit-tested only,
+not yet live-tested): volume up/down, mute, play/pause and next/previous
+track work as an Apple keyboard's do (holding a volume key keeps going),
+F13-F20 (F13-F24 on Linux) arrive as themselves, and Print Screen, Scroll
+Lock and Pause arrive as F13-F15, where an Apple extended keyboard has
+them (Print Screen takes a screenshot instead with Windows-style keys on).
+On Linux the menu key and media Stop work too; the Mac has no counterpart
+for either.
 
 For quick iteration without the full install (no autostart, no bundle):
 

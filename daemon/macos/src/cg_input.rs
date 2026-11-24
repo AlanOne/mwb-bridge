@@ -21,7 +21,7 @@ use core_graphics::geometry::{CGPoint, CGRect};
 
 use mwb_protocol::input_handling::{EdgeExit, InputSink, ModifierState, ScreenEdge};
 
-use crate::keycode_macos::evdev_to_cgkeycode;
+use crate::keycode_macos::{evdev_to_cgkeycode, evdev_to_media_key};
 use crate::windows_keys::{self, Action, AppKind};
 
 /// What a non-modifier key's press was turned into, so its repeats and its
@@ -688,6 +688,10 @@ impl InputSink for CgInput {
             }
             return;
         }
+        if let Some(media_key) = evdev_to_media_key(evdev_code) {
+            post_media_key(media_key, pressed);
+            return;
+        }
         let Some(keycode) = evdev_to_cgkeycode(evdev_code) else {
             eprintln!("(cg_input: no CGKeyCode mapping for evdev code {evdev_code}, ignoring)");
             return;
@@ -705,7 +709,11 @@ impl InputSink for CgInput {
             Some(Some((kc, flags, location))) => self.post_key(*kc, true, *flags, *location, true),
             Some(None) => {}
             None => {
-                if let Some(keycode) = evdev_to_cgkeycode(evdev_code) {
+                // Holding a volume key keeps changing the volume, as on an
+                // Apple keyboard.
+                if let Some(media_key) = evdev_to_media_key(evdev_code) {
+                    post_media_key(media_key, true);
+                } else if let Some(keycode) = evdev_to_cgkeycode(evdev_code) {
                     self.post_key(keycode, true, self.flags, CGEventTapLocation::HID, true);
                 }
             }
@@ -778,4 +786,52 @@ pub fn lock_screen() {
         event.set_flags(CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagControl);
         event.post(CGEventTapLocation::Session);
     }
+}
+
+/// Posts a media key (an `NX_KEYTYPE_*` value) the way an Apple keyboard
+/// sends one: as an `NSSystemDefined` event of subtype 8 (aux control
+/// button), with the key and its down (0xA) or up (0xB) state in `data1`.
+/// Core Graphics can't make these itself, so it goes through NSEvent, which
+/// is fine off the main thread for creating an event.
+fn post_media_key(media_key: i64, pressed: bool) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSPoint;
+    const NS_SYSTEM_DEFINED: u64 = 14;
+    const AUX_CONTROL_BUTTONS: i16 = 8;
+    let state: i64 = if pressed { 0xA } else { 0xB };
+    let flags: u64 = (state as u64) << 8;
+    let data1: isize = ((media_key << 16) | (state << 8)) as isize;
+    unsafe extern "C" {
+        fn CGEventPost(tap: u32, event: *const std::ffi::c_void);
+    }
+    objc2::rc::autoreleasepool(|_| {
+        // SAFETY: NSEvent's documented factory method with its documented
+        // argument types; a nil context is allowed.
+        let event: *mut AnyObject = unsafe {
+            msg_send![
+                class!(NSEvent),
+                otherEventWithType: NS_SYSTEM_DEFINED,
+                location: NSPoint::new(0.0, 0.0),
+                modifierFlags: flags,
+                timestamp: 0.0f64,
+                windowNumber: 0isize,
+                context: std::ptr::null_mut::<AnyObject>(),
+                subtype: AUX_CONTROL_BUTTONS,
+                data1: data1,
+                data2: -1isize
+            ]
+        };
+        if event.is_null() {
+            eprintln!("(cg_input: couldn't create a media key event)");
+            return;
+        }
+        // SAFETY: `CGEvent` returns a CGEventRef owned by the NSEvent, which
+        // the autorelease pool keeps alive until after it's posted.
+        let cg_event: *const std::ffi::c_void = unsafe { msg_send![event, CGEvent] };
+        if !cg_event.is_null() {
+            // SAFETY: a valid CGEventRef; 0 is kCGHIDEventTap.
+            unsafe { CGEventPost(0, cg_event) };
+        }
+    });
 }

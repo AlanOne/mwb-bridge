@@ -46,6 +46,7 @@ pub const EV_RIGHTALT: u32 = 100;
 pub const EV_LEFTSHIFT: u32 = 42;
 pub const EV_RIGHTSHIFT: u32 = 54;
 pub const EV_CAPSLOCK: u32 = 58;
+const EV_SYSRQ: u32 = 99;
 const EV_C: u32 = 46;
 const EV_V: u32 = 47;
 const EV_E: u32 = 18;
@@ -77,6 +78,7 @@ const VK_UP: u16 = 0x7E;
 const VK_C: u16 = 0x08;
 const VK_V: u16 = 0x09;
 const VK_Q: u16 = 0x0C;
+const VK_3: u16 = 0x14;
 const VK_4: u16 = 0x15;
 
 pub fn is_modifier(evdev: u32) -> bool {
@@ -114,7 +116,7 @@ pub fn needs_context(evdev: u32, mods: ModifierState) -> bool {
     mods.ctrl
         || mods.alt
         || mods.super_
-        || matches!(evdev, EV_HOME | EV_END | EV_ENTER | EV_BACKSPACE | EV_DELETE | EV_F2)
+        || matches!(evdev, EV_HOME | EV_END | EV_ENTER | EV_BACKSPACE | EV_DELETE | EV_F2 | EV_SYSRQ)
 }
 
 /// Decides what a non-modifier keypress becomes. `in_text` is asked only
@@ -138,6 +140,13 @@ pub fn rewrite(evdev: u32, mods: ModifierState, app: AppKind, in_text: &mut dyn 
     }
     if only_win && evdev == EV_E && !mods.shift {
         return Action::OpenFinderWindow;
+    }
+    // Print Screen: the whole screen to the clipboard, as on Windows.
+    if none && evdev == EV_SYSRQ {
+        return Action::SystemShortcut(
+            VK_3,
+            cmd | CGEventFlags::CGEventFlagShift | CGEventFlags::CGEventFlagControl,
+        );
     }
     if only_win && evdev == EV_S && mods.shift {
         return Action::SystemShortcut(
@@ -376,6 +385,7 @@ mod tests {
         assert_eq!(r(EV_F4, mods(false, false, true, false), AppKind::Other, false), Action::Key(VK_Q, CMD));
         assert_eq!(r(EV_E, mods(false, false, false, true), AppKind::Other, false), Action::OpenFinderWindow);
         assert!(matches!(r(EV_S, mods(true, false, false, true), AppKind::Other, false), Action::SystemShortcut(VK_4, _)));
+        assert!(matches!(r(EV_SYSRQ, mods(false, false, false, false), AppKind::Terminal, false), Action::SystemShortcut(VK_3, _)));
         // AltGr characters (level3) are never treated as Alt shortcuts
         let altgr = ModifierState { level3: true, ..NONE };
         assert_eq!(r(EV_TAB, altgr, AppKind::Other, false), Action::Raw);
