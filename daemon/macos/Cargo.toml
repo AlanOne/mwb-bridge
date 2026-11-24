@@ -19,4 +19,4 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 image = { version = "0.25", default-features = false, features = ["png"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString", "NSObject", "NSArray", "NSURL", "NSGeometry"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSPanel", "NSWindow", "NSView", "NSResponder", "NSEvent", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSImage", "NSWorkspace", "NSColor", "NSGraphics", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSTextField", "NSSecureTextField", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSPasteboardItem", "NSPanel", "NSWindow", "NSView", "NSResponder", "NSEvent", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSImage", "NSWorkspace", "NSColor", "NSGraphics", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSTextField", "NSSecureTextField", "NSRunningApplication", "NSMenu", "NSMenuItem"] }

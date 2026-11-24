@@ -382,10 +382,13 @@ template is written on first run if none exists. The menu bar icon's
 "Settings..." window edits the main fields (Windows PC, security key, this
 Mac's name and ID, scroll speed), keeps everything else in the file as it
 was, and restarts the app to apply them; "Edit Config..." opens the file
-for the rest, then "Restart App". The menu also shows the connection's
-link (wired or Wi-Fi, with the round-trip time TCP measures) and has
-"Reconnect Now" (all three type-checked and unit-tested only, not yet
-live-tested).
+for the rest, then "Restart App". It checks that the Windows PC has a port
+(`windows-pc.local:15101`), and won't save over a config.json that doesn't
+parse (fix that with "Edit Config..." first). The menu also shows the
+connection's link (Wi-Fi, or the interface's name otherwise, with the
+round-trip time TCP measures) and has "Reconnect Now" (the window's
+checks are unit-tested; the window itself, the link line and "Reconnect
+Now" are type-checked only, none live-tested yet).
 
 **More than one Windows PC** (say one at home and one at the office): list
 the others in `other_windows_pcs`, each with its own PowerToys key. The Mac

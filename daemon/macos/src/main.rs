@@ -777,12 +777,16 @@ pub fn reconnect_now() {
 /// connected.
 pub fn link_line() -> Option<String> {
     use std::os::fd::AsRawFd;
-    let guard = CURRENT_STREAM.lock().unwrap();
-    let stream = guard.as_ref()?;
+    // A handle of its own, so the lookups below (which can stall while the
+    // network is reconfigured) don't hold up the session's teardown or a
+    // reconnect, which need this lock.
+    let stream = CURRENT_STREAM.lock().unwrap().as_ref()?.try_clone().ok()?;
     let interface = stream.local_addr().ok().and_then(route::interface_of_local);
+    // Only Wi-Fi is told apart: anything else may be a cable, but also a
+    // VPN tunnel, so it goes by its interface name.
     let kind = match &interface {
         Some(i) if route::is_wifi(i) => format!("Wi-Fi ({i})"),
-        Some(i) => format!("wired ({i})"),
+        Some(i) => i.clone(),
         None => "unknown link".to_string(),
     };
     let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
