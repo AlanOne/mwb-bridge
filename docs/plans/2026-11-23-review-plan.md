@@ -208,8 +208,11 @@ and the companion link's missing MAC and freshness.
 - Not done: trying candidate addresses in parallel (the wired-first ordering in `route.rs` would need rethinking), and a single mutex around encrypt-and-write for sends from other threads (Phase 1's 50ms tick already keeps queued sends prompt).
 
 ### Phase 5: features
-**Built** (each feature Grok-reviewed and its findings fixed; no final
-whole-phase review yet). Live-tested on the Mac and both Windows PCs
+**Done** (each feature Grok-reviewed and its findings fixed; the
+whole-phase review on 2026-11-24 found six more, fixed in 6597624:
+stale Mac copies on the Windows clipboard, the PowerToys fallback for
+failed copies, the owed release, two drags from the Mac at once, and
+offer ids made in the same millisecond). Live-tested on the Mac and both Windows PCs
 2026-11-24: big transfers both ways with progress and cancel, folders, the
 shorter drop hold (the 3s one froze the cursor), media keys, stay-awake,
 keep-screen-on, the settings window, the setup check, and
