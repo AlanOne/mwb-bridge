@@ -85,5 +85,10 @@ Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\"
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":{\"value\":[\"WINPC\",\"\",\"\",\"\"]},\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "alan-mac")!.Contains("MachineMatrixString"), "missing from the layout is reported");
 Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,:,:,:\"}}"), "alan-mac")!.Contains("MachinePool"), "missing from the pool is reported");
 Check(SetupCheck.Problem(Props("{}"), "alan-mac") == null, "settings it can't read don't produce a false alarm");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac \",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1, alan-mac:2,:,:\"}}"), "alan-mac") == null, "spaces PowerToys trims don't cause a false alarm");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "alan-mac")!.Contains("MachineMatrixString"), "a layout without four slots is one PowerToys ignores");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2\"}}"), "alan-mac")!.Contains("four"), "a pool without four slots is one PowerToys ignores");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:NONE,:,:\"}}"), "alan-mac")!.Contains("valid ID"), "a pool entry without a usable ID is reported");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,:,:,:,alan-mac:2\"}}"), "alan-mac") != null, "only the first four pool slots count");
 
 return failures == 0 ? 0 : 1;
