@@ -140,6 +140,16 @@ everything but the handshake until Windows has answered the handshake
 challenge, so a replayed or redirected connection can't inject input, and
 the Linux build no longer logs every key and mouse packet to the journal.
 
+**The Mac stays reachable** (type-checked only, not yet live-tested):
+while the bridge is connected and the Mac is on power, it holds macOS's
+"no idle system sleep" assertion. The display still turns off after its
+idle time, but the Mac stays awake behind it instead of going to sleep,
+which it otherwise does soon after (and in clamshell mode, lid closed with
+an external display, straight away). A sleeping Mac drops the connection,
+so input from Windows can't wake it, only opening the lid can. Crossing
+over to the Mac wakes the display. On battery the Mac may still sleep, and
+closing the lid with no external display always sleeps it.
+
 **Screen stays on while you use Windows** (both builds, type-checked
 only, not yet live-tested): with "Block screen saver on other machines" on
 in PowerToys' Mouse Without Borders settings, Windows tells every machine

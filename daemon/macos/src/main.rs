@@ -15,6 +15,7 @@ mod drag_in;
 mod drag_out;
 mod drag_source;
 mod keycode_macos;
+mod power;
 mod route;
 mod windows_keys;
 
@@ -621,6 +622,10 @@ fn run_session(
                 // Only the client session forwards input and sees the
                 // release, so only it starts a new activation's LET_GO.
                 if to_us && cg.is_some() {
+                    // The display may be asleep: wake it for the user who
+                    // just crossed over (the Mac itself is kept awake, see
+                    // `power`).
+                    cg_input::declare_user_activity();
                     LET_GO.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 if to_us
@@ -865,6 +870,7 @@ fn network_thread(cfg: Config) {
         std::thread::spawn(move || run_server_listener(active));
     }
     std::thread::spawn(watch_for_wake);
+    std::thread::spawn(|| power::keep_awake_while_connected(|| CURRENT_STREAM.lock().unwrap().is_some()));
     {
         let active = active.clone();
         std::thread::spawn(move || watch_for_wired_path(active));
