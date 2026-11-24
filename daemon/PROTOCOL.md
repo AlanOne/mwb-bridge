@@ -858,8 +858,10 @@ press injected before that drag has ended goes to it, not the source
 window, and the new drag never starts (live-found 2026-11-24), so the
 companion waits up to 500ms for it to end on the catcher, and hides the
 catcher, before pressing. Windows is in control by then, so
-injecting is safe: the companion puts a small window under the cursor and
-presses the left button on it (Windows didn't see the real press, made
+injecting is safe: the companion puts a nearly invisible window over the
+whole desktop (a small one at the cursor missed: the cursor is often still
+moving fast from the crossing, and the press lands wherever it is by the
+time Windows handles it) and presses the left button on it (Windows didn't see the real press, made
 while the Mac had control), and turns that into a real `DoDragDrop` of
 placeholder files that fill in as the bytes arrive (same-named files in
 one drag get Explorer-style " (2)" names). Its `QueryContinueDrag` holds

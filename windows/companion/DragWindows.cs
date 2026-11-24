@@ -70,8 +70,8 @@ sealed class CatcherWindow : GhostWindow
     }
 }
 
-/// Mac -> Windows: a small window put under the cursor that a simulated
-/// left press lands on, which it turns into a real Windows drag of the
+/// Mac -> Windows: a window put over the whole desktop (so it can't be
+/// missed by a cursor still moving) that a simulated left press lands on, which it turns into a real Windows drag of the
 /// files (the same trick the Mac side uses, and PowerToys' own helper).
 sealed class SourceWindow : GhostWindow
 {

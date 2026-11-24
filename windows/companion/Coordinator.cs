@@ -342,9 +342,13 @@ sealed class Coordinator
         {
             // Windows doesn't know about the button held on the other
             // machine; this press, on the source window, gives it one.
+            // Over the whole desktop, not just around the cursor: the
+            // cursor is often still moving fast from the crossing, and a
+            // press injected at one spot lands wherever it is by the time
+            // Windows handles it (live-found 2026-11-24: 224px in 70ms,
+            // past a 64px window, so the drag never started).
             _pendingSource = drop;
-            var at = Cursor.Position;
-            _source.ShowOver(new Rectangle(at.X - 32, at.Y - 32, 64, 64));
+            _source.ShowOver(SystemInformation.VirtualScreen);
             var press = new System.Windows.Forms.Timer { Interval = 40 };
             press.Tick += (_, _) =>
             {
@@ -352,7 +356,7 @@ sealed class Coordinator
                 // Again right before pressing: other topmost windows (Mouse
                 // Without Borders keeps one at the cursor) may have come up.
                 var now = Cursor.Position;
-                _source.ShowOver(new Rectangle(now.X - 32, now.Y - 32, 64, 64));
+                _source.ShowOver(SystemInformation.VirtualScreen);
                 Log.Write($"[to-windows] Pressing at {now} on {Native.DescribeWindowAt(now)} (the source window is 0x{_source.Handle.ToInt64():x}).");
                 Native.LeftButton(down: true);
             };
