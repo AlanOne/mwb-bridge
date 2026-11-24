@@ -218,11 +218,14 @@ since PowerToys only reports single-file drags.
   2026-11-23, including going back to Windows mid-drag, which cancels it
   cleanly. As soon as the drag reaches the Mac the file starts
   downloading and a real macOS drag of it is started under the cursor (see
-  `daemon/macos/src/drag_source.rs`). Letting go before the files have
-  arrived holds the drop (the cursor stays put) for up to 3 seconds; if
-  they're still arriving then, the drag is cancelled and they're saved to
-  `~/Desktop/MouseWithoutBorders/` once they have, so the mouse never stays
-  frozen. A click, a key or switching machines meanwhile ends the wait
+  `daemon/macos/src/drag_source.rs`). Letting go just before the files have
+  arrived holds the drop (the cursor stays put) for up to a second; if
+  they're still arriving then, or if they plainly won't be in within that
+  second (going by how fast they're arriving), the drag is cancelled at
+  once and they're saved to `~/Desktop/MouseWithoutBorders/` once they
+  have, so a big transfer never freezes the mouse (the shorter hold is
+  unit-tested only, not yet live-tested; it used to hold up to 3 seconds,
+  which froze the cursor through most of a 500 MB transfer). A click, a key or switching machines meanwhile ends the wait
   straight away the same way, and so does a lost connection (not yet
   live-tested). If you let go before the drag could start, the file is
   saved to `~/Desktop/MouseWithoutBorders/` and shown in Finder instead

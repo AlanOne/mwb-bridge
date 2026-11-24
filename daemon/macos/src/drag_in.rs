@@ -156,6 +156,9 @@ struct Incoming {
     gave_up: bool,
     // A macOS drag being started, step by step (see `Start`).
     starting: Option<Start>,
+    // The companion offer being fetched, whose progress tells how long the
+    // files will still take (none for PowerToys' single file).
+    offer_id: Option<u64>,
 }
 
 /// Starting a macOS drag takes a few steps that each wait on the main
@@ -203,10 +206,42 @@ fn start_step(start: Start, placed: bool, started: bool) -> StartStep {
 }
 
 // How long a release let go before the files have arrived is held back
-// waiting for them (an app reads the files when they're dropped). After
-// that the drag is cancelled and the files are saved to the drop folder
-// once they arrive, rather than keeping the cursor frozen.
-pub const EARLY_RELEASE_WAIT: Duration = Duration::from_secs(3);
+// waiting for them (an app reads the files when they're dropped), the
+// cursor frozen meanwhile. After that the drag is cancelled and the files
+// are saved to the drop folder once they arrive. Files that won't be in
+// within this long (going by how fast they're arriving) aren't waited for
+// at all: see `should_hold`.
+pub const EARLY_RELEASE_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a transfer that has moved `done` of `total` bytes in
+/// `running_for` will still take at that pace; `None` before it has moved
+/// anything.
+pub fn remaining_time(done: u64, total: u64, running_for: Duration) -> Option<Duration> {
+    if done >= total {
+        return Some(Duration::ZERO);
+    }
+    if done == 0 || running_for.is_zero() {
+        return None;
+    }
+    let rate = done as f64 / running_for.as_secs_f64();
+    Some(Duration::from_secs_f64(((total - done) as f64 / rate).min(86_400.0)))
+}
+
+/// Whether a release let go early is worth holding (the cursor frozen) for
+/// files that will take `remaining` longer: only if they'll be in within
+/// `EARLY_RELEASE_WAIT`, or if that isn't known (then it's held no longer
+/// than that).
+pub fn should_hold(remaining: Option<Duration>) -> bool {
+    remaining.is_none_or(|r| r <= EARLY_RELEASE_WAIT)
+}
+
+/// How long companion offer `id`'s files will still take to arrive, if
+/// that can be told yet.
+fn offer_remaining(id: Option<u64>) -> Option<Duration> {
+    let id = id?;
+    let progress = crate::companion::link()?.transfers.active().into_iter().find(|p| p.id == id)?;
+    remaining_time(progress.done, progress.total, progress.running_for)
+}
 
 /// What to do about a held-back release, given the download's outcome so
 /// far and how long the release has been held.
@@ -237,7 +272,7 @@ impl IncomingDrag {
         prune_old_drags(&root, KEEP_DRAGS);
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
-        self.current = Some(Incoming { fetch: fetch.clone(), expected: 1, dragging: false, gave_up: false, starting: None });
+        self.current = Some(Incoming { fetch: fetch.clone(), expected: 1, dragging: false, gave_up: false, starting: None, offer_id: None });
         let cfg = cfg.clone();
         std::thread::spawn(move || {
             let result = crate::clipboard::fetch_dragged_file(&cfg, peer_addr, &dir, |path| fetch.created(path));
@@ -257,7 +292,7 @@ impl IncomingDrag {
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
         let expected = mwb_protocol::companion::top_level_count(&offer);
-        self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false, starting: None });
+        self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false, starting: None, offer_id: Some(offer.id) });
         let link = link.clone();
         std::thread::spawn(move || {
             let result = link.fetch_files(&offer, &dir, |path| fetch.created(path));
@@ -397,8 +432,15 @@ impl IncomingDrag {
                 incoming.fetch.then(after);
                 false
             }
+            ReleaseStep::Wait if !should_hold(offer_remaining(incoming.offer_id)) => {
+                // Too far from done to keep the cursor frozen for.
+                println!("[drop] Let go well before the files arrived, saving them to the drop folder once they have.");
+                cg.cancel_drag();
+                incoming.fetch.then(After::SaveToDropFolder);
+                false
+            }
             ReleaseStep::Wait => {
-                println!("[drop] Let go before the files arrived, holding the drop for up to {}s.", EARLY_RELEASE_WAIT.as_secs());
+                println!("[drop] Let go just before the files arrived, holding the drop for up to {}s.", EARLY_RELEASE_WAIT.as_secs());
                 self.held_release = Some((incoming.fetch, std::time::Instant::now()));
                 true
             }
@@ -678,6 +720,20 @@ mod tests {
         assert!(tmp.0.join("drop/a.txt").exists() && tmp.0.join("drop/b.txt").exists());
         fetch.then(After::Discard);
         assert!(!dir.exists(), "both files and their folder are gone");
+    }
+
+    #[test]
+    fn a_release_is_only_held_for_files_about_to_arrive() {
+        let secs = Duration::from_secs;
+        // 100 of 300 MB in 2s: 4s to go.
+        assert_eq!(remaining_time(100, 300, secs(2)), Some(secs(4)));
+        assert!(!should_hold(remaining_time(100, 300, secs(2))));
+        // 290 of 300 in 2s: well under a second.
+        assert!(should_hold(remaining_time(290, 300, secs(2))));
+        assert_eq!(remaining_time(300, 300, secs(2)), Some(Duration::ZERO));
+        // Nothing moved yet, or no progress to go by: held, but only briefly.
+        assert_eq!(remaining_time(0, 300, secs(2)), None);
+        assert!(should_hold(None));
     }
 
     #[test]
