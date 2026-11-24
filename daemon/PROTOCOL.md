@@ -767,12 +767,17 @@ everything after that (the rest of the folder, later folders and files)
 left out and logged. Walking happens off the UI and input threads; a drag
 whose catch ended meanwhile, or a copy something newer replaced, isn't
 offered once the walk is done, and a slow copy that arrives after
-something newer was copied isn't put on the clipboard. A file that
+something newer was copied (on either machine) isn't put on the clipboard,
+on the Mac or on Windows. A file that
 vanishes before it's sent goes empty, keeping the others at their indexes,
 and one that changed size since it was offered goes as it is then (never
 more than its header says), the receiver logging the difference rather
 than failing the rest. On the Mac, a copy the companion can't take after
-all (the link drops while its folders are walked) goes the PowerToys way. The
+all (the link drops while its folders are walked) goes the PowerToys way
+if PowerToys can send it (a file up to 100MB, not a folder), and is logged
+as not sent otherwise; of two that fail together, the newer is kept. Offer
+ids are milliseconds since 1970, made unique even when two offers start in
+the same millisecond. The
 receiver rebuilds the folders under its own drop folder, each path part
 made safe (`.`/`..` dropped; on Windows, device names like `CON` get a `_`
 in front), every offered folder in one place, and any name that would land
@@ -864,7 +869,10 @@ Mouse Without Borders would forward the press and release to the Mac,
 where they look like a drop of whatever is being dragged there (live-found
 2026-11-24, a quick bounce back to the Mac). The files are saved to the
 desktop then, and a release still owed is injected at the next
-`INACTIVE`. (The whole-desktop source window and stopping a bounced
+`INACTIVE` (unless that says a drag came back, whose own release ends it),
+or after a disconnect once the parked cursor moves. One drag from the Mac
+at a time: an offer that comes while another is being started or is
+running is saved to the desktop. (The whole-desktop source window and stopping a bounced
 drag's transfer were live-tested 2026-11-24; the no-press-while-the-Mac-
 has-control guard is type-checked only, as that race didn't recur.) Windows is in control by then, so
 injecting is safe: the companion puts a nearly invisible window over the

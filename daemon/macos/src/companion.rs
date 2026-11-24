@@ -262,7 +262,12 @@ impl Link {
             // A copy that doesn't get through goes back for PowerToys.
             let give_back = |paths: Vec<PathBuf>| {
                 if frame == proto::CLIPBOARD_TO_WINDOWS {
-                    *link.failed_copy.lock().unwrap() = Some((generation, paths));
+                    // Never over a newer copy that failed too (both fail
+                    // together when the link dies).
+                    let mut slot = link.failed_copy.lock().unwrap();
+                    if slot.as_ref().is_none_or(|(g, _)| *g <= generation) {
+                        *slot = Some((generation, paths));
+                    }
                 }
             };
             let (files, skipped) = proto::expand_offer_paths(&paths);
@@ -273,7 +278,7 @@ impl Link {
                 println!("[companion] Nothing to send in that {what} (only empty folders?).");
                 return;
             }
-            let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let id = next_offer_id();
             let offer = Offer {
                 id,
                 files: files
@@ -349,6 +354,23 @@ impl Link {
             proto::send_files(&mut writer, files, |n| transfer.add(n))
         });
         transfer.outcome(sent)
+    }
+}
+
+/// A fresh offer id: unique even for offers made in the same millisecond
+/// (a copy and a drag at once), and above any from an earlier run, which
+/// the companion may still have (they're milliseconds since 1970).
+fn next_offer_id() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let mut last = LAST.load(Ordering::SeqCst);
+    loop {
+        let id = now.max(last + 1);
+        match LAST.compare_exchange(last, id, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return id,
+            Err(actual) => last = actual,
+        }
     }
 }
 
@@ -478,6 +500,12 @@ mod tests {
             "security_key": KEY, "windows_ip": "unused", "machine_name": "mac", "machine_id": 3,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn offers_made_at_once_get_different_ids() {
+        let ids: Vec<u64> = (0..1000).map(|_| next_offer_id()).collect();
+        assert!(ids.windows(2).all(|w| w[1] > w[0]));
     }
 
     #[test]

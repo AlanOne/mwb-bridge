@@ -290,6 +290,9 @@ fn run_session(
                     for (path, reason) in &skipped {
                         println!("{} [file-copy] Not sending {} to Windows: {reason}.", timestamp(), path.display());
                     }
+                    if powertoys_only && files.is_empty() {
+                        println!("{} [file-copy] That copy couldn't go through the companion, and PowerToys can't send it either: it wasn't sent. Copy it again once the companion is back.", timestamp());
+                    }
                     // Windows' clipboard takes one received file per
                     // transfer, so a multi-file copy sends its first.
                     if let Some(first) = files.first() {

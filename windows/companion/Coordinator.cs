@@ -38,6 +38,7 @@ sealed class Coordinator
 
     // Mac -> Windows state.
     IncomingDrop? _pendingSource; // waiting for the simulated press to land
+    bool _dragRunning;            // a drag from the bridge is under way here
     // When EndLeftoverDrag released Windows' leftover drag, until it has
     // ended on the catcher: a drag started here meanwhile waits for that.
     DateTime? _endingLeftoverSince;
@@ -165,8 +166,17 @@ sealed class Coordinator
         if (_releaseOwed)
         {
             _releaseOwed = false;
-            Native.LeftButton(down: false);
-            Log.Write("[to-windows] Windows has control again: letting go of the press a drag that didn't start left behind.");
+            if (_catching && inactive.DragCameBack(version))
+            {
+                // The button is really held for the drag coming back: its
+                // own release ends it, and an injected one would drop it.
+                Log.Write("[to-windows] A drag came back holding the button: the press a drag that didn't start left behind is let go with it.");
+            }
+            else
+            {
+                Native.LeftButton(down: false);
+                Log.Write("[to-windows] Windows has control again: letting go of the press a drag that didn't start left behind.");
+            }
         }
         if (!_catching) return;
         if (inactive.DragCameBack(version))
@@ -234,9 +244,11 @@ sealed class Coordinator
 
     string[] _lastSetOnClipboard = Array.Empty<string>();
     string[] _lastOffered = Array.Empty<string>();
-    // Moves on with every copy (UI thread only), so a walk can tell it was
-    // overtaken.
-    int _copyGeneration;
+    // Moves on with every copy (changed on the UI thread only), so a walk
+    // or a Mac copy still arriving can tell it was overtaken.
+    volatile int _copyGeneration;
+    // Counts copies from the Mac: only the latest goes on the clipboard.
+    long _macCopies;
     DateTime _lastOfferedAt;
 
     /// Files copied on the Mac: put them on Windows' clipboard once they've
@@ -245,8 +257,17 @@ sealed class Coordinator
     {
         var drop = IncomingDrop.Create(offer, IncomingDrop.CopiesRoot);
         _fromMac[offer.Id] = drop;
+        // A slow copy mustn't land over anything copied since, on the Mac
+        // (a later copy from it) or here.
+        var mine = Interlocked.Increment(ref _macCopies);
+        var clipboardAt = _copyGeneration;
         drop.Completed = () => Post(() =>
         {
+            if (mine != Interlocked.Read(ref _macCopies) || clipboardAt != _copyGeneration)
+            {
+                Log.Write($"[copy] {drop.TopLevel.Length} item(s) copied on the Mac arrived after something newer was copied: not putting them on the clipboard.");
+                return;
+            }
             try
             {
                 var list = new System.Collections.Specialized.StringCollection();
@@ -358,6 +379,13 @@ sealed class Coordinator
 
     void StartSourceDrag(IncomingDrop drop)
     {
+        if (_pendingSource != null || _dragRunning)
+        {
+            // One is being started or is running: leave it be.
+            Log.Write($"[to-windows] Drag {drop.Id}: another drag from the bridge is still going on here, saving its files to the desktop instead.");
+            drop.SaveToDesktopWhenComplete();
+            return;
+        }
         Log.Write($"[to-windows] Drag {drop.Id}: {drop.Paths.Length} file(s) from the bridge, starting a drag here.");
         Log.Write($"[to-windows] Cursor at {Cursor.Position}, left button {(Native.LeftButtonDown() ? "down" : "up")} as Windows sees it.");
         if (!Native.LeftButtonDown())
@@ -464,7 +492,10 @@ sealed class Coordinator
         poll.Tick += (_, _) => { };
         poll.Start();
         _source.QueryContinueDrag += Query;
-        var effect = _source.DoDragDrop(data, DragDropEffects.Copy);
+        DragDropEffects effect;
+        _dragRunning = true;
+        try { effect = _source.DoDragDrop(data, DragDropEffects.Copy); }
+        finally { _dragRunning = false; }
         _source.QueryContinueDrag -= Query;
         poll.Stop();
         _source.Hide();
@@ -551,6 +582,25 @@ sealed class Coordinator
         }
         else if (_catching) HideCatcher();
         foreach (var drop in _fromMac.Values) drop.Cancelled = true;
+        // No INACTIVE will come to settle an owed release: let go once
+        // Windows has control again (the parked cursor moves).
+        _bridgeActive = false;
+        if (_releaseOwed) ReleaseOwedOnceControlBack(Cursor.Position);
+    }
+
+    void ReleaseOwedOnceControlBack(Point parked)
+    {
+        var poll = new System.Windows.Forms.Timer { Interval = 100 };
+        poll.Tick += (_, _) =>
+        {
+            if (!_releaseOwed) { poll.Dispose(); return; }
+            if (Cursor.Position == parked) return;
+            poll.Dispose();
+            _releaseOwed = false;
+            Native.LeftButton(down: false);
+            Log.Write("[to-windows] Windows has control again after the bridge went away: letting go of the press a drag that didn't start left behind.");
+        };
+        poll.Start();
     }
 }
 
