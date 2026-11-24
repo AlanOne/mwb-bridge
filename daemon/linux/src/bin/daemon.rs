@@ -348,6 +348,41 @@ fn lock_local_machine() {
     }
 }
 
+/// For MWB's Awake package (about once a minute while someone uses
+/// Windows): holds a systemd idle inhibitor for the next 90 seconds, which
+/// Hyprland's idle daemon (hypridle) honors by default, so the screen
+/// doesn't blank or lock while the user works on Windows. Nothing moves,
+/// unlike real MWB's mouse jiggle, which would fight relative mode's
+/// tracked cursor and a held drag. A locked session (hyprlock running) is
+/// left alone, so its screen can still go dark. The previous inhibitor is
+/// replaced, after the new one has started, so there's no gap.
+fn keep_idle_off(current: &mut Option<std::process::Child>) {
+    let locked = Command::new("pgrep").args(["-x", "hyprlock"]).stdout(Stdio::null()).status().is_ok_and(|s| s.success());
+    if locked {
+        return;
+    }
+    let started = Command::new("systemd-inhibit")
+        .args(["--what=idle", "--who=MWB bridge", "--why=Someone is using Windows", "--mode=block", "sleep", "90"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match started {
+        Ok(child) => {
+            if let Some(mut old) = current.replace(child) {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+        }
+        Err(e) => eprintln!("(awake: couldn't start systemd-inhibit: {e})"),
+    }
+    // Reap one that ran out on its own meanwhile.
+    if let Some(child) = current.as_mut()
+        && child.try_wait().ok().flatten().is_some()
+    {
+        *current = None;
+    }
+}
+
 /// Waits for the clipboard to change: `wl-paste --watch` runs a command on
 /// every change, so a line from that command is the signal, instead of
 /// spawning up to three `wl-paste` processes every half second to look.
@@ -588,6 +623,8 @@ fn run_session(
     // (see initial_package_id and build_clipboard_text_packages).
     let mut next_clip_id: u32 = initial_package_id();
     let mut authenticated = false;
+    // The idle inhibitor `keep_idle_off` holds, if any.
+    let mut idle_inhibitor: Option<std::process::Child> = None;
     let mut ignored_before_handshake = false;
     let mut last_data = std::time::Instant::now();
 
@@ -805,11 +842,10 @@ fn run_session(
                 }
             }
             PACKAGE_TYPE_AWAKE => {
-                // Someone is using Windows: keep this machine's screen on,
-                // the way real MWB does (it nudges the mouse and back).
-                if let Some(w) = wl.as_deref_mut() {
-                    w.move_relative(1.0, 0.0);
-                    w.move_relative(-1.0, 0.0);
+                // Someone is using Windows: keep this machine's screen on
+                // (see `keep_idle_off`), on the client connection only.
+                if wl.is_some() {
+                    keep_idle_off(&mut idle_inhibitor);
                 }
             }
             PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT | PACKAGE_TYPE_MACHINE_SWITCHED => {}

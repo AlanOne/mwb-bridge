@@ -804,8 +804,45 @@ pub fn lock_screen() {
 /// Tells macOS the user is active, the way input from a real keyboard
 /// would: the display wakes if it had dimmed or gone to sleep, and the idle
 /// timer (screen saver, display sleep) starts over. Nothing visible moves.
-/// For MWB's `Awake` package, sent while someone is using Windows.
-pub fn declare_user_activity() {
+/// With `unless_locked`, a locked screen is left alone (real MWB doesn't
+/// wake a machine whose desktop isn't the active one either). Runs on a
+/// thread of its own, at most one at a time, since it's a round trip to the
+/// power daemon that mustn't hold up input.
+pub fn declare_user_activity(unless_locked: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        if !(unless_locked && screen_locked()) {
+            declare_user_activity_now();
+        }
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Whether the login session's screen is locked.
+fn screen_locked() -> bool {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
+    }
+    // SAFETY: a Copy-rule dictionary, owned (and released) by the wrapper.
+    let dict = unsafe { CGSessionCopyCurrentDictionary() };
+    if dict.is_null() {
+        return false;
+    }
+    let dict: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(dict) };
+    dict.find(CFString::from_static_string("CGSSessionScreenIsLocked"))
+        .and_then(|v| v.downcast::<CFBoolean>())
+        .is_some_and(|b| b.into())
+}
+
+fn declare_user_activity_now() {
     use core_foundation::base::TCFType;
     use core_foundation::string::{CFString, CFStringRef};
     use std::sync::atomic::{AtomicU32, Ordering};

@@ -635,7 +635,7 @@ fn run_session(
                     // The display may be asleep: wake it for the user who
                     // just crossed over (the Mac itself is kept awake, see
                     // `power`).
-                    cg_input::declare_user_activity();
+                    cg_input::declare_user_activity(false);
                     LET_GO.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
                 if to_us
@@ -647,9 +647,11 @@ fn run_session(
             }
             PACKAGE_TYPE_AWAKE => {
                 // Someone is using Windows: keep this Mac's display awake,
-                // as real MWB keeps its machines' screens on.
+                // as real MWB keeps its machines' screens on, unless it's
+                // locked (as real MWB leaves a machine whose desktop isn't
+                // the active one alone).
                 if cg.is_some() {
-                    cg_input::declare_user_activity();
+                    cg_input::declare_user_activity(true);
                 }
             }
             PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT => {}

@@ -154,8 +154,10 @@ closing the lid with no external display always sleeps it.
 only, not yet live-tested): with "Block screen saver on other machines" on
 in PowerToys' Mouse Without Borders settings, Windows tells every machine
 about once a minute that someone is using it. The Mac then counts that as
-user activity (its display stays on, nothing moves), and Linux nudges the
-pointer a pixel and back, as real MWB does.
+user activity (its display stays on, nothing moves), and Linux holds a
+systemd idle inhibitor for the next 90 seconds, which Hyprland's idle
+daemon honors (nothing moves there either). A locked Mac or Linux session
+is left alone, so its screen can still go dark.
 
 **Wired over Wi-Fi**: when Windows answers on both an Ethernet cable and
 Wi-Fi (mDNS returns an address per interface), the bridge tries the wired

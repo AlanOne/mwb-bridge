@@ -623,13 +623,18 @@ understood makes it work.
 
 Sent to `ID.ALL` about once a minute (`frmScreen`'s timer,
 `Common.SendAwakeBeat`) while the sending PC's "Block screen saver on other
-machines" setting (`BlockScreenSaver`) is on and someone has used its real
+machines" setting (`BlockScreenSaver`) is on, its desktop is the active one
+(not the logon or screen saver desktop), and someone has used its real
 keyboard or mouse since the last one; otherwise a plain `Heartbeat` goes.
 A receiving MWB machine adds the sender to its pool and, if nothing local
-happened since, jiggles its own mouse a few pixels and back
-(`HumanBeingDetected`, `PokeMyself`). The Mac answers it with
-`IOPMAssertionDeclareUserActivity` (display awake, idle timer reset, no
-movement); Linux nudges its virtual pointer one pixel and back.
+happened since and its desktop is the active one, jiggles its own mouse a
+few pixels and back, up to ten times (`HumanBeingDetected`, `PokeMyself`).
+The Mac answers it with `IOPMAssertionDeclareUserActivity` (display awake,
+idle timer reset, no movement) on a thread of its own, unless the screen
+is locked (`CGSSessionScreenIsLocked`); Linux holds a systemd idle
+inhibitor for 90 seconds (hypridle honors those), unless hyprlock is
+running. Neither moves the pointer: a jiggle would fight relative mode's
+tracked cursor and a drag held across a switch.
 
 ### ClipboardAsk: the likely missing piece in the reverse direction
 
