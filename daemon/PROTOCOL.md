@@ -864,7 +864,9 @@ Mouse Without Borders would forward the press and release to the Mac,
 where they look like a drop of whatever is being dragged there (live-found
 2026-11-24, a quick bounce back to the Mac). The files are saved to the
 desktop then, and a release still owed is injected at the next
-`INACTIVE`. Windows is in control by then, so
+`INACTIVE`. (The whole-desktop source window and stopping a bounced
+drag's transfer were live-tested 2026-11-24; the no-press-while-the-Mac-
+has-control guard is type-checked only, as that race didn't recur.) Windows is in control by then, so
 injecting is safe: the companion puts a nearly invisible window over the
 whole desktop (a small one at the cursor missed: the cursor is often still
 moving fast from the crossing, and the press lands wherever it is by the

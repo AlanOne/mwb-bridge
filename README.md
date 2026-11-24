@@ -220,7 +220,8 @@ since PowerToys only reports single-file drags.
   window, the Desktop, a chat app's attachment area...), live-tested
   2026-11-23, including going back to Windows mid-drag, which cancels it
   cleanly (and, through the companion, stops the files' transfer then
-  rather than fetching the rest only to delete it; not yet live-tested). As soon as the drag reaches the Mac the file starts
+  rather than fetching the rest only to delete it; live-tested
+  2026-11-24). As soon as the drag reaches the Mac the file starts
   downloading and a real macOS drag of it is started under the cursor (see
   `daemon/macos/src/drag_source.rs`). Letting go just before the files have
   arrived holds the drop (the cursor stays put) for up to a second; if
@@ -273,7 +274,7 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
   progress on both machines, in the Mac's menu bar (the percentage next
   to the icon, and a line such as "Sending to Windows: 120 MB of 260 MB
   (46%)" in its menu) and in the companion's tray: its icon turns into the
-  percentage with a bar under it (not yet live-tested), and its menu and
+  percentage with a bar under it (live-tested 2026-11-24), and its menu and
   tooltip say the same as the Mac's. Both
   menus then have "Cancel Transfer", which stops it on both sides: a drag
   of it ends without a drop, a copy never reaches the clipboard, and the
