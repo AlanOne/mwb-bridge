@@ -42,7 +42,7 @@ sealed class TrayContext : ApplicationContext
         Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnPreferenceChanged;
 
         var coordinator = new Coordinator(_ui);
-        new Server(config, coordinator, SetStatus).Start();
+        new Server(config, coordinator, SetStatus, Warn).Start();
         _clipboard = new ClipboardWatcher(coordinator.OnClipboardChanged);
 
         if (Config.MwbTransferFileOn())
@@ -88,6 +88,12 @@ sealed class TrayContext : ApplicationContext
     {
         if (disposing) Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnPreferenceChanged;
         base.Dispose(disposing);
+    }
+
+    /// A setup problem worth a balloon, not just a log line.
+    void Warn(string message)
+    {
+        _ui.BeginInvoke(() => _tray.ShowBalloonTip(15000, "MWB Bridge Companion", message, ToolTipIcon.Warning));
     }
 
     void SetStatus(string? bridge)

@@ -278,7 +278,11 @@ Setup:
    versioned protocol. Either side still works with the other's previous
    version, and the companion's log says when the two differ.
 3. The Mac bridge finds the companion by itself on the PC it's connected
-   to. Without one it uses PowerToys' own drag-and-drop, as above.
+   to. Without one it uses PowerToys' own drag-and-drop, as above. When
+   the bridge connects, the companion also checks that it's in both of
+   Mouse Without Borders' lists (`MachineMatrixString` and `MachinePool`,
+   see "On the Windows side" below) and shows a warning once if it isn't
+   (type-checked and unit-tested only, not yet live-tested).
 
 The log is `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log` (also under
 the tray icon's menu: the same two-headed arrow as the Mac's menu bar

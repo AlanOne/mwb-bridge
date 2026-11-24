@@ -10,14 +10,19 @@ sealed class Server
     readonly Config _config;
     readonly Coordinator _coordinator;
     readonly Action<string?> _status;
+    readonly Action<string> _warn;
+    // Bridges already warned about, so a reconnecting bridge doesn't warn
+    // again each time.
+    readonly HashSet<string> _warned = new(StringComparer.OrdinalIgnoreCase);
     FrameConnection? _control;
     readonly object _controlLock = new();
 
-    public Server(Config config, Coordinator coordinator, Action<string?> status)
+    public Server(Config config, Coordinator coordinator, Action<string?> status, Action<string> warn)
     {
         _config = config;
         _coordinator = coordinator;
         _status = status;
+        _warn = warn;
         coordinator.SendToBridge = Send;
         coordinator.BridgeConnected = () => { lock (_controlLock) return _control != null; };
     }
@@ -138,6 +143,13 @@ sealed class Server
         }
         Log.Write($"Bridge {hello.Name} connected from {peer}.");
         _status(hello.Name);
+        if (Config.MwbSetupProblem(hello.Name) is string problem)
+        {
+            Log.Write(problem);
+            bool first;
+            lock (_warned) first = _warned.Add(hello.Name);
+            if (first) _warn(problem);
+        }
         try
         {
             while (true)

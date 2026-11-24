@@ -51,6 +51,21 @@ sealed class Config
     /// file") is on. It catches the same drags this app does, so the two fight.
     public static bool MwbTransferFileOn() => MwbProperty("TransferFile")?.GetBoolean() == true;
 
+    /// What's missing for the bridge `name` in Mouse Without Borders' own
+    /// settings (see SetupCheck), or null if nothing is or it can't tell.
+    public static string? MwbSetupProblem(string name)
+    {
+        try
+        {
+            var props = JsonDocument.Parse(File.ReadAllText(MwbSettingsPath)).RootElement.GetProperty("properties");
+            return SetupCheck.Problem(props, name);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// A `properties.<name>.value` from Mouse Without Borders' settings.
     static JsonElement? MwbProperty(string name)
     {

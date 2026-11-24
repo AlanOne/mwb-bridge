@@ -73,4 +73,11 @@ Check(laidOut.SequenceEqual(new[] { $"photos{sep}2026{sep}a.jpg", $"photos{sep}b
 Check(topLevel.SequenceEqual(new[] { "photos", "photos (2)", "evil.txt", "x" }), "only top-level items are handed on");
 Directory.Delete(dir, recursive: true);
 
+// Setup check: the bridge has to be in both of PowerToys' lists.
+System.Text.Json.JsonElement Props(string json) => System.Text.Json.JsonDocument.Parse(json).RootElement;
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "Alan-Mac") == null, "a bridge in both lists is set up (names ignore case)");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":{\"value\":[\"WINPC\",\"\",\"\",\"\"]},\"MachinePool\":{\"value\":\"WINPC:1,alan-mac:2,:,:\"}}"), "alan-mac")!.Contains("MachineMatrixString"), "missing from the layout is reported");
+Check(SetupCheck.Problem(Props("{\"MachineMatrixString\":[\"alan-mac\",\"WINPC\",\"\",\"\"],\"MachinePool\":{\"value\":\"WINPC:1,:,:,:\"}}"), "alan-mac")!.Contains("MachinePool"), "missing from the pool is reported");
+Check(SetupCheck.Problem(Props("{}"), "alan-mac") == null, "settings it can't read don't produce a false alarm");
+
 return failures == 0 ? 0 : 1;
