@@ -692,16 +692,16 @@ pub(crate) fn safe_file_name(windows_path: &str) -> String {
 /// server connection whose handshake is done.
 /// With `current` set, it stops (an error, the connection then dropped)
 /// once the clipboard moves past that generation.
-fn send_item(stream: &mut TcpStream, cipher: &CbcState, chain: &mut [u8; 16], (path, name): &Item, current: Option<u64>) -> std::io::Result<()> {
-    use std::io::Write;
+fn send_item(out: &mut impl std::io::Write, cipher: &CbcState, chain: &mut [u8; 16], (path, name): &Item, current: Option<u64>) -> std::io::Result<()> {
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len() as usize;
-    let mut body = WhileCurrent { inner: std::io::BufReader::new(&mut file), generation: current };
     // Not even the header for content that's already stale.
-    body.read(&mut [])?;
+    if superseded(current) {
+        return Err(superseded_error());
+    }
     let header = build_file_header(size, name);
-    stream.write_all(&cipher.encrypt(chain, &header))?;
-    write_padded_body(stream, cipher, chain, &mut body, size)?;
+    out.write_all(&cipher.encrypt(chain, &header))?;
+    write_padded_body(out, cipher, chain, &mut std::io::BufReader::new(&mut file), size)?;
     println!("[big-send] Sent {name:?} ({size} bytes) to Windows.");
     Ok(())
 }
@@ -796,20 +796,48 @@ pub fn set_pending_drag(shared: &ClipboardShared, outbound: Outbound) {
     PENDING_GENERATION.store(u64::MAX, Ordering::SeqCst);
 }
 
-/// Reads `inner`, failing once the clipboard has moved past `generation`.
-struct WhileCurrent<R> {
-    inner: R,
+/// Whether clipboard content of `generation` has been replaced by a newer
+/// copy (never, for `None`: a drag's files).
+fn superseded(generation: Option<u64>) -> bool {
+    generation.is_some_and(|g| CLIPBOARD_GENERATION.load(Ordering::SeqCst) != g)
+}
+
+fn superseded_error() -> std::io::Error {
+    std::io::Error::other("a newer copy replaced it")
+}
+
+/// Writes to `inner` in pieces of at most 64KB, failing before any piece
+/// once the clipboard has moved past `generation`: so a push of stale
+/// content stops within one piece, even when the last of it was already
+/// read from disk.
+struct WhileCurrent<W> {
+    inner: W,
     generation: Option<u64>,
 }
 
-impl<R: Read> Read for WhileCurrent<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(generation) = self.generation
-            && CLIPBOARD_GENERATION.load(Ordering::SeqCst) != generation
-        {
-            return Err(std::io::Error::other("a newer copy replaced it"));
+impl<W: std::io::Write> std::io::Write for WhileCurrent<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if superseded(self.generation) {
+            return Err(superseded_error());
         }
-        self.inner.read(buf)
+        self.inner.write(&buf[..buf.len().min(64 * 1024)])
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Ends a connection with a reset rather than a close: Windows then gets a
+/// read error, which it only logs, instead of an end of data, after which
+/// it would apply a complete body (stale content over a newer copy) or
+/// show an error toast for a short one.
+fn reset(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    // SAFETY: a live socket and a correctly sized linger struct.
+    unsafe {
+        libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER, &linger as *const _ as *const libc::c_void, std::mem::size_of::<libc::linger>() as libc::socklen_t);
     }
 }
 
@@ -839,7 +867,14 @@ fn push_item(cfg: &Config, addr: SocketAddr, post_action: u32, item: &Item, curr
     stream.read_exact(&mut peer_hs_ct)?;
     let _peer_hs = cipher.decrypt(&mut read_chain, &peer_hs_ct);
 
-    send_item(&mut stream, &cipher, &mut write_chain, item, current)?;
+    let sent = send_item(&mut WhileCurrent { inner: &mut stream, generation: current }, &cipher, &mut write_chain, item, current);
+    // Superseded while (or just after) sending: reset rather than close, so
+    // Windows doesn't apply it, or toast about a short one.
+    if superseded(current) {
+        reset(&stream);
+        return Err(superseded_error());
+    }
+    sent?;
     // Windows keeps reading past the file's size until we close our side,
     // then saves the file and closes its side: wait for that, so the next
     // transfer doesn't arrive while this one is still being saved.
@@ -964,18 +999,22 @@ mod push_tests {
 #[cfg(test)]
 mod generation_tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn a_clipboard_push_stops_once_something_newer_is_copied() {
         let generation = CLIPBOARD_GENERATION.load(Ordering::SeqCst);
-        let mut body = WhileCurrent { inner: &[1u8, 2, 3][..], generation: Some(generation) };
-        let mut buf = [0u8; 1];
-        assert_eq!(body.read(&mut buf).unwrap(), 1);
+        let mut sink = Vec::new();
+        let mut out = WhileCurrent { inner: &mut sink, generation: Some(generation) };
+        out.write_all(&[1u8; 100_000]).unwrap();
         copied();
-        assert!(body.read(&mut buf).is_err());
+        assert!(out.write(&[1u8]).is_err());
+        assert!(superseded(Some(generation)));
+        assert_eq!(sink.len(), 100_000);
         // A drag's file (no generation) goes regardless.
-        let mut drag = WhileCurrent { inner: &[1u8][..], generation: None };
-        assert_eq!(drag.read(&mut buf).unwrap(), 1);
+        let mut drag = WhileCurrent { inner: Vec::new(), generation: None };
+        assert_eq!(drag.write(&[1u8]).unwrap(), 1);
+        assert!(!superseded(None));
     }
 }
 
