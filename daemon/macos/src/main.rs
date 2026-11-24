@@ -626,6 +626,13 @@ fn run_session(
                     link.send_empty(mwb_protocol::companion::ACTIVE);
                 }
             }
+            PACKAGE_TYPE_AWAKE => {
+                // Someone is using Windows: keep this Mac's display awake,
+                // as real MWB keeps its machines' screens on.
+                if cg.is_some() {
+                    cg_input::declare_user_activity();
+                }
+            }
             PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT => {}
             _ => {
                 if unhandled_seen.insert(package_type) {

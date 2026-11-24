@@ -795,6 +795,14 @@ fn run_session(
                     println!("[{role}] (Hi liveness pings received so far: {hi_count})");
                 }
             }
+            PACKAGE_TYPE_AWAKE => {
+                // Someone is using Windows: keep this machine's screen on,
+                // the way real MWB does (it nudges the mouse and back).
+                if let Some(w) = wl.as_deref_mut() {
+                    w.move_relative(1.0, 0.0);
+                    w.move_relative(-1.0, 0.0);
+                }
+            }
             PACKAGE_TYPE_HELLO | PACKAGE_TYPE_BYEBYE | PACKAGE_TYPE_HEARTBEAT | PACKAGE_TYPE_MACHINE_SWITCHED => {}
             _ => {}
         }

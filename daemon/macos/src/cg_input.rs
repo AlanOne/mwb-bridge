@@ -835,3 +835,29 @@ fn post_media_key(media_key: i64, pressed: bool) {
         }
     });
 }
+
+/// Tells macOS the user is active, the way input from a real keyboard
+/// would: the display wakes if it had dimmed or gone to sleep, and the idle
+/// timer (screen saver, display sleep) starts over. Nothing visible moves.
+/// For MWB's `Awake` package, sent while someone is using Windows.
+pub fn declare_user_activity() {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPMAssertionDeclareUserActivity(name: CFStringRef, user_type: u32, assertion_id: *mut u32) -> i32;
+    }
+    const USER_ACTIVE_LOCAL: u32 = 0;
+    // Reusing the assertion each time updates it instead of piling up new ones.
+    static ASSERTION: AtomicU32 = AtomicU32::new(0);
+    let name = CFString::new("Mouse Without Borders: someone is using Windows");
+    let mut id = ASSERTION.load(Ordering::Relaxed);
+    // SAFETY: a valid CFString and a pointer to a u32 for the assertion ID.
+    let result = unsafe { IOPMAssertionDeclareUserActivity(name.as_concrete_TypeRef(), USER_ACTIVE_LOCAL, &mut id) };
+    if result == 0 {
+        ASSERTION.store(id, Ordering::Relaxed);
+    } else {
+        eprintln!("(cg_input: couldn't declare user activity: IOKit error {result:#x})");
+    }
+}

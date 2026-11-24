@@ -619,6 +619,18 @@ left in place since it's verified correct and harmless, in case a future
 PowerToys version, a different network topology, or something not yet
 understood makes it work.
 
+### Awake (Type=21)
+
+Sent to `ID.ALL` about once a minute (`frmScreen`'s timer,
+`Common.SendAwakeBeat`) while the sending PC's "Block screen saver on other
+machines" setting (`BlockScreenSaver`) is on and someone has used its real
+keyboard or mouse since the last one; otherwise a plain `Heartbeat` goes.
+A receiving MWB machine adds the sender to its pool and, if nothing local
+happened since, jiggles its own mouse a few pixels and back
+(`HumanBeingDetected`, `PokeMyself`). The Mac answers it with
+`IOPMAssertionDeclareUserActivity` (display awake, idle timer reset, no
+movement); Linux nudges its virtual pointer one pixel and back.
+
 ### ClipboardAsk: the likely missing piece in the reverse direction
 
 Found 2026-11-23 by reading the PowerToys source again (`main`, after

@@ -18,6 +18,12 @@ pub const PACKAGE_TYPE_HI: u8 = 2;
 pub const PACKAGE_TYPE_HELLO: u8 = 3;
 pub const PACKAGE_TYPE_BYEBYE: u8 = 4;
 pub const PACKAGE_TYPE_HEARTBEAT: u8 = 20;
+// Sent to every machine about once a minute while someone is using the
+// sending PC, when its "Block screen saver on other machines" setting is on
+// (Common.SendAwakeBeat). Real MWB treats it as user activity
+// (HumanBeingDetected), so the screen of a machine nobody is touching
+// directly stays on.
+pub const PACKAGE_TYPE_AWAKE: u8 = 21;
 pub const PACKAGE_TYPE_KEYBOARD: u8 = 122;
 pub const PACKAGE_TYPE_MOUSE: u8 = 123;
 pub const PACKAGE_TYPE_HANDSHAKE: u8 = 126;

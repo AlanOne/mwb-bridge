@@ -140,6 +140,13 @@ everything but the handshake until Windows has answered the handshake
 challenge, so a replayed or redirected connection can't inject input, and
 the Linux build no longer logs every key and mouse packet to the journal.
 
+**Screen stays on while you use Windows** (both builds, type-checked
+only, not yet live-tested): with "Block screen saver on other machines" on
+in PowerToys' Mouse Without Borders settings, Windows tells every machine
+about once a minute that someone is using it. The Mac then counts that as
+user activity (its display stays on, nothing moves), and Linux nudges the
+pointer a pixel and back, as real MWB does.
+
 **Wired over Wi-Fi**: when Windows answers on both an Ethernet cable and
 Wi-Fi (mDNS returns an address per interface), the bridge tries the wired
 addresses first, and a connection that ended up on Wi-Fi moves to the
