@@ -162,6 +162,7 @@ pub fn evdev_to_cgkeycode(evdev: u32) -> Option<u16> {
         99 => 0x69,  // KEY_SYSRQ (Print Screen) -> F13
         70 => 0x6B,  // KEY_SCROLLLOCK -> F14
         119 => 0x71, // KEY_PAUSE -> F15
+        127 => 0x6E, // KEY_COMPOSE (the PC menu key) -> kVK_ContextualMenu
 
         _ => return None,
     })

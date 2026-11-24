@@ -449,8 +449,8 @@ track work as an Apple keyboard's do (holding a volume key keeps going),
 F13-F20 (F13-F24 on Linux) arrive as themselves, and Print Screen, Scroll
 Lock and Pause arrive as F13-F15, where an Apple extended keyboard has
 them (Print Screen takes a screenshot instead with Windows-style keys on).
-On Linux the menu key and media Stop work too; the Mac has no counterpart
-for either.
+The menu key arrives as the Mac's contextual-menu key. Media Stop works on
+Linux; the Mac has no counterpart for it.
 
 For quick iteration without the full install (no autostart, no bundle):
 
