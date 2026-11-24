@@ -208,6 +208,12 @@ and the companion link's missing MAC and freshness.
 - Not done: trying candidate addresses in parallel (the wired-first ordering in `route.rs` would need rethinking), and a single mutex around encrypt-and-write for sends from other threads (Phase 1's 50ms tick already keeps queued sends prompt).
 
 ### Phase 5: features
+**Built** (each feature Grok-reviewed and its findings fixed; no final
+whole-phase review yet). Live-tested 2026-11-24: progress on the Mac and
+big transfers both ways; the freeze that test found (a drop held for up to
+3s) is fixed. Not yet live-tested: cancel, Windows-side progress, folders,
+media keys, keep-awake, self-registration, the settings window and the
+setup check.
 In order: full-size images, folders, progress and cancel, the companion setup check, media keys, keep-awake, self-registration (careful: it rewrites the matrix on first registration), the Mac settings panel. Paste-time transfer and an authenticated companion cipher come after.
 
 ### Phase 6: Linux parity
