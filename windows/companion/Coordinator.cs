@@ -32,6 +32,10 @@ sealed class Coordinator
 
     // Mac -> Windows state.
     IncomingDrop? _pendingSource; // waiting for the simulated press to land
+    // When EndLeftoverDrag released Windows' leftover drag, until it has
+    // ended on the catcher: a drag started here meanwhile waits for that.
+    DateTime? _endingLeftoverSince;
+    static readonly TimeSpan LeftoverEndWait = TimeSpan.FromMilliseconds(500);
 
     public Coordinator(Control ui)
     {
@@ -45,6 +49,7 @@ sealed class Coordinator
         _catcher.Dropped += () =>
         {
             Log.Write("[to-mac] The leftover Windows drag ended on the catcher.");
+            _endingLeftoverSince = null;
             if (_catching) _leftoverEnded = true;
         };
         // Mouse Without Borders keeps its own small topmost window at the
@@ -185,6 +190,7 @@ sealed class Coordinator
         // needs it.
         _catcher.ShowOver(SystemInformation.VirtualScreen);
         Native.LeftButton(down: false);
+        _endingLeftoverSince = DateTime.UtcNow;
         _catching = _caughtDrag = _offered = _leftoverEnded = false;
         var session = ++_catchSession;
         After(300, () =>
@@ -301,7 +307,34 @@ sealed class Coordinator
         return drop;
     }
 
-    public void OnOfferToWindows(IncomingDrop drop)
+    public void OnOfferToWindows(IncomingDrop drop) => StartWhenLeftoverEnded(drop, waiting: false);
+
+    /// A drag from the Mac usually arrives right as Windows' leftover drag
+    /// (one that went to the Mac before) is being ended: until that drag
+    /// has ended, a press goes to it rather than to the source window, and
+    /// the new drag never starts (live-found 2026-11-24). So wait for it,
+    /// briefly.
+    void StartWhenLeftoverEnded(IncomingDrop drop, bool waiting)
+    {
+        if (drop.Cancelled) return;
+        if (_endingLeftoverSince is DateTime since && DateTime.UtcNow - since < LeftoverEndWait)
+        {
+            if (!waiting) Log.Write($"[to-windows] Drag {drop.Id}: waiting for the leftover Windows drag to end first.");
+            After(30, () => StartWhenLeftoverEnded(drop, waiting: true));
+            return;
+        }
+        _endingLeftoverSince = null;
+        // Windows has control: no catch needs the catcher, and over the
+        // whole desktop it could take the press meant for the source.
+        if (!_catching)
+        {
+            _raise.Stop();
+            _catcher.Hide();
+        }
+        StartSourceDrag(drop);
+    }
+
+    void StartSourceDrag(IncomingDrop drop)
     {
         Log.Write($"[to-windows] Drag {drop.Id}: {drop.Paths.Length} file(s) from the bridge, starting a drag here.");
         Log.Write($"[to-windows] Cursor at {Cursor.Position}, left button {(Native.LeftButtonDown() ? "down" : "up")} as Windows sees it.");

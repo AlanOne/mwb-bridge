@@ -271,7 +271,9 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
 - **Progress and cancel** (live-tested both ways 2026-11-24 with 500 MB): a transfer that takes more than a second shows its
   progress on both machines, in the Mac's menu bar (the percentage next
   to the icon, and a line such as "Sending to Windows: 120 MB of 260 MB
-  (46%)" in its menu) and in the companion's tray menu and tooltip. Both
+  (46%)" in its menu) and in the companion's tray: its icon turns into the
+  percentage with a bar under it (not yet live-tested), and its menu and
+  tooltip say the same as the Mac's. Both
   menus then have "Cancel Transfer", which stops it on both sides: a drag
   of it ends without a drop, a copy never reaches the clipboard, and the
   part that arrived is deleted.

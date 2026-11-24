@@ -31,6 +31,9 @@ sealed class TrayContext : ApplicationContext
     readonly ToolStripMenuItem _transferItem = new("") { Enabled = false, Available = false };
     readonly ToolStripMenuItem _cancelItem = new("Cancel transfer") { Available = false };
     readonly System.Windows.Forms.Timer _progressTimer = new() { Interval = 500 };
+    // The percentage the tray icon shows while a transfer runs (-1: the
+    // usual icon is up).
+    int _iconPercent = -1;
     string? _bridge;
     readonly Control _ui = new();
     ClipboardWatcher? _clipboard;
@@ -92,7 +95,49 @@ sealed class TrayContext : ApplicationContext
             var old = _tray.Icon;
             _tray.Icon = TrayIcon(light);
             old?.Dispose();
+            _iconPercent = -1; // a percentage icon is redrawn next tick
         });
+    }
+
+    void SetTrayIcon(Icon icon, int percent)
+    {
+        var old = _tray.Icon;
+        _tray.Icon = icon;
+        old?.Dispose();
+        _iconPercent = percent;
+    }
+
+    /// `percent` drawn at the tray's icon size, with a bar along the bottom
+    /// filled that far: black on a light taskbar, white on a dark one.
+    static Icon PercentIcon(int percent, bool light)
+    {
+        var size = SystemInformation.SmallIconSize;
+        using var bitmap = new Bitmap(size.Width, size.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bitmap))
+        {
+            g.Clear(Color.Transparent);
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            var ink = light ? Color.Black : Color.White;
+            var bar = Math.Max(2, size.Height / 8);
+            var text = percent.ToString();
+            using var font = new Font("Segoe UI", size.Height * (text.Length > 1 ? 0.6f : 0.7f), FontStyle.Bold, GraphicsUnit.Pixel);
+            using var brush = new SolidBrush(ink);
+            using var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString(text, font, brush, new RectangleF(-1, -1, size.Width + 2, size.Height - bar), format);
+            using var track = new SolidBrush(Color.FromArgb(80, ink));
+            g.FillRectangle(track, 0, size.Height - bar, size.Width, bar);
+            g.FillRectangle(brush, 0, size.Height - bar, size.Width * percent / 100f, bar);
+        }
+        var handle = bitmap.GetHicon();
+        try
+        {
+            using var borrowed = Icon.FromHandle(handle);
+            return (Icon)borrowed.Clone(); // owns a copy of the handle
+        }
+        finally
+        {
+            Native.DestroyIcon(handle);
+        }
     }
 
     protected override void Dispose(bool disposing)
@@ -119,8 +164,9 @@ sealed class TrayContext : ApplicationContext
 
     string TrayText() => _bridge == null ? "MWB Bridge Companion: waiting" : $"MWB Bridge Companion: {_bridge}";
 
-    /// The running transfers' line and "Cancel transfer" in the menu, and
-    /// their percentage in the tooltip.
+    /// The running transfers' line and "Cancel transfer" in the menu, their
+    /// percentage as the tray icon (as the Mac shows it next to its menu bar
+    /// icon), and in the tooltip.
     void ShowProgress()
     {
         var progress = Transfers.ProgressLine(_bridge ?? "the bridge");
@@ -130,10 +176,12 @@ sealed class TrayContext : ApplicationContext
             _transferItem.Text = line;
             var tip = $"MWB Bridge Companion: {(Transfers.Snapshot().All(t => t.Sending) ? "sending" : "receiving")} {pct}%";
             if (_tray.Text != tip) _tray.Text = tip;
+            if (pct != _iconPercent) SetTrayIcon(PercentIcon(pct, _lightTaskbar), pct);
         }
-        else if (_transferItem.Available)
+        else if (_transferItem.Available || _iconPercent >= 0)
         {
             _tray.Text = TrayText();
+            if (_iconPercent >= 0) SetTrayIcon(TrayIcon(_lightTaskbar), -1);
         }
         if (_transferItem.Available != shown)
         {

@@ -852,7 +852,12 @@ live.
 
 **Mac -> Windows.** On `HideMouse` with the left button held and a file
 drag on the drag pasteboard, the Mac cancels its drag (Escape), sends
-`OFFER_TO_WINDOWS` and the files. Windows is in control by then, so
+`OFFER_TO_WINDOWS` and the files. That often comes right as the companion
+is ending Windows' leftover drag from an earlier Windows -> Mac drag; a
+press injected before that drag has ended goes to it, not the source
+window, and the new drag never starts (live-found 2026-11-24), so the
+companion waits up to 500ms for it to end on the catcher, and hides the
+catcher, before pressing. Windows is in control by then, so
 injecting is safe: the companion puts a small window under the cursor and
 presses the left button on it (Windows didn't see the real press, made
 while the Mac had control), and turns that into a real `DoDragDrop` of
