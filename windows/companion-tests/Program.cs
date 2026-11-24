@@ -50,13 +50,27 @@ Directory.CreateDirectory(dir);
 var big = Enumerable.Range(0, Frames.ChunkSize + 1000).Select(i => (byte)(i % 251)).ToArray();
 File.WriteAllBytes(Path.Combine(dir, "big.bin"), big);
 File.WriteAllBytes(Path.Combine(dir, "empty.txt"), Array.Empty<byte>());
-var sent = Task.Run(() => client.SendFiles(new[] { Path.Combine(dir, "big.bin"), Path.Combine(dir, "empty.txt") }));
+var sent = Task.Run(() => client.SendFiles(new[] { (Path.Combine(dir, "big.bin"), "big.bin"), (Path.Combine(dir, "empty.txt"), "empty.txt") }));
 var done = new List<int>();
 server.ReceiveFiles(h => Path.Combine(dir, "got-" + h.Name), done.Add);
 await sent;
 Check(File.ReadAllBytes(Path.Combine(dir, "got-big.bin")).SequenceEqual(big), "a file bigger than a chunk arrives intact");
 Check(File.Exists(Path.Combine(dir, "got-empty.txt")) && new FileInfo(Path.Combine(dir, "got-empty.txt")).Length == 0, "an empty file arrives");
 Check(done.SequenceEqual(new[] { 0, 1 }), "each file is reported done, in order");
+
+// Folders: offered as their files with relative names, rebuilt on arrival.
+Directory.CreateDirectory(Path.Combine(dir, "photos", "2026"));
+Directory.CreateDirectory(Path.Combine(dir, "photos", "empty"));
+File.WriteAllBytes(Path.Combine(dir, "photos", "b.jpg"), new byte[] { 1 });
+File.WriteAllBytes(Path.Combine(dir, "photos", "2026", "a.jpg"), new byte[] { 2 });
+var skippedItems = new List<string>();
+var expanded = Names.Expand(new[] { Path.Combine(dir, "photos"), Path.Combine(dir, "big.bin"), Path.Combine(dir, "missing") }, skippedItems.Add);
+Check(expanded.Select(e => e.Name).SequenceEqual(new[] { "photos/2026/a.jpg", "photos/b.jpg", "big.bin" }), "a folder is offered as its files, by path from the folder");
+Check(skippedItems.SequenceEqual(new[] { Path.Combine(dir, "missing") }), "what can't be read is reported, not offered");
+var (laidOut, topLevel) = Names.Layout(new[] { "photos/2026/a.jpg", "photos/b.jpg", "photos", "../evil.txt", "photos/2026/a.jpg", "x/y:z.txt" });
+var sep = Path.DirectorySeparatorChar;
+Check(laidOut.SequenceEqual(new[] { $"photos{sep}2026{sep}a.jpg", $"photos{sep}b.jpg", "photos (2)", "evil.txt", $"photos{sep}2026{sep}a (2).jpg", $"x{sep}y_z.txt" }), "folders are rebuilt safely, without climbing out");
+Check(topLevel.SequenceEqual(new[] { "photos", "photos (2)", "evil.txt", "x" }), "only top-level items are handed on");
 Directory.Delete(dir, recursive: true);
 
 return failures == 0 ? 0 : 1;

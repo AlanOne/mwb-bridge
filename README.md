@@ -233,7 +233,12 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
   files copied in Explorer land on the Mac's clipboard, and
   files copied in Finder on Windows' clipboard, all of them, as soon as
   they've arrived. PowerToys only sends one file per copy, up to 100MB.
-- No size limit per file; folders still aren't supported (zip them).
+- No size limit per file.
+- **Folders** go through it too, both ways, dragged or copied (type-checked
+  and unit-tested only, not yet live-tested): each folder arrives whole,
+  with its subfolders, and the drop or paste hands on the folder itself.
+  Empty folders inside aren't carried. Without the companion, folders
+  still aren't supported (zip them), as with PowerToys itself.
 
 Setup:
 1. Untick "Transfer copied files to the remote machine's clipboard" under

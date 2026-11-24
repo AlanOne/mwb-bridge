@@ -264,14 +264,10 @@ fn run_session(
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
                 }
                 Some(ClipboardEvent::Files(paths)) if companion::link().is_some_and(|l| l.is_connected()) && {
-                    // The companion takes every file, of any size. If the
-                    // offer can't be sent (the link just died), the copy
-                    // goes the PowerToys way below instead.
-                    let files: Vec<_> = paths.iter().filter(|p| p.is_file()).cloned().collect();
-                    for path in paths.iter().filter(|p| !p.is_file()) {
-                        println!("{} [file-copy] Not sending {} to Windows: folders aren't supported, zip it first.", timestamp(), path.display());
-                    }
-                    files.is_empty() || companion::link().unwrap().offer_files(mwb_protocol::companion::CLIPBOARD_TO_WINDOWS, files, "copy")
+                    // The companion takes every file, of any size, and
+                    // folders. If the offer can't be sent (the link just
+                    // died), the copy goes the PowerToys way below instead.
+                    companion::link().unwrap().offer_files(mwb_protocol::companion::CLIPBOARD_TO_WINDOWS, paths.clone(), "copy")
                 } => {}
                 Some(ClipboardEvent::Files(paths)) => {
                     let (files, skipped) = drag_out::split_sendable(paths);
@@ -697,14 +693,8 @@ fn offer_to_companion(link: &std::sync::Arc<companion::Link>, cg: &mut CgInput, 
     if dragged.is_empty() {
         return;
     }
-    let (files, skipped): (Vec<_>, Vec<_>) = dragged.into_iter().partition(|p| p.is_file());
-    for path in &skipped {
-        println!("{} [drag-out] Not sending {} to Windows: folders aren't supported, zip it first.", timestamp(), path.display());
-    }
     cg.cancel_drag();
-    if !files.is_empty() {
-        link.offer_files(mwb_protocol::companion::OFFER_TO_WINDOWS, files, "drag");
-    }
+    link.offer_files(mwb_protocol::companion::OFFER_TO_WINDOWS, dragged, "drag");
 }
 
 fn run_client(

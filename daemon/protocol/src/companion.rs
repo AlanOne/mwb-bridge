@@ -27,7 +27,9 @@ pub const COMPANION_PORT: u16 = 15102;
 /// Sent in `Hello`, so the companion can tell when the bridge is from a
 /// different version of this repo. 2: `Inactive` carries `drag_over` and
 /// `let_go` (version 1, sent as no version at all, had only `button_held`).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 3: an offer's file names can be relative paths (`folder/sub/a.txt`,
+/// always `/`), so folders carry across; an older receiver flattens them.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// First frame on every connection.
 pub const HELLO: u32 = 1;
@@ -213,6 +215,67 @@ impl<S: Read> FrameReader<S> {
     }
 }
 
+/// The files to offer for `paths` (files and folders, as dragged or
+/// copied), each with the name it's offered under: a file's own name, or
+/// for a file inside a folder its path from that folder down
+/// (`folder/sub/a.txt`). Folders are walked in name order; symbolic links
+/// to folders aren't followed (they could loop), and empty folders carry
+/// nothing, so they don't arrive. Also returns what couldn't be read.
+pub fn expand_offer_paths(paths: &[std::path::PathBuf]) -> (Vec<(std::path::PathBuf, String)>, Vec<std::path::PathBuf>) {
+    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(std::path::PathBuf, String)>, skipped: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            skipped.push(dir.to_path_buf());
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for path in entries {
+            let name = format!("{prefix}/{}", path.file_name().unwrap_or_default().to_string_lossy());
+            let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+            match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => out.push((path, name)),
+                Ok(m) if m.is_dir() && !is_link => walk(&path, &name, out, skipped),
+                _ => skipped.push(path),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut skipped = Vec::new();
+    for path in paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => out.push((path.clone(), name)),
+            Ok(m) if m.is_dir() => walk(path, &name, &mut out, &mut skipped),
+            _ => skipped.push(path.clone()),
+        }
+    }
+    (out, skipped)
+}
+
+/// An offered name's path parts, for a receiver to rebuild it under its
+/// own folder: split on `/` (and `\\`), with empty, `.` and `..` parts
+/// dropped so nothing can land outside that folder. Never empty.
+pub fn name_parts(name: &str) -> Vec<&str> {
+    let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != "." && *p != "..").collect();
+    if parts.is_empty() { vec!["file"] } else { parts }
+}
+
+/// How many top-level items an offer rebuilds into: each loose file, plus
+/// one folder per distinct folder name its other files are inside.
+pub fn top_level_count(offer: &Offer) -> usize {
+    let mut folders = std::collections::HashSet::new();
+    let mut loose = 0;
+    for file in &offer.files {
+        let parts = name_parts(&file.name);
+        if parts.len() > 1 {
+            folders.insert(parts[0]);
+        } else {
+            loose += 1;
+        }
+    }
+    loose + folders.len()
+}
+
 /// Sends files over a data connection whose `HELLO` is done: per file a
 /// header, its bytes, an end, then `DONE`.
 pub fn send_files<S: Write>(writer: &mut FrameWriter<S>, files: &[(std::path::PathBuf, String)]) -> std::io::Result<()> {
@@ -291,6 +354,42 @@ mod tests {
     }
 
     #[test]
+    fn folders_expand_to_their_files_with_relative_names() {
+        let root = std::env::temp_dir().join(format!("mwb-expand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("photos/2026")).unwrap();
+        std::fs::create_dir_all(root.join("photos/empty")).unwrap();
+        std::fs::write(root.join("photos/b.jpg"), b"b").unwrap();
+        std::fs::write(root.join("photos/2026/a.jpg"), b"a").unwrap();
+        std::fs::write(root.join("notes.txt"), b"n").unwrap();
+        std::os::unix::fs::symlink(root.join("photos"), root.join("photos/loop")).unwrap();
+        let (files, skipped) = expand_offer_paths(&[root.join("photos"), root.join("notes.txt"), root.join("missing")]);
+        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, vec!["photos/2026/a.jpg", "photos/b.jpg", "notes.txt"]);
+        assert_eq!(files[0].0, root.join("photos/2026/a.jpg"));
+        assert_eq!(skipped, vec![root.join("photos/loop"), root.join("missing")]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn top_level_items_are_loose_files_and_distinct_folders() {
+        let offer = |names: &[&str]| Offer { id: 1, files: names.iter().map(|n| FileInfo { name: n.to_string(), size: 0 }).collect() };
+        assert_eq!(top_level_count(&offer(&["a.txt", "b.txt"])), 2);
+        assert_eq!(top_level_count(&offer(&["photos/a.jpg", "photos/2026/b.jpg", "notes.txt"])), 2);
+        assert_eq!(top_level_count(&offer(&["photos", "photos/a.jpg"])), 2);
+        assert_eq!(top_level_count(&offer(&["a.txt", "a.txt"])), 2);
+    }
+
+    #[test]
+    fn name_parts_cannot_climb_out() {
+        assert_eq!(name_parts("photos/2026/a.jpg"), vec!["photos", "2026", "a.jpg"]);
+        assert_eq!(name_parts("../../etc/passwd"), vec!["etc", "passwd"]);
+        assert_eq!(name_parts("a\\b/./c"), vec!["a", "b", "c"]);
+        assert_eq!(name_parts("/"), vec!["file"]);
+        assert_eq!(name_parts(".."), vec!["file"]);
+    }
+
+    #[test]
     fn frames_round_trip_both_ways_including_unaligned_payloads() {
         let ((mut aw, mut ar), (mut bw, mut br)) = pair();
         aw.write_json(HELLO, &Hello::control("mac")).unwrap();
@@ -308,9 +407,9 @@ mod tests {
     fn the_wire_format_is_what_the_csharp_side_expects() {
         // Hello's optional fields are left out, not sent as null.
         let json = serde_json::to_string(&Hello::data("mac", "get", 3)).unwrap();
-        assert_eq!(json, r#"{"role":"data","name":"mac","op":"get","id":3,"version":2}"#);
+        assert_eq!(json, r#"{"role":"data","name":"mac","op":"get","id":3,"version":3}"#);
         let json = serde_json::to_string(&Hello::control("mac")).unwrap();
-        assert_eq!(json, r#"{"role":"control","name":"mac","version":2}"#);
+        assert_eq!(json, r#"{"role":"control","name":"mac","version":3}"#);
         assert_eq!(
             serde_json::to_string(&Inactive { drag_over: true, button_held: false, let_go: false }).unwrap(),
             r#"{"drag_over":true,"button_held":false,"let_go":false}"#

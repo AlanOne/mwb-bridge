@@ -12,8 +12,9 @@ namespace MwbBridgeCompanion;
 
 static class Frames
 {
-    /// Same as the bridge's `PROTOCOL_VERSION`: 2 has `Inactive.DragOver`.
-    public const uint Version = 2;
+    /// Same as the bridge's `PROTOCOL_VERSION`: 2 has `Inactive.DragOver`,
+    /// 3 offers folders as relative file names ("folder/sub/a.txt").
+    public const uint Version = 3;
 
     public const uint Hello = 1;
     public const uint Active = 2;
@@ -206,13 +207,13 @@ sealed class FrameConnection : IDisposable
     public static T Parse<T>(byte[] body) => JsonSerializer.Deserialize<T>(body, Frames.Json) ?? throw new IOException("empty message");
 
     /// Per file a header, its bytes, an end; then Done.
-    public void SendFiles(IReadOnlyList<string> paths)
+    public void SendFiles(IReadOnlyList<(string Path, string Name)> files)
     {
         var buf = new byte[Frames.ChunkSize];
-        for (var i = 0; i < paths.Count; i++)
+        for (var i = 0; i < files.Count; i++)
         {
-            using var file = File.OpenRead(paths[i]);
-            WriteJson(Frames.FileHeader, new FileHeaderMsg((uint)i, Path.GetFileName(paths[i]), (ulong)file.Length));
+            using var file = File.OpenRead(files[i].Path);
+            WriteJson(Frames.FileHeader, new FileHeaderMsg((uint)i, files[i].Name, (ulong)file.Length));
             int n;
             while ((n = file.Read(buf, 0, buf.Length)) > 0)
             {

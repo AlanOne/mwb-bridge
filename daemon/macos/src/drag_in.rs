@@ -108,7 +108,7 @@ impl Fetch {
             After::Keep => {}
             After::Discard => {
                 for path in paths {
-                    let _ = std::fs::remove_file(path);
+                    let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
                 }
                 if let Some(dir) = paths.first().and_then(|p| p.parent()) {
                     let _ = std::fs::remove_dir(dir); // only if empty
@@ -256,7 +256,7 @@ impl IncomingDrag {
         prune_old_drags(&root, KEEP_DRAGS);
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
-        let expected = offer.files.len();
+        let expected = mwb_protocol::companion::top_level_count(&offer);
         self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false, starting: None });
         let link = link.clone();
         std::thread::spawn(move || {
@@ -520,8 +520,21 @@ fn save_to(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
     let dest = dir.join(path.file_name().unwrap_or_default());
     // Copy rather than move: the cache and the Desktop can be on different
     // volumes, and the copy left behind is cleaned up with old drags.
-    std::fs::copy(path, &dest)?;
+    copy_all(path, &dest)?;
     Ok(dest)
+}
+
+/// Copies a file, or a folder with everything in it, to `dest`.
+fn copy_all(path: &Path, dest: &Path) -> std::io::Result<()> {
+    if !path.is_dir() {
+        return std::fs::copy(path, dest).map(|_| ());
+    }
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        copy_all(&entry.path(), &dest.join(entry.file_name()))?;
+    }
+    Ok(())
 }
 
 /// A fresh folder under `root` for one drag's file, so a file dropped into

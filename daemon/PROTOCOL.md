@@ -723,14 +723,22 @@ TCP 15102 on the PC its MWB connection goes to, with MWB's own v0.102
 encryption and the same key. Frames are a 16-byte header (type u32,
 reserved u32, length u64, little-endian) plus the payload zero-padded to 16
 bytes. The first frame is `HELLO` (JSON `{"role", "name", "op"?, "id"?,
-"version"}`); `version` is `PROTOCOL_VERSION` (2, missing before it existed)
-and the companion logs a mismatch. It closes a connection that sends no
+"version"}`); `version` is `PROTOCOL_VERSION` (3; missing before it
+existed) and the companion logs a mismatch. It closes a connection that sends no
 `HELLO` within 10s, keeps the control connection alive with TCP keepalive
 (15s, 5s, 3 probes) and gives up on a data connection that stalls for 30s.
 One long-lived control connection carries `ACTIVE` (2), `INACTIVE` (3,
 `{"drag_over", "button_held", "let_go"}`), `OFFER_TO_WINDOWS` (4) and `CANCEL` (7) from the bridge
 and `OFFER_TO_MAC` (5) from the companion; an offer is `{"id", "files":
-[{"name", "size"}]}`. File bytes go over a short data connection per drag
+[{"name", "size"}]}`. Since version 3 a name can be a relative path
+(`photos/2026/a.jpg`, always `/`): a dragged or copied folder is offered as
+every file in it, named by its path from the folder down (links to folders
+aren't followed, empty folders carry nothing). The receiver rebuilds the
+folders under its own drop folder, each path part made safe and `.`/`..`
+dropped, gives top-level items unique names (each loose file is one item;
+all files under one folder name share one rebuilt folder), and hands only
+the top-level items to the drop or the clipboard. An older receiver
+flattens such names. File bytes go over a short data connection per drag
 (`op` "get" when the companion sends, "put" when the bridge does): per file
 `FILE_HEADER` (10, `{"index", "name", "size"}`), `FILE_CHUNK`s (11, up to
 1MB) and `FILE_END` (12), then `DONE` (13). The bridge opens every

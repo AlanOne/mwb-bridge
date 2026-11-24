@@ -16,7 +16,7 @@ sealed class Coordinator
     public Func<bool>? BridgeConnected { get; set; }
 
     // Windows -> Mac drags offered to the bridge, by id: the files it fetches.
-    readonly ConcurrentDictionary<ulong, string[]> _toMac = new();
+    readonly ConcurrentDictionary<ulong, (string Path, string Name)[]> _toMac = new();
     // Mac -> Windows drags, by id.
     readonly ConcurrentDictionary<ulong, IncomingDrop> _fromMac = new();
     ulong _nextId = (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -101,19 +101,17 @@ sealed class Coordinator
         // Once per catch: the drag can leave and re-enter the catcher, and a
         // second offer would start a second drag on the Mac.
         if (!_catching || _offered) return;
-        var files = dropped.Where(File.Exists).ToArray();
-        foreach (var skipped in dropped.Where(p => !File.Exists(p)))
-        {
-            Log.Write($"[to-mac] Skipping {skipped}: folders aren't supported, zip it first.");
-        }
+        // Folders go as every file inside them (see Names.Expand).
+        var files = Names.Expand(dropped, skipped => Log.Write($"[to-mac] Skipping {skipped}: it couldn't be read."));
         if (files.Length == 0)
         {
+            Log.Write("[to-mac] Nothing to send in that drag (only empty folders?).");
             _offered = true;
             return;
         }
         var id = Interlocked.Increment(ref _nextId);
         _toMac[id] = files;
-        var offer = new OfferMsg(id, files.Select(f => new FileInfoMsg(Path.GetFileName(f), (ulong)new FileInfo(f).Length)).ToList());
+        var offer = new OfferMsg(id, files.Select(f => new FileInfoMsg(f.Name, (ulong)new FileInfo(f.Path).Length)).ToList());
         Log.Write($"[to-mac] Offering {files.Length} file(s) to the bridge as drag {id}: {string.Join(", ", offer.Files.Select(f => f.Name))}");
         // Not sent (no bridge right now): tried again if the drag re-enters.
         _offered = SendToBridge?.Invoke(Frames.OfferToMac, offer) == true;
@@ -179,7 +177,7 @@ sealed class Coordinator
     }
 
     /// The bridge fetching a drag's files.
-    public string[]? FilesToMac(ulong id) => _toMac.TryGetValue(id, out var f) ? f : null;
+    public (string Path, string Name)[]? FilesToMac(ulong id) => _toMac.TryGetValue(id, out var f) ? f : null;
 
     // ---- Mac -> Windows ------------------------------------------------
 
@@ -202,10 +200,10 @@ sealed class Coordinator
             try
             {
                 var list = new System.Collections.Specialized.StringCollection();
-                list.AddRange(drop.Paths);
+                list.AddRange(drop.TopLevel);
                 Clipboard.SetFileDropList(list);
-                _lastSetOnClipboard = drop.Paths;
-                Log.Write($"[copy] {drop.Paths.Length} file(s) copied on the Mac are on the clipboard.");
+                _lastSetOnClipboard = drop.TopLevel;
+                Log.Write($"[copy] {drop.TopLevel.Length} item(s) copied on the Mac are on the clipboard.");
             }
             catch (Exception e)
             {
@@ -234,17 +232,14 @@ sealed class Coordinator
         // copy twice in a row.
         if (files.SequenceEqual(_lastSetOnClipboard)) return;
         if (files.SequenceEqual(_lastOffered) && DateTime.Now - _lastOfferedAt < TimeSpan.FromSeconds(2)) return;
-        foreach (var skipped in files.Where(f => !File.Exists(f)))
-        {
-            Log.Write($"[copy] Skipping {skipped}: folders aren't supported, zip it first.");
-        }
-        var sendable = files.Where(File.Exists).ToArray();
+        // Folders go as every file inside them (see Names.Expand).
+        var sendable = Names.Expand(files, skipped => Log.Write($"[copy] Skipping {skipped}: it couldn't be read."));
         if (sendable.Length == 0) return;
         _lastOffered = files;
         _lastOfferedAt = DateTime.Now;
         var id = Interlocked.Increment(ref _nextId);
         _toMac[id] = sendable;
-        var offer = new OfferMsg(id, sendable.Select(f => new FileInfoMsg(Path.GetFileName(f), (ulong)new FileInfo(f).Length)).ToList());
+        var offer = new OfferMsg(id, sendable.Select(f => new FileInfoMsg(f.Name, (ulong)new FileInfo(f.Path).Length)).ToList());
         var sent = SendToBridge?.Invoke(Frames.ClipboardToMac, offer) == true;
         Log.Write($"[copy] {sendable.Length} file(s) copied here {(sent ? "offered to the bridge" : "not sent: no bridge connected")} ({id}): {string.Join(", ", offer.Files.Select(f => f.Name))}");
     }
@@ -311,7 +306,7 @@ sealed class Coordinator
         if (drop == null) return;
         // Out of the way of the drop once the drag is running.
         BeginInvokeLater(() => _source.Bounds = new Rectangle(-32000, -32000, 1, 1));
-        var data = new DataObject(DataFormats.FileDrop, drop.Paths);
+        var data = new DataObject(DataFormats.FileDrop, drop.TopLevel);
         DateTime? releasedAt = null;
         var gaveUp = false;
         void Query(object? sender, QueryContinueDragEventArgs e)
@@ -440,7 +435,10 @@ sealed class Coordinator
 sealed class IncomingDrop
 {
     public ulong Id { get; }
+    /// Every file, in offer order (the bytes arrive by index).
     public string[] Paths { get; }
+    /// What a drop or a paste hands on: loose files and rebuilt folders.
+    public string[] TopLevel { get; }
     readonly bool[] _done;
     public volatile bool Cancelled;
     public volatile bool Failed;
@@ -451,10 +449,11 @@ sealed class IncomingDrop
 
     public bool IsComplete { get { lock (_done) return _done.All(d => d); } }
 
-    IncomingDrop(ulong id, string[] paths)
+    IncomingDrop(ulong id, string[] paths, string[] topLevel)
     {
         Id = id;
         Paths = paths;
+        TopLevel = topLevel;
         _done = new bool[paths.Length];
     }
 
@@ -469,10 +468,15 @@ sealed class IncomingDrop
         PruneSoon();
         var dir = Path.Combine(root ?? Root, offer.Id.ToString());
         Directory.CreateDirectory(dir);
-        var paths = Names.Unique(offer.Files.Select(f => f.Name)).Select(n => Path.Combine(dir, n)).ToArray();
+        var (files, top) = Names.Layout(offer.Files.Select(f => f.Name));
+        var paths = files.Select(f => Path.Combine(dir, f)).ToArray();
         // Empty placeholders, so the drag can start before the bytes arrive.
-        foreach (var p in paths) File.WriteAllBytes(p, Array.Empty<byte>());
-        return new IncomingDrop(offer.Id, paths);
+        foreach (var p in paths)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(p)!);
+            File.WriteAllBytes(p, Array.Empty<byte>());
+        }
+        return new IncomingDrop(offer.Id, paths, top.Select(t => Path.Combine(dir, t)).ToArray());
     }
 
     public void FileDone(int index)
@@ -518,9 +522,21 @@ sealed class IncomingDrop
     {
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MouseWithoutBorders");
         Directory.CreateDirectory(dir);
-        foreach (var p in Paths) File.Copy(p, Path.Combine(dir, Path.GetFileName(p)), overwrite: true);
+        foreach (var p in TopLevel) CopyAll(p, Path.Combine(dir, Path.GetFileName(p)));
         Log.Write($"[to-windows] Drag {Id}: saved to {dir}.");
         Process.Start(new ProcessStartInfo(dir) { UseShellExecute = true });
+    }
+
+    /// Copies a file, or a folder with everything in it.
+    static void CopyAll(string from, string to)
+    {
+        if (!Directory.Exists(from))
+        {
+            File.Copy(from, to, overwrite: true);
+            return;
+        }
+        Directory.CreateDirectory(to);
+        foreach (var entry in Directory.EnumerateFileSystemEntries(from)) CopyAll(entry, Path.Combine(to, Path.GetFileName(entry)));
     }
 
     static int _pruning;
