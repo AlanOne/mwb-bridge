@@ -209,11 +209,12 @@ and the companion link's missing MAC and freshness.
 
 ### Phase 5: features
 **Built** (each feature Grok-reviewed and its findings fixed; no final
-whole-phase review yet). Live-tested 2026-11-24: progress on the Mac and
-big transfers both ways; the freeze that test found (a drop held for up to
-3s) is fixed. Not yet live-tested: cancel, Windows-side progress, folders,
-media keys, keep-awake, self-registration, the settings window and the
-setup check.
+whole-phase review yet). Live-tested on the Mac and both Windows PCs
+2026-11-24: big transfers both ways with progress and cancel, folders, the
+shorter drop hold (the 3s one froze the cursor), media keys, stay-awake,
+keep-screen-on, the settings window and the setup check. Not yet
+live-tested: self-registration, full-size images, and everything on
+Linux.
 In order: full-size images, folders, progress and cancel, the companion setup check, media keys, keep-awake, self-registration (careful: it rewrites the matrix on first registration), the Mac settings panel. Paste-time transfer and an authenticated companion cipher come after.
 
 ### Phase 6: Linux parity

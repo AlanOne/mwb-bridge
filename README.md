@@ -140,7 +140,7 @@ everything but the handshake until Windows has answered the handshake
 challenge, so a replayed or redirected connection can't inject input, and
 the Linux build no longer logs every key and mouse packet to the journal.
 
-**The Mac stays reachable** (type-checked only, not yet live-tested):
+**The Mac stays reachable** (live-tested 2026-11-24):
 while the bridge is connected and the Mac is on power, it holds macOS's
 "no idle system sleep" assertion. The display still turns off after its
 idle time, but the Mac stays awake behind it instead of going to sleep,
@@ -153,8 +153,8 @@ disconnected for 45 seconds may the Mac sleep again. On battery it may
 still sleep (a UPS counts as power), and closing the lid with no external
 display always sleeps it.
 
-**Screen stays on while you use Windows** (both builds, type-checked
-only, not yet live-tested): with "Block screen saver on other machines" on
+**Screen stays on while you use Windows** (live-tested on the Mac
+2026-11-24, Linux type-checked only): with "Block screen saver on other machines" on
 in PowerToys' Mouse Without Borders settings, Windows tells every machine
 about once a minute that someone is using it. The Mac then counts that as
 user activity (its display stays on, nothing moves), and Linux holds a
@@ -226,9 +226,9 @@ since PowerToys only reports single-file drags.
   they're still arriving then, or if they plainly won't be in within that
   second (going by how fast they're arriving), the drag is cancelled at
   once and they're saved to `~/Desktop/MouseWithoutBorders/` once they
-  have, so a big transfer never freezes the mouse (the shorter hold is
-  unit-tested only, not yet live-tested; it used to hold up to 3 seconds,
-  which froze the cursor through most of a 500 MB transfer). A click, a key or switching machines meanwhile ends the wait
+  have, so a big transfer never freezes the mouse (live-tested 2026-11-24
+  with 500 MB; it used to hold up to 3 seconds, which froze the cursor
+  through most of such a transfer). A click, a key or switching machines meanwhile ends the wait
   straight away the same way, and so does a lost connection (not yet
   live-tested). If you let go before the drag could start, the file is
   saved to `~/Desktop/MouseWithoutBorders/` and shown in Finder instead
@@ -254,22 +254,21 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
   cursor, so they drop into whichever Explorer window or app you let go
   over. Letting go before they've fully arrived holds the drop for up to a
   second; if they're still arriving then, or the drag can't start, they're
-  saved to `Desktop\MouseWithoutBorders\` as before (the one-second limit is
-  not yet live-tested).
+  saved to `Desktop\MouseWithoutBorders\` as before (the one-second limit
+  live-tested 2026-11-24 with 500 MB files).
 - **File copy and paste** goes through it too, both ways (live-tested
   2026-11-23: 7 files from Finder to Explorer, 2 from Explorer to Finder):
   files copied in Explorer land on the Mac's clipboard, and
   files copied in Finder on Windows' clipboard, all of them, as soon as
   they've arrived. PowerToys only sends one file per copy, up to 100MB.
 - No size limit per file.
-- **Folders** go through it too, both ways, dragged or copied (type-checked
-  and unit-tested only, not yet live-tested): each folder arrives whole,
+- **Folders** go through it too, both ways, dragged or copied (live-tested
+  2026-11-24): each folder arrives whole,
   with its subfolders, and the drop or paste hands on the folder itself.
   Empty folders aren't carried (a dragged empty folder sends nothing), and
   one drag or copy carries at most 50,000 files. Without the companion, folders
   still aren't supported (zip them), as with PowerToys itself.
-- **Progress and cancel** (type-checked and unit-tested only, not yet
-  live-tested): a transfer that takes more than a second shows its
+- **Progress and cancel** (live-tested both ways 2026-11-24 with 500 MB): a transfer that takes more than a second shows its
   progress on both machines, in the Mac's menu bar (the percentage next
   to the icon, and a line such as "Sending to Windows: 120 MB of 260 MB
   (46%)" in its menu) and in the companion's tray menu and tooltip. Both
@@ -315,7 +314,7 @@ Setup:
    and shows a warning once if it isn't: missing, a layout slot with
    spaces around the name, a pool PowerToys would throw away (one slot
    that isn't `name:id`), or an ID that a later slot takes away, or that
-   is 0 or 255 (type-checked and unit-tested only, not yet live-tested).
+   is 0 or 255 (live-tested 2026-11-24).
 
 The log is `%LOCALAPPDATA%\MwbBridgeCompanion\companion.log` (also under
 the tray icon's menu: the same two-headed arrow as the Mac's menu bar
@@ -403,9 +402,10 @@ for the rest, then "Restart App". It checks that the Windows PC has a port
 (`windows-pc.local:15101`), and won't save over a config.json that doesn't
 parse (fix that with "Edit Config..." first). The menu also shows the
 connection's link (Wi-Fi, or the interface's name otherwise, with the
-round-trip time TCP measures) and has "Reconnect Now" (the window's
-checks are unit-tested; the window itself, the link line and "Reconnect
-Now" are type-checked only, none live-tested yet).
+round-trip time TCP measures) and has "Reconnect Now" (the window,
+pasting into it included, live-tested 2026-11-24; the link line and
+"Reconnect Now" type-checked only). `self_register` and the other fields
+not in the window are set with "Edit Config...", then "Restart App".
 
 **More than one Windows PC** (say one at home and one at the office): list
 the others in `other_windows_pcs`, each with its own PowerToys key. The Mac
@@ -468,8 +468,8 @@ Win tap for Spotlight, Win+E for a Finder window, Win+Shift+S to snip to the
 clipboard, Print Screen for the whole screen to the clipboard, and Finder's
 Enter/Backspace/Delete/F2. Rules live in `daemon/macos/src/windows_keys.rs`.
 
-**Media and extra keys** (both builds, type-checked and unit-tested only,
-not yet live-tested): volume up/down, mute, play/pause and next/previous
+**Media and extra keys** (live-tested on the Mac 2026-11-24, Linux
+type-checked only): volume up/down, mute, play/pause and next/previous
 track work as an Apple keyboard's do (holding a volume key keeps going),
 F13-F20 (F13-F24 on Linux) arrive as themselves, and Print Screen, Scroll
 Lock and Pause arrive as F13-F15, where an Apple extended keyboard has
@@ -666,7 +666,9 @@ network this was built on, but your router/DNS setup may differ.
 
 **Letting Windows add the bridge itself** (both builds, off by default,
 type-checked and unit-tested only, not yet live-tested): with
-`"self_register": true` in the config, the bridge announces itself after
+`"self_register": true` in the config (on the Mac, "Edit Config..." in the
+menu bar, then "Restart App"; on Linux, edit config.json and restart the
+service), the bridge announces itself after
 each handshake the way real MWB machines do (a Heartbeat with its name),
 and Windows adds a machine it doesn't know yet to `MachinePool` on its
 own. Careful: when it learns a new machine this way, Windows also rewrites
