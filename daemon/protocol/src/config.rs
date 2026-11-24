@@ -62,6 +62,16 @@ pub struct Config {
     // PC's MWB layout. Ignored on Linux.
     #[serde(default)]
     pub other_windows_pcs: Vec<WindowsPc>,
+    // Off by default. When on, the bridge announces itself to Windows after
+    // each handshake (a Heartbeat, as real MWB machines send), and Windows
+    // adds a machine it doesn't know yet to its `MachinePool` by itself, so
+    // that half of the hand-editing goes away. Careful: when Windows learns
+    // a new machine that way it also rewrites its layout
+    // (`MachineMatrixString`) to the pool's order, which can move machines
+    // already there; check the layout in PowerToys afterwards. A machine
+    // already in the pool is left alone.
+    #[serde(default)]
+    pub self_register: bool,
 }
 
 #[derive(Deserialize, Clone)]

@@ -381,6 +381,15 @@ fn run_session(
                 let matched =
                     m1 == our_flipped[0] && m2 == our_flipped[1] && m3 == our_flipped[2] && m4 == our_flipped[3];
                 println!("[client] HandshakeAck received, challenge match: {matched}");
+                // Announce this machine once per connection, if asked to
+                // (see Config::self_register).
+                if matched && !*handshook && cfg.self_register {
+                    let mut hb = build_heartbeat(next_clip_id, cfg.machine_id, &cfg.machine_name);
+                    next_clip_id = next_clip_id.wrapping_add(1);
+                    finalize_send_buf(&mut hb, magic_number);
+                    stream.write_all(&cipher.encrypt(&mut write_chain, &hb))?;
+                    println!("[client] Announced this machine to Windows (self_register is on).");
+                }
                 *handshook |= matched;
                 let peer = String::from_utf8_lossy(&full[32..64]).trim_end().to_string();
                 let detail = if matched { "Connected" } else { "Handshake failed — check the security key" };

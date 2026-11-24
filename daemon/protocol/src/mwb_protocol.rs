@@ -444,6 +444,22 @@ pub fn build_clipboard_beat(id: u32, src_id: u32) -> [u8; PACKAGE_SIZE_EX] {
     buf
 }
 
+/// Builds a Heartbeat (Type=20) carrying this machine's name, broadcast the
+/// way real MWB machines send them: Windows adds a machine it doesn't know
+/// yet to its pool on one (Receiver.cs, `MachineStuff.AddToMachinePool`).
+pub fn build_heartbeat(id: u32, src_id: u32, machine_name: &str) -> [u8; PACKAGE_SIZE_EX] {
+    let mut buf = [0u8; PACKAGE_SIZE_EX];
+    buf[0] = PACKAGE_TYPE_HEARTBEAT;
+    pack_u32_le(&mut buf, 4, id);
+    pack_u32_le(&mut buf, 8, src_id);
+    pack_u32_le(&mut buf, 12, ID_ALL);
+    let name = format!("{:<32}", machine_name);
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(32);
+    buf[32..32 + n].copy_from_slice(&bytes[..n]);
+    buf
+}
+
 /// Builds the "MachineSwitched" package (Type=77) that actually triggers
 /// real MWB's file/big-clipboard auto-pull — a plain 32-byte package
 /// (unlike the beat above, `Des` here is the specific machine being told
@@ -723,6 +739,16 @@ mod package_tests {
             assert!(!is_big_package(t), "type {t} is a 32-byte package on real MWB");
         }
         assert!(is_big_package(PACKAGE_TYPE_CLIPBOARD_ASK));
+    }
+
+    #[test]
+    fn a_heartbeat_names_this_machine_to_everyone() {
+        let hb = build_heartbeat(5, 3, "alan-mac");
+        assert_eq!(hb[0], PACKAGE_TYPE_HEARTBEAT);
+        assert_eq!(unpack_u32_le(&hb, 8), 3);
+        assert_eq!(unpack_u32_le(&hb, 12), ID_ALL);
+        assert_eq!(std::str::from_utf8(&hb[32..64]).unwrap().trim_end(), "alan-mac");
+        assert!(is_big_package(PACKAGE_TYPE_HEARTBEAT));
     }
 
     #[test]

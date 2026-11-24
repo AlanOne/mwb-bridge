@@ -681,6 +681,15 @@ fn run_session(
                 let m3 = unpack_u32_le(&full, 24);
                 let m4 = unpack_u32_le(&full, 28);
                 let matched = m1 == our_flipped[0] && m2 == our_flipped[1] && m3 == our_flipped[2] && m4 == our_flipped[3];
+                // Announce this machine once per connection, if asked to
+                // (see Config::self_register).
+                if matched && !authenticated && cfg.self_register && role == "client" {
+                    let mut hb = build_heartbeat(next_clip_id, cfg.machine_id, &cfg.machine_name);
+                    next_clip_id = next_clip_id.wrapping_add(1);
+                    finalize_send_buf(&mut hb, magic_number);
+                    stream.write_all(&cipher.encrypt(&mut write_chain, &hb))?;
+                    println!("[{role}] Announced this machine to Windows (self_register is on).");
+                }
                 authenticated |= matched;
                 println!("[{role}] HandshakeAck received, challenge match: {matched}");
                 if role == "client" {

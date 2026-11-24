@@ -632,6 +632,16 @@ an IP Mapping entry in PowerToys' own settings UI or a hosts-file entry
 (`C:\Windows\System32\drivers\etc\hosts`) — neither was needed on the
 network this was built on, but your router/DNS setup may differ.
 
+**Letting Windows add the bridge itself** (both builds, off by default,
+type-checked and unit-tested only, not yet live-tested): with
+`"self_register": true` in the config, the bridge announces itself after
+each handshake the way real MWB machines do (a Heartbeat with its name),
+and Windows adds a machine it doesn't know yet to `MachinePool` on its
+own. Careful: when it learns a new machine this way, Windows also rewrites
+`MachineMatrixString` to the pool's order, which can move machines already
+in the layout, so check the layout in PowerToys' settings afterwards. A
+machine already in the pool is left alone, so it's harmless to leave on.
+
 ## Config files (written by the plugin, read by the daemon)
 
 The plugin's popup writes `~/.local/share/omarchy-mwb-bridge/config.json`
