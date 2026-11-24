@@ -22,6 +22,7 @@ mod windows_keys;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -68,6 +69,65 @@ static CURRENT_STREAM: Mutex<Option<TcpStream>> = Mutex::new(None);
 /// has control), and a lost connection counts as letting go, since it
 /// cancels the drag here.
 static LET_GO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the menu bar's "Disconnect": the bridge hands control back to
+/// Windows, drops its connections, refuses Windows' and doesn't reconnect
+/// until "Connect", so the cursor can't wander over to this Mac. Kept in a
+/// file next to config.json, so it lasts across restarts.
+static DISCONNECTED: AtomicBool = AtomicBool::new(false);
+
+fn disconnected_flag_path() -> std::path::PathBuf {
+    config::config_path().with_file_name("disconnected")
+}
+
+pub fn is_disconnected() -> bool {
+    DISCONNECTED.load(Ordering::SeqCst)
+}
+
+/// The menu bar's "Disconnect" (`true`) and "Connect" (`false`).
+pub fn set_disconnected(on: bool) {
+    DISCONNECTED.store(on, Ordering::SeqCst);
+    let flag = disconnected_flag_path();
+    if on {
+        let _ = std::fs::write(&flag, "Disconnected from the menu bar. Choose Connect there, or delete this file and restart.\n");
+        println!("[client] {} Disconnecting, as asked from the menu bar.", timestamp());
+        end_connections();
+    } else {
+        let _ = std::fs::remove_file(&flag);
+        println!("[client] {} Connecting again, as asked from the menu bar.", timestamp());
+    }
+}
+
+/// Quit from the menu bar: hand control back and close the connection (as
+/// Disconnect does, but without remembering it), then exit. A clean exit,
+/// so launchd leaves the app stopped.
+pub fn quit() -> ! {
+    DISCONNECTED.store(true, Ordering::SeqCst);
+    end_connections();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while CURRENT_STREAM.lock().unwrap().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    println!("[client] {} Quitting, as asked from the menu bar.", timestamp());
+    std::process::exit(0);
+}
+
+/// Ends the sessions once DISCONNECTED is set. Each session notices the flag
+/// within a tick and closes itself, handing control back first; the
+/// companion link and a session stuck in a long write are cut from here.
+fn end_connections() {
+    if let Some(link) = companion::link() {
+        link.disconnect("disconnected from the menu bar");
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(2));
+        if is_disconnected()
+            && let Some(stream) = CURRENT_STREAM.lock().unwrap().take()
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    });
+}
 
 /// The Windows end of the live connection, if there is one.
 pub fn current_peer() -> Option<std::net::SocketAddr> {
@@ -206,8 +266,28 @@ fn run_session(
     // HideMouse): a companion drag offer arriving after control left is
     // ignored.
     let mut active_here = false;
+    // The machine whose input this Mac is getting (from its mouse packages
+    // and MachineSwitched), until HideMouse: who to hand control back to
+    // on Disconnect or Quit.
+    let mut controller: Option<u32> = None;
 
     loop {
+        // Disconnect or Quit from the menu bar. If the cursor is here, hand
+        // it back first (at the middle of the controlling PC's screen), or
+        // whoever is at that PC would be left without one.
+        if is_disconnected() {
+            if cg.is_some()
+                && let Some(windows_id) = controller
+            {
+                let mut pkg = build_next_machine(next_clip_id, cfg.machine_id, windows_id, 32767, 32767, windows_id);
+                finalize_send_buf(&mut pkg, magic_number);
+                stream.write_all(&cipher.encrypt(&mut write_chain, &pkg))?;
+                println!("[client] {} Handed control back to Windows.", timestamp());
+                // Let it switch before the connection closes.
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            return Ok(());
+        }
         // A release held back for files still arriving (see IncomingDrag).
         if let Some(cg) = cg.as_deref_mut() {
             incoming.tick(cg);
@@ -418,6 +498,7 @@ fn run_session(
                 let y = unpack_u32_le(&full, 20);
                 let wheel = unpack_u32_le(&full, 24);
                 let flags = unpack_u32_le(&full, 28);
+                controller = Some(src_id);
                 if let Some(cg) = cg.as_deref_mut() {
                     lag.arrived(stream);
                     // After a stall, absolute moves queue up: injecting each
@@ -557,6 +638,7 @@ fn run_session(
                 if package_type == PACKAGE_TYPE_HIDE_MOUSE {
                     if des_id == cfg.machine_id {
                         active_here = false;
+                        controller = None;
                     }
                     // A drop held back here ends now (the user let go here),
                     // before the button state is read: it holds the left
@@ -646,6 +728,9 @@ fn run_session(
                 // going on on Windows, it's now over here.
                 let to_us = unpack_u32_le(&full, 12) == cfg.machine_id;
                 active_here |= to_us;
+                if to_us {
+                    controller = Some(src_id);
+                }
                 // Only the client session forwards input and sees the
                 // release, so only it starts a new activation's LET_GO.
                 if to_us && cg.is_some() {
@@ -905,6 +990,9 @@ fn run_server_listener(active: Arc<Mutex<Config>>) {
 
     for conn in listener.incoming() {
         match conn {
+            // While disconnected from the menu bar, Windows mustn't get a
+            // connection it could send the cursor over.
+            Ok(stream) if is_disconnected() => drop(stream),
             Ok(mut stream) => {
                 println!("[server] Accepted connection from {:?}", stream.peer_addr());
                 set_socket_timeouts(&stream);
@@ -960,6 +1048,14 @@ fn network_thread(cfg: Config) {
     let mut i = 0;
     let mut delay = RECONNECT_FIRST;
     loop {
+        if is_disconnected() {
+            println!("[client] {} Disconnected from the menu bar, waiting for Connect.", timestamp());
+            config::write_status(false, "", "Disconnected from the menu bar");
+            while is_disconnected() {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            delay = RECONNECT_FIRST;
+        }
         let pc = &pcs[i];
         *active.lock().unwrap() = pc.clone();
         let mut handshook = false;
@@ -1028,6 +1124,7 @@ fn ensure_config_template() {
 
 fn main() {
     ensure_config_template();
+    DISCONNECTED.store(disconnected_flag_path().exists(), Ordering::SeqCst);
 
     std::thread::spawn(|| {
         let cfg = loop {

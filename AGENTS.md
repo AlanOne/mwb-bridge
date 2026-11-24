@@ -148,9 +148,15 @@ Files and commands:
   Status: `status.json` in the same folder.
 - Logs: `~/Library/Logs/mwb-mac-bridge/mwb-mac-bridge.log` and
   `mwb-mac-bridge.err.log`.
-- Stop: `launchctl bootout gui/$(id -u)/com.alanone.mwb-mac-bridge` (it
-  restarts on its own otherwise). Start again by re-running `install.sh` or
-  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.alanone.mwb-mac-bridge.plist`.
+- Stop: the menu's Quit (a clean exit, which the LaunchAgent doesn't
+  restart; a crash or "Restart App", which exits with code 1, is), or
+  `launchctl bootout gui/$(id -u)/com.alanone.mwb-mac-bridge`. Start again
+  with `launchctl kickstart gui/$(id -u)/com.alanone.mwb-mac-bridge` (after
+  Quit), by re-running `install.sh` or with `launchctl bootstrap gui/$(id -u)
+  ~/Library/LaunchAgents/com.alanone.mwb-mac-bridge.plist`.
+- The menu's Disconnect keeps the bridge off Windows (it hands control
+  back first) until Connect, remembered in a `disconnected` file next to
+  config.json.
 - Quick run without installing: `cargo run -p mwb_mac_bridge` in `daemon/`.
 
 ## Building and checking
@@ -194,6 +200,9 @@ Most work since early November 2026 went into the macOS build. On Linux:
   ready in `mwb_protocol::companion` (`open`, `send_files`,
   `receive_files`, `expand_offer_paths`, `Transfers`, `progress_line`);
   the Mac's `companion.rs` is the client to port.
+- **No Disconnect.** The Mac's menu can keep the bridge off Windows until
+  Connect, handing control back first. On Linux the only way is stopping
+  the service, which doesn't hand control back.
 
 Already on both, so no porting needed: fast reconnect after sleep (Linux
 uses logind's `PrepareForSleep`, the Mac a wall-clock watchdog), relative

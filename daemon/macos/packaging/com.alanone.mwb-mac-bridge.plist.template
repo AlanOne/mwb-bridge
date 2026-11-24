@@ -10,11 +10,14 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <!-- Mirrors the Linux build's `Restart=always`/`RestartSec=3` systemd
-         unit: respawn on any exit (crash or otherwise), but ThrottleInterval
+    <!-- Respawn after a crash or "Restart App" (which exits with code 1),
+         but not after the menu's Quit (a clean exit). ThrottleInterval
          keeps a fast-crashing binary from being relaunched in a tight loop. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>ThrottleInterval</key>
     <integer>3</integer>
     <key>StandardOutPath</key>

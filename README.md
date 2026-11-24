@@ -428,6 +428,21 @@ pasting into it included, live-tested 2026-11-24; the link line and
 "Reconnect Now" type-checked only). `self_register` and the other fields
 not in the window are set with "Edit Config...", then "Restart App".
 
+**Disconnect** in the menu stops Windows from sending the cursor to the
+Mac, say while someone else is using the PC and might push the mouse over
+by accident. If the cursor is on the Mac at that moment, it's handed back
+to the middle of the PC's screen first. The Mac then drops its
+connections, turns Windows' own away and doesn't reconnect until you
+choose **Connect** in the same menu. A slash crosses out the menu bar icon
+meanwhile. The choice survives restarts and logins (it's kept as a file
+called `disconnected` next to config.json). **Quit** hands the cursor
+back the same way and now really quits: the LaunchAgent only restarts the
+app after a crash or "Restart App", so it stays stopped until you open
+"MWB Mac Bridge" again or log in. Live-tested 2026-11-24: starting
+disconnected from that file, refusing Windows meanwhile, and reconnecting
+once it's gone. The menu items, the hand-back and Quit are type-checked
+only.
+
 **More than one Windows PC** (say one at home and one at the office): list
 the others in `other_windows_pcs`, each with its own PowerToys key. The Mac
 connects to whichever it can reach, trying `windows_ip` first, and a dropped
@@ -452,7 +467,7 @@ entries' format, relaunch.
 
 **Install (builds, packages as `~/Applications/MWB Mac Bridge.app`, and
 registers a LaunchAgent so it starts at login and auto-restarts on
-crash — the counterpart to the Linux build's systemd `--user` service):**
+crash, but not after the menu's Quit — the counterpart to the Linux build's systemd `--user` service):**
 
 ```sh
 bash daemon/macos/packaging/install.sh

@@ -1,6 +1,7 @@
 // Minimal menu bar shell: a status item showing connection state (polled
 // from status.json, the same file the network thread already writes via
-// `config::write_status`) plus "Edit Config...", "Restart App", and "Quit".
+// `config::write_status`) plus "Disconnect", "Edit Config...", "Restart
+// App", and "Quit".
 // No in-app settings form yet — editing config.json directly and
 // restarting is the whole config UX for milestone 1, deliberately, matching
 // how small this first cut is meant to be.
@@ -28,7 +29,10 @@ use tray_icon::{Icon, TrayIconBuilder};
 /// regardless of appearance, which looks visibly wrong next to system
 /// icons. Only the alpha channel matters for a template image; RGB is set
 /// to black by convention.
-fn bridge_icon() -> Icon {
+///
+/// While disconnected from the menu, a slash crosses it out, with a clear
+/// gap on each side so it reads against the arrow.
+fn bridge_icon(disconnected: bool) -> Icon {
     const SIZE: i32 = 36;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
     let mut set = |x: i32, y: i32| {
@@ -68,10 +72,40 @@ fn bridge_icon() -> Icon {
         }
     }
 
+    if disconnected {
+        // From the top right to the bottom left corner.
+        let (x0, y0, x1, y1) = (SIZE as f32 - 5.0, 4.0, 5.0, SIZE as f32 - 4.0);
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len = (dx * dx + dy * dy).sqrt();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let t = ((px - x0) * dx + (py - y0) * dy) / (len * len);
+                if !(0.0..=1.0).contains(&t) {
+                    continue;
+                }
+                let dist = ((px - x0) * dy - (py - y0) * dx).abs() / len;
+                let idx = ((y * SIZE + x) * 4) as usize;
+                if dist <= 1.8 {
+                    rgba[idx + 3] = 255;
+                } else if dist <= 4.0 {
+                    rgba[idx + 3] = 0;
+                }
+            }
+        }
+    }
+
     Icon::from_rgba(rgba, SIZE as u32, SIZE as u32).expect("valid fixed-size RGBA buffer")
 }
 
+fn tooltip(disconnected: bool) -> &'static str {
+    if disconnected { "MWB Mac Bridge (disconnected)" } else { "MWB Mac Bridge" }
+}
+
 fn status_line() -> String {
+    if crate::is_disconnected() {
+        return "Disconnected (choose Connect to resume)".to_string();
+    }
     match config::read_status() {
         Some(s) if s.connected => format!("Connected to {}", s.peer),
         Some(s) => format!("Status: {}", s.detail),
@@ -103,11 +137,25 @@ fn save_windows_keys(enabled: bool) {
     }
 }
 
+/// The LaunchAgent's label (see packaging/install.sh).
+const LAUNCH_AGENT: &str = "com.alanone.mwb-mac-bridge";
+
 pub fn restart_app() {
+    // Under the LaunchAgent, launchd starts the app again after an exit that
+    // isn't clean (KeepAlive's SuccessfulExit is false, so Quit's clean exit
+    // stays quit). A copy started here would be killed with the job's
+    // process group anyway.
+    if std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == LAUNCH_AGENT) {
+        std::process::exit(1);
+    }
     if let Ok(exe) = std::env::current_exe() {
         let _ = Command::new(exe).spawn();
     }
     std::process::exit(0);
+}
+
+fn connection_toggle_text(disconnected: bool) -> &'static str {
+    if disconnected { "Connect" } else { "Disconnect" }
 }
 
 pub fn run() {
@@ -129,7 +177,11 @@ pub fn run() {
     windows_keys::ENABLED.store(windows_keys_on, Ordering::Relaxed);
     let windows_keys_item = CheckMenuItem::new("Windows-Style Keys", true, windows_keys_on, None);
     let link_item = MenuItem::new(crate::link_line().unwrap_or_default(), false, None);
-    let reconnect_item = MenuItem::new("Reconnect Now", true, None);
+    let disconnected = crate::is_disconnected();
+    let reconnect_item = MenuItem::new("Reconnect Now", !disconnected, None);
+    // Stops Windows from sending the cursor here (e.g. while someone else
+    // uses the PC) until Connect, even across restarts.
+    let disconnect_item = MenuItem::new(connection_toggle_text(disconnected), true, None);
     let settings_item = MenuItem::new("Settings...", true, None);
     let edit_config_item = MenuItem::new("Edit Config...", true, None);
     let restart_item = MenuItem::new("Restart App", true, None);
@@ -141,6 +193,7 @@ pub fn run() {
     menu.append(&status_item).unwrap();
     menu.append(&link_item).unwrap();
     menu.append(&reconnect_item).unwrap();
+    menu.append(&disconnect_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&windows_keys_item).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
@@ -151,9 +204,9 @@ pub fn run() {
     menu.append(&quit_item).unwrap();
 
     let tray_icon = TrayIconBuilder::new()
-        .with_icon(bridge_icon())
+        .with_icon(bridge_icon(disconnected))
         .with_icon_as_template(true)
-        .with_tooltip("MWB Mac Bridge")
+        .with_tooltip(tooltip(disconnected))
         .with_menu(Box::new(menu.clone()))
         .build()
         .expect("failed to create the menu bar status item");
@@ -163,6 +216,7 @@ pub fn run() {
     let edit_config_id = edit_config_item.id().clone();
     let settings_id = settings_item.id().clone();
     let reconnect_id = reconnect_item.id().clone();
+    let disconnect_id = disconnect_item.id().clone();
     let restart_id = restart_item.id().clone();
     let quit_id = quit_item.id().clone();
     let cancel_transfer_id = cancel_transfer_item.id().clone();
@@ -217,8 +271,17 @@ pub fn run() {
                 crate::reconnect_now();
             } else if event.id == restart_id {
                 restart_app();
+            } else if event.id == disconnect_id {
+                let disconnected = !crate::is_disconnected();
+                crate::set_disconnected(disconnected);
+                disconnect_item.set_text(connection_toggle_text(disconnected));
+                reconnect_item.set_enabled(!disconnected);
+                let _ = tray_icon.set_icon(Some(bridge_icon(disconnected)));
+                tray_icon.set_icon_as_template(true);
+                let _ = tray_icon.set_tooltip(Some(tooltip(disconnected)));
+                status_item.set_text(status_line());
             } else if event.id == quit_id {
-                *control_flow = ControlFlow::Exit;
+                crate::quit();
             }
         }
     });
