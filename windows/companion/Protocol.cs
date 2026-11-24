@@ -213,18 +213,23 @@ sealed class FrameConnection : IDisposable
         var buf = new byte[Frames.ChunkSize];
         for (var i = 0; i < files.Count; i++)
         {
-            FileStream? opened = null;
-            try { opened = File.OpenRead(files[i].Path); }
+            Stream? opened = null;
+            try { opened = File.Open(files[i].Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete); }
             catch (Exception e) { Log.Write($"Couldn't read {files[i].Path}, sending it empty: {e.Message}"); }
             // A file that went away since the offer goes empty, so the rest
             // still arrive at their indexes.
-            using var file = opened ?? new FileStream(Path.GetTempFileName(), FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1, FileOptions.DeleteOnClose);
-            WriteJson(Frames.FileHeader, new FileHeaderMsg((uint)i, files[i].Name, (ulong)file.Length));
+            using var file = opened ?? new MemoryStream(Array.Empty<byte>(), writable: false);
+            var size = file.Length;
+            WriteJson(Frames.FileHeader, new FileHeaderMsg((uint)i, files[i].Name, (ulong)size));
+            // No more than the header says, should it grow meanwhile (a log
+            // still being written); a file that shrinks just ends early.
+            long left = size;
             int n;
-            while ((n = file.Read(buf, 0, buf.Length)) > 0)
+            while (left > 0 && (n = file.Read(buf, 0, (int)Math.Min(buf.Length, left))) > 0)
             {
                 WriteFrame(Frames.FileChunk, buf.AsSpan(0, n));
                 progress?.Invoke(n);
+                left -= n;
             }
             WriteFrame(Frames.FileEnd, ReadOnlySpan<byte>.Empty);
         }
@@ -258,7 +263,9 @@ sealed class FrameConnection : IDisposable
                     current.Flush(true);
                     current.Dispose();
                     current = null;
-                    if (received != header.Size) throw new IOException($"{header.Name} arrived with {received} of {header.Size} bytes");
+                    // Changed size since it was offered: kept as it came,
+                    // and the rest still arrive.
+                    if (received != header.Size) Log.Write($"{header.Name} arrived with {received} of {header.Size} bytes (it changed while being sent).");
                     fileDone((int)header.Index);
                     break;
                 case Frames.Done:

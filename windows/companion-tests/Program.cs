@@ -60,6 +60,21 @@ Check(File.Exists(Path.Combine(dir, "got-gone.txt")) && new FileInfo(Path.Combin
 Check(File.ReadAllBytes(Path.Combine(dir, "got-big.bin")).SequenceEqual(big), "a file bigger than a chunk arrives intact");
 Check(File.Exists(Path.Combine(dir, "got-empty.txt")) && new FileInfo(Path.Combine(dir, "got-empty.txt")).Length == 0, "an empty file arrives");
 Check(done.SequenceEqual(new[] { 0, 1, 2 }), "each file is reported done, in order");
+// Offered at 10 bytes, only 5 left by the time it's sent: kept, and the next still arrives.
+var resized = Task.Run(() =>
+{
+    client.WriteJson(Frames.FileHeader, new FileHeaderMsg(0, "log.txt", 10));
+    client.WriteFrame(Frames.FileChunk, "short"u8);
+    client.WriteFrame(Frames.FileEnd, ReadOnlySpan<byte>.Empty);
+    client.WriteJson(Frames.FileHeader, new FileHeaderMsg(1, "next.txt", 2));
+    client.WriteFrame(Frames.FileChunk, "ok"u8);
+    client.WriteFrame(Frames.FileEnd, ReadOnlySpan<byte>.Empty);
+    client.WriteFrame(Frames.Done, ReadOnlySpan<byte>.Empty);
+});
+var resizedDone = new List<int>();
+server.ReceiveFiles(h => Path.Combine(dir, "resized-" + h.Name), resizedDone.Add);
+await resized;
+Check(File.ReadAllText(Path.Combine(dir, "resized-log.txt")) == "short" && File.ReadAllText(Path.Combine(dir, "resized-next.txt")) == "ok" && resizedDone.Count == 2, "a file that changed size doesn't stop the rest");
 
 // Folders: offered as their files with relative names, rebuilt on arrival.
 Directory.CreateDirectory(Path.Combine(dir, "photos", "2026"));

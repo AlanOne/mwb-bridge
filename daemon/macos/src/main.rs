@@ -253,6 +253,15 @@ fn run_session(
             while let Ok(ev) = clip_rx.try_recv() {
                 latest = Some(ev); // coalesce rapid successive changes to the last one
             }
+            // A file copy the companion couldn't deliver: PowerToys then.
+            let mut powertoys_only = false;
+            if latest.is_none()
+                && let Some(paths) = companion::link().and_then(|l| l.take_failed_copy())
+            {
+                println!("{} [file-copy] The companion couldn't take the copy, sending it the PowerToys way.", timestamp());
+                latest = Some(ClipboardEvent::Files(paths));
+                powertoys_only = true;
+            }
             if latest.is_some() {
                 // Whatever an older copy still has waiting is stale now.
                 clipboard::copied();
@@ -269,10 +278,11 @@ fn run_session(
                     stream.write_all(&encrypt_packages(&cipher, &mut write_chain, magic_number, packages))?;
                     println!("[client] Sent clipboard image ({len} bytes) to peer.");
                 }
-                Some(ClipboardEvent::Files(paths)) if companion::link().is_some_and(|l| l.is_connected()) && {
+                Some(ClipboardEvent::Files(paths)) if !powertoys_only && companion::link().is_some_and(|l| l.is_connected()) && {
                     // The companion takes every file, of any size, and
-                    // folders. If the offer can't be sent (the link just
-                    // died), the copy goes the PowerToys way below instead.
+                    // folders. If it turns out it can't (the link drops
+                    // meanwhile), the copy comes back from
+                    // `take_failed_copy` and goes the PowerToys way below.
                     companion::link().unwrap().offer_files(mwb_protocol::companion::CLIPBOARD_TO_WINDOWS, paths.clone(), "copy")
                 } => {}
                 Some(ClipboardEvent::Files(paths)) => {

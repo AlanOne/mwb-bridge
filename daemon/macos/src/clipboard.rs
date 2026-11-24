@@ -627,7 +627,16 @@ pub fn receive_companion_copy(link: &Arc<crate::companion::Link>, offer: mwb_pro
     let dir = root.join(offer.id.to_string());
     let link = link.clone();
     let shared = shared.clone();
+    // A slow fetch mustn't land over anything copied since (on either
+    // machine): only the latest companion copy goes on the clipboard, and
+    // only if the clipboard hasn't changed meanwhile.
+    static LATEST_OFFER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    LATEST_OFFER.store(offer.id, Ordering::SeqCst);
+    let before = pasteboard_change_count();
     std::thread::spawn(move || match link.fetch_files(&offer, &dir, |_| {}) {
+        Ok(paths) if LATEST_OFFER.load(Ordering::SeqCst) != offer.id || pasteboard_change_count() != before => {
+            println!("[file-copy] {} file(s) copied on Windows arrived after something newer was copied: not putting them on the clipboard.", paths.len());
+        }
         Ok(paths) => match Clipboard::new().and_then(|mut cb| cb.set().file_list(&paths)) {
             Ok(()) => {
                 *shared.last_applied_files.lock().unwrap() = paths.clone();
@@ -780,6 +789,11 @@ static PENDING_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
 /// older clipboard content still waiting to be pushed is stale.
 pub fn copied() {
     CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Which copy sent to Windows is the latest (see `copied`).
+pub fn generation() -> u64 {
+    CLIPBOARD_GENERATION.load(Ordering::SeqCst)
 }
 
 /// Copied content that goes the big path: pending until Windows asks.

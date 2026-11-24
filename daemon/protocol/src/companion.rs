@@ -233,34 +233,52 @@ impl<S: Read> FrameReader<S> {
 /// to folders aren't followed (they could loop), and empty folders carry
 /// nothing, so they don't arrive. Also returns what couldn't be read.
 pub fn expand_offer_paths(paths: &[std::path::PathBuf]) -> (Vec<(std::path::PathBuf, String)>, Vec<std::path::PathBuf>) {
-    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<(std::path::PathBuf, String)>, skipped: &mut Vec<std::path::PathBuf>) {
+    expand_capped(paths, MAX_OFFER_FILES)
+}
+
+/// `expand_offer_paths` stopping at `cap` files: whatever is left (the
+/// rest of a folder, later folders and files) is reported as skipped.
+fn expand_capped(paths: &[std::path::PathBuf], cap: usize) -> (Vec<(std::path::PathBuf, String)>, Vec<std::path::PathBuf>) {
+    // False once the offer is full: everything after that is left out.
+    fn walk(dir: &std::path::Path, prefix: &str, cap: usize, out: &mut Vec<(std::path::PathBuf, String)>, skipped: &mut Vec<std::path::PathBuf>) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             skipped.push(dir.to_path_buf());
-            return;
+            return true;
         };
         let mut entries: Vec<_> = entries.flatten().map(|e| e.path()).collect();
         entries.sort();
         for path in entries {
-            if out.len() >= MAX_OFFER_FILES {
-                skipped.push(path);
-                return;
+            if out.len() >= cap {
+                skipped.push(dir.to_path_buf());
+                return false;
             }
             let name = format!("{prefix}/{}", offer_part(&path));
             let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
             match std::fs::metadata(&path) {
                 Ok(m) if m.is_file() => out.push((path, name)),
-                Ok(m) if m.is_dir() && !is_link => walk(&path, &name, out, skipped),
+                Ok(m) if m.is_dir() && !is_link => {
+                    if !walk(&path, &name, cap, out, skipped) {
+                        return false;
+                    }
+                }
                 _ => skipped.push(path),
             }
         }
+        true
     }
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     for path in paths {
+        if out.len() >= cap {
+            skipped.push(path.clone());
+            continue;
+        }
         let name = offer_part(path);
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() => out.push((path.clone(), name)),
-            Ok(m) if m.is_dir() => walk(path, &name, &mut out, &mut skipped),
+            Ok(m) if m.is_dir() => {
+                walk(path, &name, cap, &mut out, &mut skipped);
+            }
             _ => skipped.push(path.clone()),
         }
     }
@@ -367,8 +385,10 @@ pub fn receive_files<R: Read>(
                     return Err(std::io::Error::other("file end before its header"));
                 };
                 file.sync_all()?;
+                // Changed size since it was offered (a log still being
+                // written): kept as it came, and the rest still arrive.
                 if received != header.size {
-                    return Err(std::io::Error::other(format!("{} arrived with {received} of {} bytes", header.name, header.size)));
+                    eprintln!("[companion] {} arrived with {received} of {} bytes (it changed while being sent).", header.name, header.size);
                 }
             }
             DONE => return Ok(written),
@@ -460,6 +480,11 @@ impl Transfers {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
         true
+    }
+
+    /// Whether offer `id` was cancelled lately.
+    pub fn was_cancelled(&self, id: u64) -> bool {
+        self.cancelled.lock().unwrap().contains(&id)
     }
 
     /// The ids of the transfers running now.
@@ -613,6 +638,43 @@ mod tests {
         assert_eq!(files[0].0, root.join("photos/2026/a.jpg"));
         assert_eq!(skipped, vec![root.join("photos/loop"), root.join("missing")]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_offer_stops_at_its_cap_across_folders_and_files() {
+        let root = std::env::temp_dir().join(format!("mwb-expand-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for f in ["a/1", "a/2", "b/1", "b/2", "c"] {
+            std::fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+            std::fs::write(root.join(f), b"x").unwrap();
+        }
+        let (files, skipped) = expand_capped(&[root.join("a"), root.join("b"), root.join("c")], 3);
+        let names: Vec<&str> = files.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, vec!["a/1", "a/2", "b/1"]);
+        assert_eq!(skipped, vec![root.join("b"), root.join("c")]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_that_changed_size_doesnt_stop_the_rest() {
+        let dir = std::env::temp_dir().join(format!("mwb-companion-resized-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ((mut aw, _ar), (_bw, mut br)) = pair();
+        let sender = std::thread::spawn(move || {
+            // Offered at 10 bytes, only 5 left by the time it's sent.
+            aw.write_json(FILE_HEADER, &FileHeader { index: 0, name: "log.txt".into(), size: 10 }).unwrap();
+            aw.write_frame(FILE_CHUNK, b"short").unwrap();
+            aw.write_frame(FILE_END, &[]).unwrap();
+            aw.write_json(FILE_HEADER, &FileHeader { index: 1, name: "next.txt".into(), size: 2 }).unwrap();
+            aw.write_frame(FILE_CHUNK, b"ok").unwrap();
+            aw.write_frame(FILE_END, &[]).unwrap();
+            aw.write_frame(DONE, &[]).unwrap();
+        });
+        let written = receive_files(&mut br, |h| Ok(dir.join(&h.name)), |_| {}).unwrap();
+        sender.join().unwrap();
+        assert_eq!(std::fs::read(&written[0]).unwrap(), b"short");
+        assert_eq!(std::fs::read(&written[1]).unwrap(), b"ok");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

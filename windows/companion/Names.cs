@@ -113,6 +113,11 @@ static class Names
         }
         foreach (var item in items)
         {
+            if (result.Count >= MaxOfferFiles)
+            {
+                skipped($"{item} (the offer already has {MaxOfferFiles} files)");
+                continue;
+            }
             try
             {
                 if (File.Exists(item))
@@ -138,6 +143,7 @@ static class Names
                     var subdirs = new List<(string, string)>();
                     foreach (var entry in entries)
                     {
+                        if (result.Count >= MaxOfferFiles) break;
                         var entryName = $"{name}/{Path.GetFileName(entry)}";
                         FileAttributes attributes;
                         try { attributes = File.GetAttributes(entry); }

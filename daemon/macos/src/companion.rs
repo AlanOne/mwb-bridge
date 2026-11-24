@@ -30,6 +30,10 @@ pub struct Link {
     config: Arc<Mutex<Config>>,
     /// File transfers to and from the companion going on now.
     pub transfers: proto::Transfers,
+    /// A file copy that couldn't be delivered (the link dropped), with the
+    /// clipboard generation it was copied at: handed back to the network
+    /// thread, which sends it the PowerToys way instead.
+    failed_copy: Mutex<Option<(u64, Vec<PathBuf>)>>,
 }
 
 static LINK: OnceLock<Arc<Link>> = OnceLock::new();
@@ -50,6 +54,7 @@ pub fn start(config: Arc<Mutex<Config>>, peer: fn() -> Option<SocketAddr>) {
         clipboard_offers: Mutex::new(Vec::new()),
         config,
         transfers: proto::Transfers::default(),
+        failed_copy: Mutex::new(None),
     });
     if LINK.set(link.clone()).is_ok() {
         let watched = link.clone();
@@ -210,6 +215,13 @@ impl Link {
         }
     }
 
+    /// The file copy `offer_files` couldn't deliver, if nothing has been
+    /// copied since.
+    pub fn take_failed_copy(&self) -> Option<Vec<PathBuf>> {
+        let (generation, paths) = self.failed_copy.lock().unwrap().take()?;
+        (generation == crate::clipboard::generation()).then_some(paths)
+    }
+
     /// Offers of files dragged on Windows that arrived since the last call.
     pub fn take_offers(&self) -> Vec<Offer> {
         std::mem::take(&mut *self.offers.lock().unwrap())
@@ -230,14 +242,24 @@ impl Link {
     /// empty folders, say) there's nothing to do, which counts as handled.
     /// Walking folders can take a while, so it happens on a thread of its
     /// own, not the caller's (the input thread). Returns false only when the
-    /// companion isn't connected (the caller then falls back to PowerToys);
-    /// if the link drops while the folders are walked, the offer is lost.
+    /// companion isn't connected (the caller then falls back to PowerToys).
+    /// A copy that can't be delivered after all (the link drops while the
+    /// folders are walked, or sending fails) comes back from
+    /// `take_failed_copy`, so it can still go the PowerToys way; a drag's
+    /// files are lost then (its drag has already ended).
     pub fn offer_files(self: &Arc<Self>, frame: u32, paths: Vec<PathBuf>, what: &'static str) -> bool {
         if !self.is_connected() {
             return false;
         }
         let link = self.clone();
+        let generation = crate::clipboard::generation();
         std::thread::spawn(move || {
+            // A copy that doesn't get through goes back for PowerToys.
+            let give_back = |paths: Vec<PathBuf>| {
+                if frame == proto::CLIPBOARD_TO_WINDOWS {
+                    *link.failed_copy.lock().unwrap() = Some((generation, paths));
+                }
+            };
             let (files, skipped) = proto::expand_offer_paths(&paths);
             for path in &skipped {
                 println!("[companion] Not sending {}: it couldn't be read, or is a link to a folder inside one.", path.display());
@@ -256,13 +278,19 @@ impl Link {
             };
             if !link.send(frame, &offer) {
                 eprintln!("[companion] Couldn't offer {what} {id}: the companion link dropped.");
+                give_back(paths);
                 return;
             }
             let names: Vec<&str> = offer.files.iter().take(20).map(|f| f.name.as_str()).collect();
             println!("[companion] Sending {what} {id} to Windows: {}{}", names.join(", "), if offer.files.len() > 20 { ", ..." } else { "" });
             match link.put_files(id, &files) {
                 Ok(()) => println!("[companion] Sent {what} {id}'s {} file(s).", files.len()),
-                Err(e) => eprintln!("[companion] Sending {what} {id} failed: {e}"),
+                Err(e) => {
+                    eprintln!("[companion] Sending {what} {id} failed: {e}");
+                    if !link.transfers.was_cancelled(id) {
+                        give_back(paths);
+                    }
+                }
             }
         });
         true
@@ -365,7 +393,7 @@ fn create_placeholders(offer: &Offer, dir: &Path, mut on_created: impl FnMut(&Pa
 /// Where each of the offer's files goes under `dir`, and the top-level
 /// items (see `create_placeholders`).
 fn lay_out(offer: &Offer, dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
-    // Lowercased, as APFS compares names by default.
+    // Keyed by `same_name_key`, as APFS compares names.
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Offered folder path (as sent) -> where it was rebuilt.
     let mut folders: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
@@ -400,15 +428,23 @@ fn lay_out(offer: &Offer, dir: &Path) -> std::io::Result<(Vec<PathBuf>, Vec<Path
     Ok((files, top))
 }
 
+/// How APFS tells names apart by default: ignoring case, and ignoring how
+/// accented letters are composed (`é` as one character or as `e` plus an
+/// accent, both legal and distinct on Windows).
+fn same_name_key(path: &Path) -> String {
+    let composed = objc2_foundation::NSString::from_str(&path.to_string_lossy()).precomposedStringWithCanonicalMapping().to_string();
+    composed.to_lowercase()
+}
+
 /// `parent/name`, or `parent/stem (2).ext` and so on, whichever nothing in
-/// `taken` has yet; then it has.
+/// `taken` has yet (as APFS compares names); then it has.
 fn claim(parent: &Path, name: &str, taken: &mut std::collections::HashSet<String>) -> PathBuf {
     let p = Path::new(name);
     let stem = p.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let mut path = parent.join(name);
     let mut n = 2;
-    while !taken.insert(path.to_string_lossy().to_lowercase()) {
+    while !taken.insert(same_name_key(&path)) {
         path = parent.join(format!("{stem} ({n}){ext}"));
         n += 1;
     }
@@ -481,7 +517,7 @@ mod tests {
     fn folders_are_rebuilt_and_only_top_level_items_are_handed_on() {
         let dst = std::env::temp_dir().join(format!("mwb-companion-folders-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
-        let names = ["photos/2026/a.jpg", "photos/b.jpg", "photos", "../evil.txt", "photos/2026/a.jpg", "Photos/c.jpg", "docs/readme", "docs/readme/notes.txt"];
+        let names = ["photos/2026/a.jpg", "photos/b.jpg", "photos", "../evil.txt", "photos/2026/a.jpg", "Photos/c.jpg", "docs/readme", "docs/readme/notes.txt", "caf\u{e9}.txt", "cafe\u{301}.txt"];
         let offer = Offer { id: 1, files: names.iter().map(|n| FileInfo { name: n.to_string(), size: 0 }).collect() };
         let mut created = Vec::new();
         let (files, top) = create_placeholders(&offer, &dst, |p| created.push(p.to_path_buf())).unwrap();
@@ -496,8 +532,11 @@ mod tests {
             // A file where a folder of the same name also goes.
             dst.join("docs/readme"),
             dst.join("docs/readme (2)/notes.txt"),
+            // The same name composed two ways: one file to APFS.
+            dst.join("caf\u{e9}.txt"),
+            dst.join("cafe\u{301} (2).txt"),
         ]);
-        assert_eq!(top, vec![dst.join("photos"), dst.join("photos (2)"), dst.join("evil.txt"), dst.join("Photos (3)"), dst.join("docs")]);
+        assert_eq!(top, vec![dst.join("photos"), dst.join("photos (2)"), dst.join("evil.txt"), dst.join("Photos (3)"), dst.join("docs"), dst.join("caf\u{e9}.txt"), dst.join("cafe\u{301} (2).txt")]);
         assert_eq!(created, top);
         assert_eq!(top.len(), mwb_protocol::companion::top_level_count(&offer));
         assert!(files.iter().all(|f| f.is_file()));

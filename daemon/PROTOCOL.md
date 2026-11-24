@@ -762,9 +762,17 @@ every file in it, named by its path from the folder down (a `\` in a
 name is sent as `_`, since receivers also read it as a separator). Links to
 folders inside a dragged folder aren't followed (the dragged folder itself
 is, if it's a link); links to files are. Empty folders carry nothing, so a
-dragged empty folder sends nothing at all. An offer stops at 50,000 files.
-Walking happens off the UI and input threads, and a file that vanishes
-before it's sent goes empty, keeping the others at their indexes. The
+dragged empty folder sends nothing at all. An offer stops at 50,000 files,
+everything after that (the rest of the folder, later folders and files)
+left out and logged. Walking happens off the UI and input threads; a drag
+whose catch ended meanwhile, or a copy something newer replaced, isn't
+offered once the walk is done, and a slow copy that arrives after
+something newer was copied isn't put on the clipboard. A file that
+vanishes before it's sent goes empty, keeping the others at their indexes,
+and one that changed size since it was offered goes as it is then (never
+more than its header says), the receiver logging the difference rather
+than failing the rest. On the Mac, a copy the companion can't take after
+all (the link drops while its folders are walked) goes the PowerToys way. The
 receiver rebuilds the folders under its own drop folder, each path part
 made safe (`.`/`..` dropped; on Windows, device names like `CON` get a `_`
 in front), every offered folder in one place, and any name that would land

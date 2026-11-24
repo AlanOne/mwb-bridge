@@ -110,15 +110,28 @@ sealed class Coordinator
         Task.Run(() =>
         {
             var files = Names.Expand(dropped, skipped => Log.Write($"[to-mac] Skipping {skipped}."));
-            if (files.Length == 0)
+            // Sent from the UI thread, and only if this catch is still the
+            // one going on: a drag that ended (or came back and started
+            // over) during the walk mustn't start a drag of it on the Mac.
+            Post(() =>
             {
-                Log.Write("[to-mac] Nothing to send in that drag (only empty folders?).");
-                return;
-            }
-            var sent = Offer(Frames.OfferToMac, files, "drag", out var id);
-            // Not sent (no bridge right now): tried again if the drag re-enters.
-            if (!sent) Post(() => { if (session == _catchSession) _offered = false; });
-            if (!sent) Log.Write($"[to-mac] Couldn't send drag {id} to the bridge.");
+                if (session != _catchSession || !_catching)
+                {
+                    Log.Write("[to-mac] That drag ended while its folders were walked: not offering it.");
+                    return;
+                }
+                if (files.Length == 0)
+                {
+                    Log.Write("[to-mac] Nothing to send in that drag (only empty folders?).");
+                    return;
+                }
+                if (Offer(Frames.OfferToMac, files, "drag", out var id)) return;
+                // No bridge right now. OLE won't enter the catcher again
+                // while the drag stays over it, so try again from here.
+                Log.Write($"[to-mac] Couldn't send drag {id} to the bridge, trying again in a second.");
+                _offered = false;
+                After(1000, () => { if (session == _catchSession) OnFilesCaught(dropped); });
+            });
         });
     }
 
@@ -201,6 +214,9 @@ sealed class Coordinator
 
     string[] _lastSetOnClipboard = Array.Empty<string>();
     string[] _lastOffered = Array.Empty<string>();
+    // Moves on with every copy (UI thread only), so a walk can tell it was
+    // overtaken.
+    int _copyGeneration;
     DateTime _lastOfferedAt;
 
     /// Files copied on the Mac: put them on Windows' clipboard once they've
@@ -234,7 +250,13 @@ sealed class Coordinator
         string[] files;
         try
         {
-            if (!Clipboard.ContainsFileDropList()) return;
+            if (!Clipboard.ContainsFileDropList())
+            {
+                // Something else copied: a file copy still being walked is
+                // stale now.
+                _copyGeneration++;
+                return;
+            }
             files = Clipboard.GetFileDropList().Cast<string>().ToArray();
         }
         catch (Exception e)
@@ -244,18 +266,31 @@ sealed class Coordinator
         }
         // Our own paste of the Mac's files, or Explorer announcing the same
         // copy twice in a row.
-        if (files.SequenceEqual(_lastSetOnClipboard)) return;
+        if (files.SequenceEqual(_lastSetOnClipboard))
+        {
+            _copyGeneration++; // newer than any copy still being walked
+            return;
+        }
         if (files.SequenceEqual(_lastOffered) && DateTime.Now - _lastOfferedAt < TimeSpan.FromSeconds(2)) return;
         _lastOffered = files;
         _lastOfferedAt = DateTime.Now;
+        var copy = ++_copyGeneration;
         // Folders go as every file inside them (see Names.Expand), which can
         // take a while: not on the UI thread.
         Task.Run(() =>
         {
             var sendable = Names.Expand(files, skipped => Log.Write($"[copy] Skipping {skipped}."));
             if (sendable.Length == 0) return;
-            var sent = Offer(Frames.ClipboardToMac, sendable, "copy", out var id);
-            if (!sent) Log.Write($"[copy] Couldn't offer copy {id}: no bridge connected.");
+            // Only if nothing newer was copied during the walk.
+            Post(() =>
+            {
+                if (copy != _copyGeneration)
+                {
+                    Log.Write("[copy] Something newer was copied while that copy's folders were walked: not offering it.");
+                    return;
+                }
+                if (!Offer(Frames.ClipboardToMac, sendable, "copy", out var id)) Log.Write($"[copy] Couldn't offer copy {id}: no bridge connected.");
+            });
         });
     }
 
