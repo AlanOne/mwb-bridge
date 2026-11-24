@@ -454,6 +454,8 @@ sealed class IncomingDrop
     public string[] Paths { get; }
     /// What a drop or a paste hands on: loose files and rebuilt folders.
     public string[] TopLevel { get; }
+    /// All the files' bytes together, for the transfer's progress.
+    public long Total { get; }
     readonly bool[] _done;
     public volatile bool Cancelled;
     public volatile bool Failed;
@@ -464,9 +466,10 @@ sealed class IncomingDrop
 
     public bool IsComplete { get { lock (_done) return _done.All(d => d); } }
 
-    IncomingDrop(ulong id, string[] paths, string[] topLevel)
+    IncomingDrop(ulong id, string[] paths, string[] topLevel, long total)
     {
         Id = id;
+        Total = total;
         Paths = paths;
         TopLevel = topLevel;
         _done = new bool[paths.Length];
@@ -491,7 +494,8 @@ sealed class IncomingDrop
             Directory.CreateDirectory(Path.GetDirectoryName(p)!);
             File.WriteAllBytes(p, Array.Empty<byte>());
         }
-        return new IncomingDrop(offer.Id, paths, top.Select(t => Path.Combine(dir, t)).ToArray());
+        var total = offer.Files.Aggregate(0L, (sum, f) => sum + (long)Math.Min(f.Size, (ulong)long.MaxValue / 2));
+        return new IncomingDrop(offer.Id, paths, top.Select(t => Path.Combine(dir, t)).ToArray(), total);
     }
 
     public void FileDone(int index)

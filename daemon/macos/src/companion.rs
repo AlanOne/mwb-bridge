@@ -28,6 +28,8 @@ pub struct Link {
     clipboard_offers: Mutex<Vec<Offer>>,
     /// The Windows PC currently connected to (its key and our name).
     config: Arc<Mutex<Config>>,
+    /// File transfers to and from the companion going on now.
+    pub transfers: proto::Transfers,
 }
 
 static LINK: OnceLock<Arc<Link>> = OnceLock::new();
@@ -47,6 +49,7 @@ pub fn start(config: Arc<Mutex<Config>>, peer: fn() -> Option<SocketAddr>) {
         offers: Mutex::new(Vec::new()),
         clipboard_offers: Mutex::new(Vec::new()),
         config,
+        transfers: proto::Transfers::default(),
     });
     if LINK.set(link.clone()).is_ok() {
         let watched = link.clone();
@@ -140,6 +143,13 @@ impl Link {
                     }
                     Err(e) => eprintln!("[companion] Unreadable clipboard offer: {e}"),
                 },
+                Ok((proto::CANCEL, body)) => match serde_json::from_slice::<proto::Cancel>(&body) {
+                    Ok(cancel) => {
+                        println!("[companion] Windows cancelled transfer {}.", cancel.id);
+                        self.transfers.cancel(cancel.id);
+                    }
+                    Err(e) => eprintln!("[companion] Unreadable cancel: {e}"),
+                },
                 Ok((other, _)) => println!("[companion] Ignoring frame {other}."),
                 Err(e) => {
                     println!("[companion] Connection to the companion ended: {e}");
@@ -187,6 +197,17 @@ impl Link {
 
     pub fn send_empty(&self, frame: u32) -> bool {
         self.send_frame(frame, &[])
+    }
+
+    /// Stops every transfer going on (the menu bar's "Cancel Transfer"):
+    /// tells the companion first, so it takes the closed connection for a
+    /// cancel, then cuts it here.
+    pub fn cancel_all(&self) {
+        for id in self.transfers.ids() {
+            println!("[companion] Cancelling transfer {id}.");
+            self.send(proto::CANCEL, &proto::Cancel { id });
+            self.transfers.cancel(id);
+        }
     }
 
     /// Offers of files dragged on Windows that arrived since the last call.
@@ -264,7 +285,17 @@ impl Link {
     /// its files, and the folders files inside folders were rebuilt in.
     pub fn fetch_files(&self, offer: &Offer, dir: &Path, on_created: impl FnMut(&Path)) -> std::io::Result<Vec<PathBuf>> {
         let (files, top) = create_placeholders(offer, dir, on_created)?;
-        let result = self.data_connection("get", offer.id).and_then(|(_writer, mut reader)| receive_into(&mut reader, files));
+        let total = offer.files.iter().map(|f| f.size).sum();
+        let result = match self.transfers.begin(offer.id, false, total) {
+            Some(transfer) => {
+                let received = self.data_connection("get", offer.id).and_then(|(_writer, mut reader)| {
+                    transfer.attach(reader.get_ref());
+                    receive_into(&mut reader, files, |n| transfer.add(n))
+                });
+                transfer.outcome(received)
+            }
+            None => Err(proto::cancelled_error()),
+        };
         if let Err(e) = result {
             for path in &top {
                 let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
@@ -278,8 +309,13 @@ impl Link {
     /// Sends `files` (each with the name it was offered under) as drag
     /// `id`'s bytes.
     pub fn put_files(&self, id: u64, files: &[(PathBuf, String)]) -> std::io::Result<()> {
-        let (mut writer, _reader) = self.data_connection("put", id)?;
-        proto::send_files(&mut writer, files)
+        let total = files.iter().map(|(p, _)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum();
+        let transfer = self.transfers.begin(id, true, total).ok_or_else(proto::cancelled_error)?;
+        let sent = self.data_connection("put", id).and_then(|(mut writer, _reader)| {
+            transfer.attach(writer.get_ref());
+            proto::send_files(&mut writer, files, |n| transfer.add(n))
+        });
+        transfer.outcome(sent)
     }
 }
 
@@ -380,10 +416,12 @@ fn claim(parent: &Path, name: &str, taken: &mut std::collections::HashSet<String
 }
 
 /// Fills the files at `paths` from `reader`.
-fn receive_into(reader: &mut proto::FrameReader<TcpStream>, paths: Vec<PathBuf>) -> std::io::Result<Vec<PathBuf>> {
-    proto::receive_files(reader, |h| {
-        paths.get(h.index as usize).cloned().ok_or_else(|| std::io::Error::other(format!("file {} isn't in the offer", h.index)))
-    })
+fn receive_into(reader: &mut proto::FrameReader<TcpStream>, paths: Vec<PathBuf>, progress: impl FnMut(u64)) -> std::io::Result<Vec<PathBuf>> {
+    proto::receive_files(
+        reader,
+        |h| paths.get(h.index as usize).cloned().ok_or_else(|| std::io::Error::other(format!("file {} isn't in the offer", h.index))),
+        progress,
+    )
 }
 
 #[cfg(test)]
@@ -420,7 +458,7 @@ mod tests {
             let (mut w, mut r) = proto::open(s, read, KEY).unwrap();
             let hello: Hello = r.read_json(proto::HELLO).unwrap();
             assert_eq!((hello.op.as_deref(), hello.id), (Some("get"), Some(9)));
-            proto::send_files(&mut w, &[(served.join("one.txt"), "one.txt".into()), (served.join("two.txt"), "one.txt".into())]).unwrap();
+            proto::send_files(&mut w, &[(served.join("one.txt"), "one.txt".into()), (served.join("two.txt"), "one.txt".into())], |_| {}).unwrap();
         });
 
         // Two files with the same name, as from two different folders.
@@ -429,7 +467,7 @@ mod tests {
         let mut created = Vec::new();
         let dst = dir.join("dst");
         let (placeholders, _) = create_placeholders(&offer, &dst, |p| created.push((p.to_path_buf(), std::fs::metadata(p).unwrap().len()))).unwrap();
-        let paths = receive_into(&mut r, placeholders).unwrap();
+        let paths = receive_into(&mut r, placeholders, |_| {}).unwrap();
         companion.join().unwrap();
 
         assert_eq!(paths, vec![dst.join("one.txt"), dst.join("one (2).txt")]);

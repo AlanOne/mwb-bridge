@@ -745,8 +745,17 @@ existed) and the companion logs a mismatch. It closes a connection that sends no
 `HELLO` within 10s, keeps the control connection alive with TCP keepalive
 (15s, 5s, 3 probes) and gives up on a data connection that stalls for 30s.
 One long-lived control connection carries `ACTIVE` (2), `INACTIVE` (3,
-`{"drag_over", "button_held", "let_go"}`), `OFFER_TO_WINDOWS` (4) and `CANCEL` (7) from the bridge
-and `OFFER_TO_MAC` (5) from the companion; an offer is `{"id", "files":
+`{"drag_over", "button_held", "let_go"}`), `OFFER_TO_WINDOWS` (4) from the bridge,
+`OFFER_TO_MAC` (5) from the companion, and `CANCEL` (7, `{"id"}`) either
+way. Since version 4 `CANCEL` stops that offer's transfer: the side that
+cancels sends it, then closes its end of the data connection, so the
+other side takes the closed connection for a cancel, not a failure, and
+closes its end too; a drag of it ends without a drop, and a copy of it
+never reaches the clipboard. Both sides remember the last 64 cancelled
+ids and refuse a data connection for one of them, in case the cancel
+beats the connection. An older peer ignores `CANCEL` and only sees its
+connection close. Both sides count each chunk's bytes against the offer's
+sizes for the progress they show. An offer is `{"id", "files":
 [{"name", "size"}]}`. Since version 3 a name can be a relative path
 (`photos/2026/a.jpg`, always `/`): a dragged or copied folder is offered as
 every file in it, named by its path from the folder down (a `\` in a

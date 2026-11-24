@@ -14,7 +14,8 @@ static class Frames
 {
     /// Same as the bridge's `PROTOCOL_VERSION`: 2 has `Inactive.DragOver`,
     /// 3 offers folders as relative file names ("folder/sub/a.txt").
-    public const uint Version = 3;
+    /// 4: Cancel goes both ways and stops a transfer.
+    public const uint Version = 4;
 
     public const uint Hello = 1;
     public const uint Active = 2;
@@ -207,7 +208,7 @@ sealed class FrameConnection : IDisposable
     public static T Parse<T>(byte[] body) => JsonSerializer.Deserialize<T>(body, Frames.Json) ?? throw new IOException("empty message");
 
     /// Per file a header, its bytes, an end; then Done.
-    public void SendFiles(IReadOnlyList<(string Path, string Name)> files)
+    public void SendFiles(IReadOnlyList<(string Path, string Name)> files, Action<long>? progress = null)
     {
         var buf = new byte[Frames.ChunkSize];
         for (var i = 0; i < files.Count; i++)
@@ -223,6 +224,7 @@ sealed class FrameConnection : IDisposable
             while ((n = file.Read(buf, 0, buf.Length)) > 0)
             {
                 WriteFrame(Frames.FileChunk, buf.AsSpan(0, n));
+                progress?.Invoke(n);
             }
             WriteFrame(Frames.FileEnd, ReadOnlySpan<byte>.Empty);
         }
@@ -230,7 +232,7 @@ sealed class FrameConnection : IDisposable
     }
 
     /// Receives what SendFiles sends; file `index` goes to `dest(header)`.
-    public void ReceiveFiles(Func<FileHeaderMsg, string> dest, Action<int> fileDone)
+    public void ReceiveFiles(Func<FileHeaderMsg, string> dest, Action<int> fileDone, Action<long>? progress = null)
     {
         FileStream? current = null;
         FileHeaderMsg? header = null;
@@ -249,6 +251,7 @@ sealed class FrameConnection : IDisposable
                     if (current == null) throw new IOException("file data before its header");
                     current.Write(body);
                     received += (ulong)body.Length;
+                    progress?.Invoke(body.Length);
                     break;
                 case Frames.FileEnd:
                     if (current == null || header == null) throw new IOException("file end before its header");

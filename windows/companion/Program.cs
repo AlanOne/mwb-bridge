@@ -27,6 +27,11 @@ sealed class TrayContext : ApplicationContext
     readonly NotifyIcon _tray;
     bool _lightTaskbar;
     readonly ToolStripMenuItem _statusItem = new("Waiting for the bridge") { Enabled = false };
+    // Shown only while a transfer runs.
+    readonly ToolStripMenuItem _transferItem = new("") { Enabled = false, Available = false };
+    readonly ToolStripMenuItem _cancelItem = new("Cancel transfer") { Available = false };
+    readonly System.Windows.Forms.Timer _progressTimer = new() { Interval = 500 };
+    string? _bridge;
     readonly Control _ui = new();
     ClipboardWatcher? _clipboard;
 
@@ -35,6 +40,8 @@ sealed class TrayContext : ApplicationContext
         _ = _ui.Handle; // the UI thread's marshalling target
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
+        menu.Items.Add(_transferItem);
+        menu.Items.Add(_cancelItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open log", null, (_, _) => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Log.FilePath) { UseShellExecute = true }));
         menu.Items.Add("Quit", null, (_, _) => { _tray!.Visible = false; ExitThread(); });
@@ -42,7 +49,11 @@ sealed class TrayContext : ApplicationContext
         Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnPreferenceChanged;
 
         var coordinator = new Coordinator(_ui);
-        new Server(config, coordinator, SetStatus, Warn).Start();
+        var server = new Server(config, coordinator, SetStatus, Warn);
+        server.Start();
+        _cancelItem.Click += (_, _) => server.CancelAll();
+        _progressTimer.Tick += (_, _) => ShowProgress();
+        _progressTimer.Start();
         _clipboard = new ClipboardWatcher(coordinator.OnClipboardChanged);
 
         if (Config.MwbTransferFileOn())
@@ -100,9 +111,35 @@ sealed class TrayContext : ApplicationContext
     {
         _ui.BeginInvoke(() =>
         {
+            _bridge = bridge;
             _statusItem.Text = bridge == null ? "Waiting for the bridge" : $"Connected to {bridge}";
-            _tray.Text = bridge == null ? "MWB Bridge Companion: waiting" : $"MWB Bridge Companion: {bridge}";
+            _tray.Text = TrayText();
         });
+    }
+
+    string TrayText() => _bridge == null ? "MWB Bridge Companion: waiting" : $"MWB Bridge Companion: {_bridge}";
+
+    /// The running transfers' line and "Cancel transfer" in the menu, and
+    /// their percentage in the tooltip.
+    void ShowProgress()
+    {
+        var progress = Transfers.ProgressLine(_bridge ?? "the bridge");
+        var shown = progress != null;
+        if (progress is var (line, pct))
+        {
+            _transferItem.Text = line;
+            var tip = $"MWB Bridge Companion: {(Transfers.Snapshot().All(t => t.Sending) ? "sending" : "receiving")} {pct}%";
+            if (_tray.Text != tip) _tray.Text = tip;
+        }
+        else if (_transferItem.Available)
+        {
+            _tray.Text = TrayText();
+        }
+        if (_transferItem.Available != shown)
+        {
+            _transferItem.Available = shown;
+            _cancelItem.Available = shown;
+        }
     }
 }
 

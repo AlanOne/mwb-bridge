@@ -29,7 +29,9 @@ pub const COMPANION_PORT: u16 = 15102;
 /// `let_go` (version 1, sent as no version at all, had only `button_held`).
 /// 3: an offer's file names can be relative paths (`folder/sub/a.txt`,
 /// always `/`), so folders carry across; an older receiver flattens them.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// 4: `CANCEL` goes both ways and stops a transfer (an older peer ignores
+/// it, and only sees its data connection close).
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// First frame on every connection.
 pub const HELLO: u32 = 1;
@@ -43,7 +45,12 @@ pub const INACTIVE: u32 = 3;
 /// them under the cursor. `Offer` payload; the bytes follow over a `put`
 /// data connection.
 pub const OFFER_TO_WINDOWS: u32 = 4;
-/// The drag of an offer ended without a drop. `Cancel` payload.
+/// Either way: stop offer `id` (`Cancel` payload). Its transfer is given
+/// up on both sides, which close its data connection, a drag of it ends
+/// without a drop, and a copy of it never reaches the clipboard. The side
+/// that cancels sends this first, then closes its end, so the other side
+/// knows the closed connection was a cancel, not a failure. A cancel that
+/// comes before the data connection makes that connection be refused.
 pub const CANCEL: u32 = 7;
 /// Files copied on this machine: put them on Windows' clipboard once they
 /// arrive. `Offer` payload; the bytes follow over a `put` data connection.
@@ -206,6 +213,10 @@ impl<S: Read> FrameReader<S> {
     }
 
     /// Reads one frame, which must be of `expected` type, as JSON.
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
     pub fn read_json<T: for<'de> Deserialize<'de>>(&mut self, expected: u32) -> std::io::Result<T> {
         let (frame_type, body) = self.read_frame()?;
         if frame_type != expected {
@@ -292,8 +303,9 @@ pub fn top_level_count(offer: &Offer) -> usize {
 }
 
 /// Sends files over a data connection whose `HELLO` is done: per file a
-/// header, its bytes, an end, then `DONE`.
-pub fn send_files<S: Write>(writer: &mut FrameWriter<S>, files: &[(std::path::PathBuf, String)]) -> std::io::Result<()> {
+/// header, its bytes, an end, then `DONE`. `progress` gets the number of
+/// bytes of each chunk once it's sent.
+pub fn send_files<S: Write>(writer: &mut FrameWriter<S>, files: &[(std::path::PathBuf, String)], mut progress: impl FnMut(u64)) -> std::io::Result<()> {
     for (index, (path, name)) in files.iter().enumerate() {
         // A file that went away (or can't be read) since the offer goes
         // empty, so the others still arrive at their indexes.
@@ -316,6 +328,7 @@ pub fn send_files<S: Write>(writer: &mut FrameWriter<S>, files: &[(std::path::Pa
                 break;
             }
             writer.write_frame(FILE_CHUNK, &buf[..n])?;
+            progress(n as u64);
         }
         writer.write_frame(FILE_END, &[])?;
     }
@@ -323,10 +336,12 @@ pub fn send_files<S: Write>(writer: &mut FrameWriter<S>, files: &[(std::path::Pa
 }
 
 /// Receives files sent by `send_files`, writing file `index` to
-/// `dest(index, header)` as it arrives. Returns the paths written, in order.
+/// `dest(index, header)` as it arrives, and passing the size of each chunk
+/// written to `progress`. Returns the paths written, in order.
 pub fn receive_files<R: Read>(
     reader: &mut FrameReader<R>,
     mut dest: impl FnMut(&FileHeader) -> std::io::Result<std::path::PathBuf>,
+    mut progress: impl FnMut(u64),
 ) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut written = Vec::new();
     let mut current: Option<(std::fs::File, u64, FileHeader)> = None;
@@ -345,6 +360,7 @@ pub fn receive_files<R: Read>(
                 };
                 file.write_all(&body)?;
                 *received += body.len() as u64;
+                progress(body.len() as u64);
             }
             FILE_END => {
                 let Some((file, received, header)) = current.take() else {
@@ -359,6 +375,206 @@ pub fn receive_files<R: Read>(
             other => return Err(std::io::Error::other(format!("unexpected frame {other} in a file transfer"))),
         }
     }
+}
+
+/// The error a cancelled transfer ends with.
+pub fn cancelled_error() -> std::io::Error {
+    std::io::Error::other("the transfer was cancelled")
+}
+
+/// The transfers going on on this side, for showing their progress and
+/// cancelling them.
+#[derive(Default)]
+pub struct Transfers {
+    active: std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<Transfer>>>,
+    /// Offers cancelled lately, so a transfer of one that only starts
+    /// afterwards is refused. The last few are kept.
+    cancelled: std::sync::Mutex<std::collections::VecDeque<u64>>,
+}
+
+struct Transfer {
+    sending: bool,
+    total: u64,
+    done: std::sync::atomic::AtomicU64,
+    cancelled: std::sync::atomic::AtomicBool,
+    started: std::time::Instant,
+    /// A handle to its data connection, to cut it on a cancel.
+    stream: std::sync::Mutex<Option<std::net::TcpStream>>,
+}
+
+/// One transfer's progress, as `Transfers::active` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub id: u64,
+    pub sending: bool,
+    pub total: u64,
+    pub done: u64,
+    pub running_for: std::time::Duration,
+}
+
+/// A running transfer; it's over when this is dropped.
+pub struct TransferGuard<'a> {
+    transfers: &'a Transfers,
+    id: u64,
+    transfer: std::sync::Arc<Transfer>,
+}
+
+const REMEMBERED_CANCELS: usize = 64;
+
+impl Transfers {
+    /// Starts tracking offer `id`'s transfer of `total` bytes. `None` if
+    /// it was cancelled already.
+    pub fn begin(&self, id: u64, sending: bool, total: u64) -> Option<TransferGuard<'_>> {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        if self.cancelled.lock().unwrap().contains(&id) {
+            return None;
+        }
+        let transfer = std::sync::Arc::new(Transfer {
+            sending,
+            total,
+            done: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
+            started: std::time::Instant::now(),
+            stream: std::sync::Mutex::new(None),
+        });
+        self.active.lock().unwrap().insert(id, transfer.clone());
+        Some(TransferGuard { transfers: self, id, transfer })
+    }
+
+    /// Cancels offer `id`: its transfer stops (its data connection is cut)
+    /// if it's running, and is refused if it hasn't started yet. Whether it
+    /// was running.
+    pub fn cancel(&self, id: u64) -> bool {
+        {
+            let mut cancelled = self.cancelled.lock().unwrap();
+            if !cancelled.contains(&id) {
+                if cancelled.len() == REMEMBERED_CANCELS {
+                    cancelled.pop_front();
+                }
+                cancelled.push_back(id);
+            }
+        }
+        let Some(transfer) = self.active.lock().unwrap().get(&id).cloned() else { return false };
+        transfer.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(stream) = transfer.stream.lock().unwrap().as_ref() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        true
+    }
+
+    /// The ids of the transfers running now.
+    pub fn ids(&self) -> Vec<u64> {
+        self.active.lock().unwrap().keys().copied().collect()
+    }
+
+    /// How the running transfers are getting on, oldest first.
+    pub fn active(&self) -> Vec<Progress> {
+        use std::sync::atomic::Ordering;
+        let mut list: Vec<Progress> = self
+            .active
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&id, t)| Progress {
+                id,
+                sending: t.sending,
+                total: t.total,
+                done: t.done.load(Ordering::Relaxed),
+                running_for: t.started.elapsed(),
+            })
+            .collect();
+        list.sort_by(|a, b| b.running_for.cmp(&a.running_for).then(a.id.cmp(&b.id)));
+        list
+    }
+}
+
+impl TransferGuard<'_> {
+    /// The transfer's data connection, cut if it's cancelled (at once, if
+    /// that happened already).
+    pub fn attach(&self, stream: &std::net::TcpStream) {
+        let mut slot = self.transfer.stream.lock().unwrap();
+        match stream.try_clone() {
+            Ok(handle) => *slot = Some(handle),
+            Err(e) => eprintln!("[companion] Can't cancel transfer {} once started: {e}", self.id),
+        }
+        if self.cancelled() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// `n` more bytes went through.
+    pub fn add(&self, n: u64) {
+        self.transfer.done.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.transfer.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `result`, or `cancelled_error` instead of the error a cancel caused.
+    pub fn outcome<T>(&self, result: std::io::Result<T>) -> std::io::Result<T> {
+        match result {
+            Err(_) if self.cancelled() => Err(cancelled_error()),
+            other => other,
+        }
+    }
+}
+
+impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        let mut active = self.transfers.active.lock().unwrap();
+        if active.get(&self.id).is_some_and(|t| std::sync::Arc::ptr_eq(t, &self.transfer)) {
+            active.remove(&self.id);
+        }
+    }
+}
+
+/// Transfers that finish this quickly are never shown.
+pub const SHOW_PROGRESS_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A size the way the trays show it: KB, MB or GB.
+pub fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b < MB {
+        format!("{} KB", (b / KB).ceil() as u64)
+    } else if b < 10.0 * MB {
+        format!("{:.1} MB", b / MB)
+    } else if b < GB {
+        format!("{} MB", (b / MB).round() as u64)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
+/// The share done, in whole percent (never 100 before the end).
+pub fn percent(done: u64, total: u64) -> u64 {
+    if total == 0 { if done == 0 { 0 } else { 100 } } else { (done.min(total) as u128 * 100 / total as u128) as u64 }
+}
+
+/// One line about the transfers in `list` that have run for a second or
+/// more, with the machine at the other end called `peer`, and the overall
+/// percentage; `None` while there are none. E.g. "Sending to Windows:
+/// 120 MB of 260 MB (46%)".
+pub fn progress_line(list: &[Progress], peer: &str) -> Option<(String, u64)> {
+    let shown: Vec<&Progress> = list.iter().filter(|p| p.running_for >= SHOW_PROGRESS_AFTER).collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let done: u64 = shown.iter().map(|p| p.done).sum();
+    let total: u64 = shown.iter().map(|p| p.total).sum();
+    let pct = percent(done, total);
+    let sending = shown.iter().filter(|p| p.sending).count();
+    let what = match (shown.len(), sending) {
+        (1, 1) => format!("Sending to {peer}"),
+        (1, _) => format!("Receiving from {peer}"),
+        (n, s) if s == n => format!("Sending {n} transfers to {peer}"),
+        (n, 0) => format!("Receiving {n} transfers from {peer}"),
+        (n, _) => format!("{n} transfers with {peer}"),
+    };
+    Some((format!("{what}: {} of {} ({pct}%)", format_size(done), format_size(total)), pct))
 }
 
 #[cfg(test)]
@@ -435,9 +651,9 @@ mod tests {
     fn the_wire_format_is_what_the_csharp_side_expects() {
         // Hello's optional fields are left out, not sent as null.
         let json = serde_json::to_string(&Hello::data("mac", "get", 3)).unwrap();
-        assert_eq!(json, r#"{"role":"data","name":"mac","op":"get","id":3,"version":3}"#);
+        assert_eq!(json, r#"{"role":"data","name":"mac","op":"get","id":3,"version":4}"#);
         let json = serde_json::to_string(&Hello::control("mac")).unwrap();
-        assert_eq!(json, r#"{"role":"control","name":"mac","version":3}"#);
+        assert_eq!(json, r#"{"role":"control","name":"mac","version":4}"#);
         assert_eq!(
             serde_json::to_string(&Inactive { drag_over: true, button_held: false, let_go: false }).unwrap(),
             r#"{"drag_over":true,"button_held":false,"let_go":false}"#
@@ -459,13 +675,62 @@ mod tests {
 
         let ((mut aw, _ar), (_bw, mut br)) = pair();
         let files = vec![(src.join("big.bin"), "big.bin".to_string()), (src.join("empty.txt"), "empty.txt".to_string())];
-        let sender = std::thread::spawn(move || send_files(&mut aw, &files).unwrap());
-        let written = receive_files(&mut br, |h| Ok(dst.join(&h.name))).unwrap();
-        sender.join().unwrap();
+        let sender = std::thread::spawn(move || {
+            let mut sent = 0;
+            send_files(&mut aw, &files, |n| sent += n).unwrap();
+            sent
+        });
+        let mut received = 0;
+        let written = receive_files(&mut br, |h| Ok(dst.join(&h.name)), |n| received += n).unwrap();
+        assert_eq!(sender.join().unwrap(), big.len() as u64);
+        assert_eq!(received, big.len() as u64);
 
         assert_eq!(written, vec![dir.join("dst/big.bin"), dir.join("dst/empty.txt")]);
         assert_eq!(std::fs::read(&written[0]).unwrap(), big);
         assert_eq!(std::fs::read(&written[1]).unwrap(), b"");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancel_cuts_a_running_transfer_and_refuses_a_later_one() {
+        use std::net::{TcpListener, TcpStream};
+        let transfers = Transfers::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let guard = transfers.begin(1, false, 100).unwrap();
+        guard.attach(&client);
+        guard.add(40);
+        assert_eq!(transfers.active()[0].done, 40);
+        assert!(transfers.cancel(1));
+        assert!(guard.cancelled());
+        // The other end sees the connection close.
+        assert_eq!(server.read(&mut [0u8; 1]).unwrap(), 0);
+        assert_eq!(guard.outcome::<()>(Err(std::io::Error::other("broken pipe"))).unwrap_err().to_string(), cancelled_error().to_string());
+        drop(guard);
+        assert!(transfers.active().is_empty());
+
+        // Cancelled before it began: refused.
+        assert!(!transfers.cancel(2));
+        assert!(transfers.begin(2, true, 1).is_none());
+        assert!(transfers.begin(3, true, 1).is_some());
+    }
+
+    #[test]
+    fn progress_reads_well_and_quick_transfers_are_not_shown() {
+        use std::time::Duration;
+        let p = |id, sending, done, total, secs| Progress { id, sending, total, done, running_for: Duration::from_secs(secs) };
+        assert_eq!(progress_line(&[p(1, true, 5, 10, 0)], "Windows"), None);
+        assert_eq!(
+            progress_line(&[p(1, true, 120 << 20, 260 << 20, 2)], "Windows"),
+            Some(("Sending to Windows: 120 MB of 260 MB (46%)".to_string(), 46))
+        );
+        assert_eq!(progress_line(&[p(1, false, 512, 3 << 20, 2)], "alan-mac").unwrap().0, "Receiving from alan-mac: 1 KB of 3.0 MB (0%)");
+        assert_eq!(progress_line(&[p(1, false, 1, 2, 2), p(2, true, 1, 2, 5)], "W").unwrap().0, "2 transfers with W: 1 KB of 1 KB (50%)");
+        assert_eq!(format_size(3 << 30), "3.0 GB");
+        assert_eq!(percent(0, 0), 0);
+        assert_eq!(percent(99, 100), 99);
+        assert_eq!(percent(200, 100), 100);
     }
 }

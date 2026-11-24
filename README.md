@@ -262,6 +262,14 @@ saves a drop to `Desktop\MouseWithoutBorders\`. With it:
   Empty folders aren't carried (a dragged empty folder sends nothing), and
   one drag or copy carries at most 50,000 files. Without the companion, folders
   still aren't supported (zip them), as with PowerToys itself.
+- **Progress and cancel** (type-checked and unit-tested only, not yet
+  live-tested): a transfer that takes more than a second shows its
+  progress on both machines, in the Mac's menu bar (the percentage next
+  to the icon, and a line such as "Sending to Windows: 120 MB of 260 MB
+  (46%)" in its menu) and in the companion's tray menu and tooltip. Both
+  menus then have "Cancel Transfer", which stops it on both sides: a drag
+  of it ends without a drop, a copy never reaches the clipboard, and the
+  part that arrived is deleted.
 
 Setup:
 1. Untick "Transfer copied files to the remote machine's clipboard" under

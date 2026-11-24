@@ -50,10 +50,12 @@ Directory.CreateDirectory(dir);
 var big = Enumerable.Range(0, Frames.ChunkSize + 1000).Select(i => (byte)(i % 251)).ToArray();
 File.WriteAllBytes(Path.Combine(dir, "big.bin"), big);
 File.WriteAllBytes(Path.Combine(dir, "empty.txt"), Array.Empty<byte>());
-var sent = Task.Run(() => client.SendFiles(new[] { (Path.Combine(dir, "big.bin"), "big.bin"), (Path.Combine(dir, "gone.txt"), "gone.txt"), (Path.Combine(dir, "empty.txt"), "empty.txt") }));
+long sentBytes = 0, receivedBytes = 0;
+var sent = Task.Run(() => client.SendFiles(new[] { (Path.Combine(dir, "big.bin"), "big.bin"), (Path.Combine(dir, "gone.txt"), "gone.txt"), (Path.Combine(dir, "empty.txt"), "empty.txt") }, n => sentBytes += n));
 var done = new List<int>();
-server.ReceiveFiles(h => Path.Combine(dir, "got-" + h.Name), done.Add);
+server.ReceiveFiles(h => Path.Combine(dir, "got-" + h.Name), done.Add, n => receivedBytes += n);
 await sent;
+Check(sentBytes == big.Length && receivedBytes == big.Length, "progress counts every byte, both ways");
 Check(File.Exists(Path.Combine(dir, "got-gone.txt")) && new FileInfo(Path.Combine(dir, "got-gone.txt")).Length == 0, "a file gone since the offer arrives empty, keeping the others' places");
 Check(File.ReadAllBytes(Path.Combine(dir, "got-big.bin")).SequenceEqual(big), "a file bigger than a chunk arrives intact");
 Check(File.Exists(Path.Combine(dir, "got-empty.txt")) && new FileInfo(Path.Combine(dir, "got-empty.txt")).Length == 0, "an empty file arrives");
@@ -78,6 +80,22 @@ Check(collided.SequenceEqual(new[] { $"docs{sep}readme", $"docs{sep}readme (2){s
 Check(collidedTop.SequenceEqual(new[] { "docs", "Photos", "photos (2)", "_CON", "_lpt1.log" }), "each offered folder is one top-level item");
 Check(Names.Safe("COM10") == "COM10" && Names.Safe("aux.txt") == "_aux.txt" && Names.Safe("console") == "console", "only real device names are changed");
 Directory.Delete(dir, recursive: true);
+
+// Transfers: progress as the bridge words it, and cancels.
+var secs = (int s) => TimeSpan.FromSeconds(s);
+Check(Transfers.ProgressLine(new[] { (true, 5L, 10L, secs(0)) }, "Windows") == null, "a transfer under a second isn't shown");
+Check(Transfers.ProgressLine(new[] { (true, 120L << 20, 260L << 20, secs(2)) }, "Windows") == ("Sending to Windows: 120 MB of 260 MB (46%)", 46), "one transfer's progress reads as on the bridge");
+Check(Transfers.ProgressLine(new[] { (false, 512L, 3L << 20, secs(2)) }, "alan-mac")?.Line == "Receiving from alan-mac: 1 KB of 3.0 MB (0%)", "sizes read as on the bridge");
+Check(Transfers.ProgressLine(new[] { (false, 1L, 2L, secs(2)), (true, 1L, 2L, secs(5)) }, "W")?.Line == "2 transfers with W: 1 KB of 1 KB (50%)", "several transfers are summed");
+Check(Transfers.FormatSize(3L << 30) == "3.0 GB" && Transfers.Percent(0, 0) == 0 && Transfers.Percent(200, 100) == 100, "sizes and percentages at the edges");
+var aborted = false;
+var running = Transfers.Begin(1, false, 100, () => aborted = true)!;
+running.Add(40);
+Check(Transfers.Snapshot().Single().Done == 40, "a running transfer reports its bytes");
+Check(Transfers.Cancel(1) && aborted && running.Cancelled, "a cancel cuts a running transfer");
+Transfers.End(running);
+Check(Transfers.Snapshot().Length == 0, "an ended transfer is gone");
+Check(!Transfers.Cancel(2) && Transfers.Begin(2, true, 1, () => { }) == null && Transfers.Begin(3, true, 1, () => { }) != null, "a transfer cancelled before it starts is refused");
 
 // Setup check: the bridge has to be in both of PowerToys' lists.
 System.Text.Json.JsonElement Props(string json) => System.Text.Json.JsonDocument.Parse(json).RootElement;

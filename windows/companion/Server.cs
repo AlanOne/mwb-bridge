@@ -120,7 +120,7 @@ sealed class Server
             else if (hello.Role == "data" && hello.Id is ulong id)
             {
                 client.ReceiveTimeout = client.SendTimeout = (int)DataTimeout.TotalMilliseconds;
-                RunData(conn, hello.Op, id);
+                RunData(conn, hello.Op, id, client);
             }
         }
         catch (Exception e)
@@ -190,7 +190,11 @@ sealed class Server
                         }
                         break;
                     case Frames.Cancel:
+                        // Its transfer is cut here, at once; its drag (if
+                        // any) ends on the UI thread.
                         var cancel = FrameConnection.Parse<CancelMsg>(body);
+                        Log.Write($"The bridge cancelled transfer {cancel.Id}.");
+                        Transfers.Cancel(cancel.Id);
                         _coordinator.Post(() => _coordinator.OnCancel(cancel.Id));
                         break;
                     default:
@@ -222,12 +226,43 @@ sealed class Server
         }
     }
 
-    void RunData(FrameConnection conn, string? op, ulong id)
+    /// Stops every transfer going on (the tray's "Cancel transfer"): tells
+    /// the bridge first, so it takes the closed connection for a cancel,
+    /// then cuts it here.
+    public void CancelAll()
+    {
+        foreach (var t in Transfers.Snapshot())
+        {
+            Log.Write($"Cancelling transfer {t.Id}.");
+            Send(Frames.Cancel, new CancelMsg(t.Id));
+            Transfers.Cancel(t.Id);
+            _coordinator.Post(() => _coordinator.OnCancel(t.Id));
+        }
+    }
+
+    void RunData(FrameConnection conn, string? op, ulong id, TcpClient client)
     {
         if (op == "get")
         {
             var files = _coordinator.FilesToMac(id) ?? throw new IOException($"no drag {id} to send");
-            conn.SendFiles(files);
+            long total = 0;
+            foreach (var f in files)
+            {
+                try { total += new FileInfo(f.Path).Length; } catch (Exception) { }
+            }
+            var transfer = Transfers.Begin(id, true, total, client.Close) ?? throw new IOException($"transfer {id} was cancelled");
+            try
+            {
+                conn.SendFiles(files, transfer.Add);
+            }
+            catch (Exception) when (transfer.Cancelled)
+            {
+                throw new IOException($"transfer {id} was cancelled");
+            }
+            finally
+            {
+                Transfers.End(transfer);
+            }
             Log.Write($"[to-mac] Sent drag {id}'s {files.Length} file(s).");
         }
         else if (op == "put")
@@ -236,14 +271,29 @@ sealed class Server
             IncomingDrop? drop = null;
             for (var i = 0; i < 40 && (drop = _coordinator.FromMac(id)) == null; i++) Thread.Sleep(50);
             if (drop == null) throw new IOException($"no drag {id} to receive");
+            var transfer = Transfers.Begin(id, false, drop.Total, client.Close);
+            if (transfer == null)
+            {
+                drop.Failed = true;
+                throw new IOException($"transfer {id} was cancelled");
+            }
             try
             {
-                conn.ReceiveFiles(h => drop.Paths[h.Index], drop.FileDone);
+                conn.ReceiveFiles(h => drop.Paths[h.Index], drop.FileDone, transfer.Add);
+            }
+            catch (Exception) when (transfer.Cancelled)
+            {
+                drop.Failed = true;
+                throw new IOException($"transfer {id} was cancelled");
             }
             catch
             {
                 drop.Failed = true;
                 throw;
+            }
+            finally
+            {
+                Transfers.End(transfer);
             }
         }
     }

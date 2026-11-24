@@ -134,6 +134,10 @@ pub fn run() {
     let edit_config_item = MenuItem::new("Edit Config...", true, None);
     let restart_item = MenuItem::new("Restart App", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
+    // Shown (above "Reconnect Now") only while a transfer runs.
+    let transfer_item = MenuItem::new("", false, None);
+    let cancel_transfer_item = MenuItem::new("Cancel Transfer", true, None);
+    let mut transfer_shown = false;
     menu.append(&status_item).unwrap();
     menu.append(&link_item).unwrap();
     menu.append(&reconnect_item).unwrap();
@@ -146,11 +150,11 @@ pub fn run() {
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&quit_item).unwrap();
 
-    let _tray_icon = TrayIconBuilder::new()
+    let tray_icon = TrayIconBuilder::new()
         .with_icon(bridge_icon())
         .with_icon_as_template(true)
         .with_tooltip("MWB Mac Bridge")
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .build()
         .expect("failed to create the menu bar status item");
 
@@ -161,13 +165,37 @@ pub fn run() {
     let reconnect_id = reconnect_item.id().clone();
     let restart_id = restart_item.id().clone();
     let quit_id = quit_item.id().clone();
+    let cancel_transfer_id = cancel_transfer_item.id().clone();
 
     event_loop.run(move |event, _elwt, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + Duration::from_secs(2));
+        // Faster while a transfer's progress is showing.
+        let every = if transfer_shown { Duration::from_millis(500) } else { Duration::from_secs(2) };
+        *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + every);
 
         if let Event::NewEvents(_) = event {
             status_item.set_text(status_line());
             link_item.set_text(crate::link_line().unwrap_or_default());
+            // The transfer's line and Cancel in the menu, and its
+            // percentage next to the icon.
+            let progress = crate::companion::link().and_then(|l| mwb_protocol::companion::progress_line(&l.transfers.active(), "Windows"));
+            match progress {
+                Some((line, pct)) => {
+                    transfer_item.set_text(line);
+                    tray_icon.set_title(Some(format!("{pct}%")));
+                    if !transfer_shown {
+                        let _ = menu.insert(&transfer_item, 2);
+                        let _ = menu.insert(&cancel_transfer_item, 3);
+                        transfer_shown = true;
+                    }
+                }
+                None if transfer_shown => {
+                    tray_icon.set_title(None::<String>);
+                    let _ = menu.remove(&transfer_item);
+                    let _ = menu.remove(&cancel_transfer_item);
+                    transfer_shown = false;
+                }
+                None => {}
+            }
         }
 
         if let Ok(event) = menu_channel.try_recv() {
@@ -180,6 +208,10 @@ pub fn run() {
             } else if event.id == settings_id {
                 if let Some(mtm) = objc2::MainThreadMarker::new() {
                     crate::settings::show(mtm);
+                }
+            } else if event.id == cancel_transfer_id {
+                if let Some(link) = crate::companion::link() {
+                    link.cancel_all();
                 }
             } else if event.id == reconnect_id {
                 crate::reconnect_now();

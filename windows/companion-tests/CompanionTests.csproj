@@ -12,5 +12,6 @@
     <Compile Include="../companion/Log.cs" />
     <Compile Include="../companion/Names.cs" />
     <Compile Include="../companion/SetupCheck.cs" />
+    <Compile Include="../companion/Transfers.cs" />
   </ItemGroup>
 </Project>
