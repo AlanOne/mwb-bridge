@@ -69,7 +69,9 @@ pub struct Config {
     // a new machine that way it also rewrites its layout
     // (`MachineMatrixString`) to the pool's order, which can move machines
     // already there; check the layout in PowerToys afterwards. A machine
-    // already in the pool is left alone.
+    // already in the pool is left alone. A name Windows would misread
+    // (not ASCII, over 32 characters, empty, or with `,` or `:`) is never
+    // announced: see `mwb_protocol::registrable_name`.
     #[serde(default)]
     pub self_register: bool,
 }

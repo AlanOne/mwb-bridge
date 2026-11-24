@@ -649,7 +649,13 @@ and Windows adds a machine it doesn't know yet to `MachinePool` on its
 own. Careful: when it learns a new machine this way, Windows also rewrites
 `MachineMatrixString` to the pool's order, which can move machines already
 in the layout, so check the layout in PowerToys' settings afterwards. A
-machine already in the pool is left alone, so it's harmless to leave on.
+machine already in the pool (under the same name, ignoring case) is left
+alone, so it's harmless to leave on. The name has to survive the trip:
+Windows reads names as plain ASCII, keeps 32 characters and can't store a
+comma or colon, so a name such as `Alan’s Mac` would come back garbled and
+look like a new machine. The bridge doesn't announce such a name (or an
+empty one) and logs why instead: use letters, digits and dashes. A pool
+that already holds four machines in the layout takes no fifth.
 
 ## Config files (written by the plugin, read by the daemon)
 

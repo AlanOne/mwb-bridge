@@ -447,17 +447,41 @@ pub fn build_clipboard_beat(id: u32, src_id: u32) -> [u8; PACKAGE_SIZE_EX] {
 /// Builds a Heartbeat (Type=20) carrying this machine's name, broadcast the
 /// way real MWB machines send them: Windows adds a machine it doesn't know
 /// yet to its pool on one (Receiver.cs, `MachineStuff.AddToMachinePool`).
-pub fn build_heartbeat(id: u32, src_id: u32, machine_name: &str) -> [u8; PACKAGE_SIZE_EX] {
+/// Refused (with the reason) for a name Windows wouldn't read back as
+/// itself (see `registrable_name`): it would then take this for a new
+/// machine and rewrite the layout around a garbled name.
+pub fn build_heartbeat(id: u32, src_id: u32, machine_name: &str) -> Result<[u8; PACKAGE_SIZE_EX], String> {
+    let name = registrable_name(machine_name)?;
     let mut buf = [0u8; PACKAGE_SIZE_EX];
     buf[0] = PACKAGE_TYPE_HEARTBEAT;
     pack_u32_le(&mut buf, 4, id);
     pack_u32_le(&mut buf, 8, src_id);
     pack_u32_le(&mut buf, 12, ID_ALL);
-    let name = format!("{:<32}", machine_name);
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(32);
-    buf[32..32 + n].copy_from_slice(&bytes[..n]);
-    buf
+    // As Windows writes it: ASCII, space-padded to 32 bytes.
+    buf[32..64].copy_from_slice(format!("{name:<32}").as_bytes());
+    Ok(buf)
+}
+
+/// `machine_name` trimmed, if Windows would read it back from a package's
+/// 32-byte ASCII name field (`DATA.MachineName`: one byte per character,
+/// `?` for anything not ASCII, trimmed) as exactly that, and could store it
+/// in its pool and layout strings (`name:id` pairs and `,`-joined names).
+/// Otherwise why not.
+pub fn registrable_name(machine_name: &str) -> Result<&str, String> {
+    let name = machine_name.trim();
+    if name.is_empty() {
+        return Err("the machine name is empty".into());
+    }
+    if let Some(c) = name.chars().find(|c| !c.is_ascii() || c.is_ascii_control()) {
+        return Err(format!("the machine name has {c:?} in it, which Windows reads as '?' (use plain ASCII letters, digits and dashes)"));
+    }
+    if name.len() > 32 {
+        return Err(format!("the machine name is {} characters long, and Windows keeps only 32", name.len()));
+    }
+    if name.contains([',', ':']) {
+        return Err("the machine name has a comma or colon in it, which PowerToys' settings can't store".into());
+    }
+    Ok(name)
 }
 
 /// Builds the "MachineSwitched" package (Type=77) that actually triggers
@@ -743,12 +767,21 @@ mod package_tests {
 
     #[test]
     fn a_heartbeat_names_this_machine_to_everyone() {
-        let hb = build_heartbeat(5, 3, "alan-mac");
+        let hb = build_heartbeat(5, 3, " alan-mac ").unwrap();
         assert_eq!(hb[0], PACKAGE_TYPE_HEARTBEAT);
         assert_eq!(unpack_u32_le(&hb, 8), 3);
         assert_eq!(unpack_u32_le(&hb, 12), ID_ALL);
-        assert_eq!(std::str::from_utf8(&hb[32..64]).unwrap().trim_end(), "alan-mac");
+        assert_eq!(&hb[32..64], format!("{:<32}", "alan-mac").as_bytes());
         assert!(is_big_package(PACKAGE_TYPE_HEARTBEAT));
+        assert!(build_heartbeat(5, 3, &"x".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn names_windows_would_misread_are_never_announced() {
+        // Read back by Windows as something else, or not storable.
+        for name in ["", "   ", "Alan\u{2019}s Mac", "caf\u{e9}", &"x".repeat(33), "a,b", "pc:2", "tab\there"] {
+            assert!(build_heartbeat(5, 3, name).is_err(), "{name:?}");
+        }
     }
 
     #[test]
