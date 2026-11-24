@@ -857,7 +857,14 @@ is ending Windows' leftover drag from an earlier Windows -> Mac drag; a
 press injected before that drag has ended goes to it, not the source
 window, and the new drag never starts (live-found 2026-11-24), so the
 companion waits up to 500ms for it to end on the catcher, and hides the
-catcher, before pressing. Windows is in control by then, so
+catcher, before pressing. It never presses (or releases) while the Mac has
+control again (an `ACTIVE` since the last `INACTIVE`; the Mac sends
+`INACTIVE` before the offer, which waits for its files to be listed):
+Mouse Without Borders would forward the press and release to the Mac,
+where they look like a drop of whatever is being dragged there (live-found
+2026-11-24, a quick bounce back to the Mac). The files are saved to the
+desktop then, and a release still owed is injected at the next
+`INACTIVE`. Windows is in control by then, so
 injecting is safe: the companion puts a nearly invisible window over the
 whole desktop (a small one at the cursor missed: the cursor is often still
 moving fast from the crossing, and the press lands wherever it is by the

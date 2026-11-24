@@ -23,6 +23,12 @@ sealed class Coordinator
 
     // Windows -> Mac state.
     bool _catching;      // the catcher is up for a drag that left Windows
+    // The bridge's machine has control (ACTIVE came, INACTIVE not yet):
+    // anything injected now is forwarded there by Mouse Without Borders.
+    bool _bridgeActive;
+    // A press injected for a drag that didn't start, whose release is
+    // owed once Windows has control again.
+    bool _releaseOwed;
     bool _caughtDrag;    // a drag is hovering over it
     bool _offered;       // its files were offered to the bridge
     bool _leftoverEnded; // Windows' drag already ended on the catcher
@@ -75,6 +81,7 @@ sealed class Coordinator
     /// control the Windows cursor is parked and hidden, so it's unseen.
     public void OnActive()
     {
+        _bridgeActive = true;
         if (_catching) return;
         Log.Write($"[to-mac] The bridge's machine is active (left button {(Native.LeftButtonDown() ? "down" : "up")} as Windows reports it), watching for a drag.");
         _catching = true;
@@ -154,6 +161,13 @@ sealed class Coordinator
     /// version, which says how to read the message).
     public void OnInactive(InactiveMsg inactive, uint version)
     {
+        _bridgeActive = false;
+        if (_releaseOwed)
+        {
+            _releaseOwed = false;
+            Native.LeftButton(down: false);
+            Log.Write("[to-windows] Windows has control again: letting go of the press a drag that didn't start left behind.");
+        }
         if (!_catching) return;
         if (inactive.DragCameBack(version))
         {
@@ -324,6 +338,14 @@ sealed class Coordinator
             return;
         }
         _endingLeftoverSince = null;
+        if (_bridgeActive)
+        {
+            // Control went back to the other machine meanwhile: a press now
+            // would be forwarded there (and look like a drop over there).
+            Log.Write($"[to-windows] Drag {drop.Id}: control went back to the bridge's machine before it could start here, saving its files to the desktop instead.");
+            drop.SaveToDesktopWhenComplete();
+            return;
+        }
         // Windows has control: no catch needs the catcher, and over the
         // whole desktop it could take the press meant for the source.
         if (!_catching)
@@ -349,16 +371,27 @@ sealed class Coordinator
             // past a 64px window, so the drag never started).
             _pendingSource = drop;
             _source.ShowOver(SystemInformation.VirtualScreen);
+            var pressed = false;
             var press = new System.Windows.Forms.Timer { Interval = 40 };
             press.Tick += (_, _) =>
             {
                 press.Dispose();
+                if (_pendingSource != drop) return;
+                if (_bridgeActive)
+                {
+                    _pendingSource = null;
+                    _source.Hide();
+                    Log.Write($"[to-windows] Drag {drop.Id}: control went back to the bridge's machine before the press, saving its files to the desktop instead.");
+                    drop.SaveToDesktopWhenComplete();
+                    return;
+                }
                 // Again right before pressing: other topmost windows (Mouse
                 // Without Borders keeps one at the cursor) may have come up.
                 var now = Cursor.Position;
                 _source.ShowOver(SystemInformation.VirtualScreen);
                 Log.Write($"[to-windows] Pressing at {now} on {Native.DescribeWindowAt(now)} (the source window is 0x{_source.Handle.ToInt64():x}).");
                 Native.LeftButton(down: true);
+                pressed = true;
             };
             press.Start();
             // If the press didn't land on the window, release it again and
@@ -371,7 +404,10 @@ sealed class Coordinator
                 {
                     _pendingSource = null;
                     _source.Hide();
-                    Native.LeftButton(down: false);
+                    // Never injected while the other machine has control:
+                    // it would get the release. Owed until Windows has it.
+                    if (pressed && _bridgeActive) _releaseOwed = true;
+                    else if (pressed) Native.LeftButton(down: false);
                     Log.Write($"[to-windows] Drag {drop.Id} didn't start, saving its files to the desktop instead.");
                     drop.SaveToDesktopWhenComplete();
                 }
