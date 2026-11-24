@@ -147,8 +147,11 @@ idle time, but the Mac stays awake behind it instead of going to sleep,
 which it otherwise does soon after (and in clamshell mode, lid closed with
 an external display, straight away). A sleeping Mac drops the connection,
 so input from Windows can't wake it, only opening the lid can. Crossing
-over to the Mac wakes the display. On battery the Mac may still sleep, and
-closing the lid with no external display always sleeps it.
+over to the Mac (by the edge or a hotkey) and using it wakes the display.
+A reconnect doesn't let go of the hold: only after the bridge has been
+disconnected for 45 seconds may the Mac sleep again. On battery it may
+still sleep (a UPS counts as power), and closing the lid with no external
+display always sleeps it.
 
 **Screen stays on while you use Windows** (both builds, type-checked
 only, not yet live-tested): with "Block screen saver on other machines" on

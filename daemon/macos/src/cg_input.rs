@@ -204,6 +204,7 @@ impl CgInput {
         }
         event.set_flags(flags);
         event.post(location);
+        input_posted();
     }
 
     fn modifier_keycode(&self, evdev: u32) -> Option<u16> {
@@ -494,6 +495,7 @@ impl CgInput {
             event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy);
         }
         event.post(CGEventTapLocation::HID);
+        input_posted();
     }
 }
 
@@ -663,6 +665,7 @@ impl InputSink for CgInput {
             return;
         };
         event.post(CGEventTapLocation::HID);
+        input_posted();
     }
 
     /// Same PIXEL-unit smoothing as `scroll_vertical`. Sign live-verified
@@ -674,6 +677,7 @@ impl InputSink for CgInput {
             return;
         };
         event.post(CGEventTapLocation::HID);
+        input_posted();
     }
 
     fn key(&mut self, evdev_code: u32, pressed: bool) {
@@ -798,6 +802,27 @@ pub fn lock_screen() {
         };
         event.set_flags(CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagControl);
         event.post(CGEventTapLocation::Session);
+    }
+}
+
+/// Called after each posted key, click, move or scroll. Posted events
+/// aren't user activity to macOS's power management: on their own they
+/// neither wake a display that has gone to sleep (input arriving after a
+/// hotkey switch, which sends no `MachineSwitched`) nor keep it from going
+/// to sleep mid-use. So declare activity for them, at most every few
+/// seconds; while locked too, since that's someone about to type the
+/// password.
+fn input_posted() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    const EVERY_MS: u64 = 5_000;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    // Milliseconds after START of the last declaration, plus one (0: none).
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    let last = LAST.load(Ordering::Relaxed);
+    if (last == 0 || now.saturating_sub(last) >= EVERY_MS) && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        declare_user_activity(false);
     }
 }
 
@@ -930,6 +955,7 @@ fn post_media_key(media_key: i64, pressed: bool) {
     }
     // SAFETY: a valid CGEventRef; 0 is kCGHIDEventTap.
     with_media_key_event(media_key, pressed, |event| unsafe { CGEventPost(0, event) });
+    input_posted();
 }
 
 #[cfg(test)]
