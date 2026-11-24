@@ -37,18 +37,30 @@ struct State {
     after: Option<After>,
 }
 
+/// Stops a download that's no longer wanted.
+type StopHook = Box<dyn FnOnce() + Send>;
+
 pub struct Fetch {
     state: Mutex<State>,
     done: Condvar,
     drop_dir: PathBuf,
     reveal: bool,
+    /// Stops the download when its files turn out not to be wanted
+    /// (`After::Discard` before they've arrived).
+    stop: Mutex<Option<StopHook>>,
 }
 
 impl Fetch {
     /// `drop_dir` is where `After::SaveToDropFolder` saves to; `reveal`
     /// shows the saved file in Finder (off in tests).
     pub fn new(drop_dir: PathBuf, reveal: bool) -> Arc<Self> {
-        Arc::new(Self { state: Mutex::new(State::default()), done: Condvar::new(), drop_dir, reveal })
+        Arc::new(Self { state: Mutex::new(State::default()), done: Condvar::new(), drop_dir, reveal, stop: Mutex::new(None) })
+    }
+
+    /// How to stop the download early, should its files be discarded
+    /// before they've all arrived.
+    pub fn on_discard(&self, stop: impl FnOnce() + Send + 'static) {
+        *self.stop.lock().unwrap() = Some(Box::new(stop));
     }
 
     /// The fetching thread created a (still empty) destination file.
@@ -85,20 +97,33 @@ impl Fetch {
 
     /// Decides what happens to the file once it has arrived: right away if
     /// it already has, otherwise when it does.
+    /// Files to be discarded that haven't all arrived yet stop arriving:
+    /// no point fetching the rest of a big file (and showing its progress)
+    /// for a drag that went back to Windows.
     pub fn then(&self, after: After) {
         let outcome = {
             let mut state = self.state.lock().unwrap();
             state.after = Some(after);
             state.outcome.clone()
         };
-        if let Some(outcome) = outcome {
-            self.apply(after, &outcome);
+        match outcome {
+            Some(outcome) => self.apply(after, &outcome),
+            None if after == After::Discard => {
+                if let Some(stop) = self.stop.lock().unwrap().take() {
+                    stop();
+                }
+            }
+            None => {}
         }
     }
 
     fn apply(&self, after: After, outcome: &Result<Vec<PathBuf>, String>) {
         let paths = match outcome {
             Ok(paths) => paths,
+            Err(_) if after == After::Discard => {
+                println!("[drop] Stopped fetching files no longer wanted.");
+                return;
+            }
             Err(e) => {
                 eprintln!("[drop] Fetching the dragged files from Windows failed: {e}");
                 return;
@@ -292,6 +317,10 @@ impl IncomingDrag {
         let dir = new_drag_dir(&root);
         let fetch = Fetch::new(crate::clipboard::dropped_files_dir(), true);
         let expected = mwb_protocol::companion::top_level_count(&offer);
+        {
+            let (link, id) = (link.clone(), offer.id);
+            fetch.on_discard(move || link.cancel(id));
+        }
         self.current = Some(Incoming { fetch: fetch.clone(), expected, dragging: false, gave_up: false, starting: None, offer_id: Some(offer.id) });
         let link = link.clone();
         std::thread::spawn(move || {
@@ -670,6 +699,28 @@ mod tests {
         fetch.then(After::Discard);
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn files_discarded_before_they_arrive_stop_arriving() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stopped = Arc::new(AtomicBool::new(false));
+        let tmp = TempDir::new("stop");
+        let fetch = Fetch::new(tmp.0.join("drop"), false);
+        let flag = stopped.clone();
+        fetch.on_discard(move || flag.store(true, Ordering::SeqCst));
+        fetch.then(After::Keep);
+        assert!(!stopped.load(Ordering::SeqCst), "kept files keep arriving");
+        fetch.then(After::Discard);
+        assert!(stopped.load(Ordering::SeqCst));
+        // Arrived already: nothing to stop, they're just deleted.
+        let stopped_late = Arc::new(AtomicBool::new(false));
+        let (fetch, path) = fetched(&tmp);
+        let flag = stopped_late.clone();
+        fetch.on_discard(move || flag.store(true, Ordering::SeqCst));
+        fetch.finished(Ok(vec![path.clone()]));
+        fetch.then(After::Discard);
+        assert!(!stopped_late.load(Ordering::SeqCst) && !path.exists());
     }
 
     #[test]

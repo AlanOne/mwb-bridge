@@ -219,7 +219,8 @@ since PowerToys only reports single-file drags.
 - **Windows -> Mac**: drops into whatever app you let go over (a Finder
   window, the Desktop, a chat app's attachment area...), live-tested
   2026-11-23, including going back to Windows mid-drag, which cancels it
-  cleanly. As soon as the drag reaches the Mac the file starts
+  cleanly (and, through the companion, stops the files' transfer then
+  rather than fetching the rest only to delete it; not yet live-tested). As soon as the drag reaches the Mac the file starts
   downloading and a real macOS drag of it is started under the cursor (see
   `daemon/macos/src/drag_source.rs`). Letting go just before the files have
   arrived holds the drop (the cursor stays put) for up to a second; if

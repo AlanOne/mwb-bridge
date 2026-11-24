@@ -204,15 +204,20 @@ impl Link {
         self.send_frame(frame, &[])
     }
 
-    /// Stops every transfer going on (the menu bar's "Cancel Transfer"):
-    /// tells the companion first, so it takes the closed connection for a
-    /// cancel, then cuts it here.
+    /// Stops every transfer going on (the menu bar's "Cancel Transfer").
     pub fn cancel_all(&self) {
         for id in self.transfers.ids() {
-            println!("[companion] Cancelling transfer {id}.");
-            self.send(proto::CANCEL, &proto::Cancel { id });
-            self.transfers.cancel(id);
+            self.cancel(id);
         }
+    }
+
+    /// Stops offer `id`'s transfer, running or not started yet: tells the
+    /// companion first, so it takes the closed connection for a cancel,
+    /// then cuts it here.
+    pub fn cancel(&self, id: u64) {
+        println!("[companion] Cancelling transfer {id}.");
+        self.send(proto::CANCEL, &proto::Cancel { id });
+        self.transfers.cancel(id);
     }
 
     /// The file copy `offer_files` couldn't deliver, if nothing has been
