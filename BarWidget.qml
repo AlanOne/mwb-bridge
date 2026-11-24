@@ -35,7 +35,7 @@ BarWidget {
   property var loadedConfig: ({})
   readonly property string statusPath: root.dataDir + "/status.json"
   readonly property string serviceName: "mwb-omarchy-bridge.service"
-  readonly property string windowsSideDocsUrl: "https://github.com/AlanOne/omarchy-plugin-mwb-bridge/blob/master/README.md#on-the-windows-side"
+  readonly property string windowsSideDocsUrl: "https://github.com/AlanOne/mwb-bridge/blob/master/README.md#on-the-windows-side"
 
   // This widget's own directory, whatever it was actually installed at —
   // resolved from the QML file's own URL rather than assuming the

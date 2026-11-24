@@ -1,4 +1,21 @@
-# Mouse Without Borders (Windows PowerToys) Omarchy Bridge
+# MWB Bridge
+
+Lets a Windows PC running Microsoft PowerToys' **Mouse Without Borders**
+drive machines MWB doesn't support: a **Mac** and an **Omarchy (Hyprland)
+Linux** machine. Each bridge pretends to be an MWB machine, so the Windows
+keyboard and mouse cross over to it (by the screen edge or MWB's switch
+hotkeys), and the clipboard, files and the lock-both-machines double-tap
+carry across. An optional Windows tray app, the **companion**
+(`windows/companion/`), adds multi-file and folder drag-and-drop and copy,
+of any size, with progress and cancel.
+
+- **macOS**: a menu bar app, see **macOS** below.
+- **Linux (Omarchy)**: an Omarchy bar-widget plugin, described next.
+
+(This project started as an Omarchy plugin, `omarchy-plugin-mwb-bridge`;
+the old GitHub URL still redirects here.)
+
+## Linux (Omarchy)
 
 An Omarchy bar-widget plugin, with its own bundled daemon, that lets a
 Windows PC's physical keyboard/mouse (via Microsoft PowerToys' **Mouse
@@ -608,13 +625,13 @@ reference the same real, resolved path this repo is checked out at — if you
 ever move the checkout, update both). `visudo -c` at the end catches a typo
 before it can break `sudo` entirely.
 
-## Install
+## Install on Linux (Omarchy)
 
 1. Install the plugin, either way:
 
    - **Via Omarchy's own plugin command** (also reachable from its menu —
      search for "Add Plugin"): `omarchy plugin add
-     https://github.com/AlanOne/omarchy-plugin-mwb-bridge.git --enable`.
+     https://github.com/AlanOne/mwb-bridge.git --enable`.
      This clones it, validates the manifest, and adds it to your bar
      layout for you.
    - **Manually**: check this repo out to

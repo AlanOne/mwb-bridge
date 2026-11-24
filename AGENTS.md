@@ -75,7 +75,7 @@ It reads the security key from MWB's own `settings.json` (`SecurityKey`,
 stored in plain text), unless `%APPDATA%\MwbBridgeCompanion\config.json`
 sets one. AlanOnePC is reachable as the SSH host `alanonepc` (PowerShell
 shell); CHP-ALANJ has no SSH, only a T3 linked environment, with this repo
-checked out at `C:\Users\Alan\Work\omarchy-plugins\mwb-bridge` (install
+checked out at `C:\Users\Alan\Work\mwb-bridge` (install
 there with `install.ps1 -InstallSdk`: it has no machine-wide .NET 8, so the
 runtime gets bundled, and its NuGet config lists no sources, hence the
 explicit `--source`). A GUI app has to
@@ -101,7 +101,7 @@ Network facts that matter:
 ## Setting it up on Linux (Omarchy)
 
 1. Install the plugin: `omarchy plugin add
-   https://github.com/AlanOne/omarchy-plugin-mwb-bridge.git --enable`, or
+   https://github.com/AlanOne/mwb-bridge.git --enable`, or
    check the repo out (or symlink it) to
    `~/.config/omarchy/plugins/io.github.alanone.mwb-bridge/` and add
    `{ "id": "io.github.alanone.mwb-bridge" }` to the bar layout in
